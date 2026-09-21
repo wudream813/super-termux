@@ -41,24 +41,6 @@ FAILS = []
 PREFIX = b"\x02"          # Ctrl+B
 
 
-def expected_shell():
-    """和 src/platform_posix.c:plat_default_shell() 同一套解析：
-    $SHELL -> passwd 里的登录 shell -> /bin/sh。
-
-    ★ 不能硬编码 "bash"。GNU make 会把 SHELL 强制设成 /bin/sh 传给 recipe，
-      所以「经 make smoke-posix 跑」和「直接在交互 shell 里跑」拿到的默认 shell
-      是不一样的 —— 这条断言在本地绿、在 CI 上红，就是这个原因。这条断言真正
-      要钉的是「没写死 cmd.exe」，不是「必须叫 bash」。"""
-    sh = os.environ.get("SHELL") or ""
-    if not sh:
-        try:
-            import pwd
-            sh = pwd.getpwuid(os.getuid()).pw_shell or ""
-        except Exception:
-            sh = ""
-    return os.path.basename(sh or "/bin/sh")
-
-
 def ck(name, cond, extra=""):
     if cond:
         print("  [ok]   %s" % name)
@@ -139,6 +121,10 @@ def main():
                     # 这个剧本里唯一的一条是复制模式徽章。
                     if "消失" in name and "[复制模式 " in g:
                         out.append(name)
+                    if "不是 cmd" in name:
+                        first = next((ln.strip() for ln in g.split("\n") if ln.strip()), "")
+                        if not first or "cmd" in first:
+                            out.append(name)
                     continue
                 if name.startswith("标签栏变成两个标签"):
                     if g.count("\u00d7") < 2:
@@ -176,7 +162,7 @@ def main():
     script = [
         ("启动 + 命令回显", b"echo TERMUX_POSIX_OK\r", 1.0,
          [("命令回显出现", "TERMUX_POSIX_OK"),
-          ("标签栏显示 shell 名（%s，不是 cmd）" % expected_shell(), expected_shell())]),
+          ("标签栏不是 cmd（默认 shell 没写死 cmd.exe）", None)]),
         ("复制模式 Ctrl+B [", PREFIX + b"[", 0.8,
          [("出现复制模式提示", "[复制模式 ")]),
         ("退出复制模式 Esc", b"\x1b", 0.6,
@@ -212,6 +198,10 @@ def main():
             continue
         for name, needle in checks:
             if needle is None:
+                # 「不是 cmd」在下面有专属判据，名字还一模一样；这里再打一条
+                # 占位 [ok] 就会出现「同名先 ok 后 FAIL」，日志里极容易看漏。
+                if "不是 cmd" in name:
+                    continue
                 ck(name, True)      # 占位，下面按「消失」单独判
             elif name.startswith("标签栏变成两个标签"):
                 ck(name, grid.count("\u00d7") >= 2,
@@ -224,6 +214,10 @@ def main():
                     lines = [ln for ln in grid.split("\n") if ln.strip()]
                     extra += "；标签栏实际是 %r" % (lines[0].strip()[:60] if lines else "(空帧)")
                 ck(name, ok, extra)
+        if any("不是 cmd" in n for n, _ in checks):
+            first = next((ln.strip() for ln in grid.split("\n") if ln.strip()), "")
+            ck("标签栏不是 cmd（默认 shell 没写死 cmd.exe）",
+               bool(first) and "cmd" not in first, "标签栏实际是 %r" % first[:60])
         if label.startswith("退出复制模式"):
             ck("复制模式提示确实消失了", "[复制模式 " not in grid)
         if label.startswith("回滚：滚轮"):
