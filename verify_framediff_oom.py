@@ -33,16 +33,25 @@ HARNESS = r"""
 #include <string.h>
 #include "framediff.h"
 
+/* ★ 故障注入原来是 `-Wl,--wrap=realloc` + __wrap_realloc/__real_realloc。
+ * 那是 GNU ld 专有的，Apple 的 ld64 直接报 `ld: unknown options: --wrap=realloc`
+ * —— CI 的 macOS 作业就栽在这儿。
+ *
+ * 改成可移植做法：本文件和 framediff.c 都用 -Drealloc=fio_realloc 编译，于是
+ * 它们里面所有 realloc 调用都指向下面这个；真正的 realloc 由另一个【不带这个
+ * 宏】的小文件 real_realloc.c 转发过来。三个平台同一条路径，本地就能验。
+ * （不用 __asm__("realloc") 那种符号改名：Mach-O 上 C 符号带前导下划线，
+ *   写死 "realloc" 会链接不到。） */
 static int g_fail_small_realloc = 0;
-void *__real_realloc(void *p, size_t n);
-void *__wrap_realloc(void *p, size_t n) {
+void *fio_call_real_realloc(void *p, size_t n);
+void *fio_realloc(void *p, size_t n) {
     /* dirty 按 1 字节/行扩容（32/64/... 小请求）；rows 每项 FrameChunk 24 字节
      * （64*24=1536），chunk 数据缓冲起步 256。只让 <=128 的小请求失败。 */
     if (g_fail_small_realloc && n > 0 && n <= 128) {
         fprintf(stderr, "  [inject] realloc(%zu) -> NULL\n", n);
         return NULL;
     }
-    return __real_realloc(p, n);
+    return fio_call_real_realloc(p, n);
 }
 
 int main(void) {
@@ -107,10 +116,23 @@ def main() -> int:
         harness = Path(td) / "oom.c"
         exe = Path(td) / "oom.bin"
         harness.write_text(HARNESS, encoding="utf-8")
+        # 这个文件【不能】带 -Drealloc=fio_realloc，否则它自己也变成递归。
+        real = Path(td) / "real_realloc.c"
+        real.write_text(
+            "#include <stdlib.h>\n"
+            "void *fio_call_real_realloc(void *p, size_t n) { return realloc(p, n); }\n",
+            encoding="utf-8")
+        realobj = Path(td) / "real_realloc.o"
+        cp0 = subprocess.run(["gcc", "-O1", "-c", str(real), "-o", str(realobj)],
+                             capture_output=True, text=True)
+        if cp0.returncode != 0:
+            print(cp0.stderr, file=sys.stderr)
+            print("FAIL: real_realloc.c 编译失败", file=sys.stderr)
+            return 1
         cp = subprocess.run(
             ["gcc", "-O1", "-g", "-fsanitize=address", "-fno-omit-frame-pointer",
-             "-Wl,--wrap=realloc", "-I" + str(ROOT / "include"),
-             str(harness), str(FRAMEDIFF_C), "-o", str(exe), "-lm"],
+             "-Drealloc=fio_realloc", "-I" + str(ROOT / "include"),
+             str(harness), str(FRAMEDIFF_C), str(realobj), "-o", str(exe), "-lm"],
             capture_output=True, text=True)
         if cp.returncode != 0:
             print(cp.stderr, file=sys.stderr)
