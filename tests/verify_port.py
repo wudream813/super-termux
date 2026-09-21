@@ -51,6 +51,7 @@ MAIN_POSIX = read("src", "main_posix.c")
 CONFIG = read("src", "config.c")
 INPUT = read("src", "input.c")
 PANE = read("src", "pane.c")
+COMMON_H = read("include", "common.h")
 MAKEFILE = read("Makefile")
 
 # ===========================================================================
@@ -301,6 +302,22 @@ ck("fork 子进程用 execve（async-signal-safe）", "execve(" in _child)
 ck("命令的绝对路径在父进程里解析（resolve_program）", "resolve_program(argv[0]" in _sp)
 ck("environ 显式声明（glibc 要 _GNU_SOURCE，自己声明两边通用）",
    "extern char **environ;" in PLAT_POSIX)
+
+# --- 版本号不能和 README 对不上 --------------------------------------------
+# 发版时最容易漏的就是改了一处忘了另一处；tag 和源码对不上就更难看。
+import re as _re
+_ver = _re.search(r'#define TERMUX_VERSION "([^"]+)"', COMMON_H)
+ck("common.h 里有 TERMUX_VERSION", _ver is not None)
+if _ver:
+    _v = _ver.group(1)
+    _rd = read(".", "README.md")
+    # ★ 必须钉住「当前版本：」那一行，不能只搜 "**vX.Y.Z**" 在不在文件里 ——
+    #   版本历史段里也写着同一个版本号，那样搜永远是绿的（我第一次就写成了这样，
+    #   验红时把「当前版本」改回 1.8.52 断言居然还是 ok）。
+    _m = _re.search(r"当前版本：\*\*v([0-9][^*]*)\*\*", _rd)
+    ck("README 有「当前版本：」那一行", _m is not None)
+    ck("README 的当前版本和源码一致", _m is not None and _m.group(1) == _v,
+       "README 写的是 v%s，源码是 v%s" % (_m.group(1) if _m else "?", _v))
 
 # ===========================================================================
 # 自证：故意把一条断言的条件取反，必须失败。

@@ -2,10 +2,32 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Windows 终端复用器（Terminal Multiplexer）—— 模块化 C 架构，基于 Windows ConPTY。
-在 Windows 控制台里管理多个 cmd / PowerShell 会话，像 tmux 一样分标签页。
+终端复用器（Terminal Multiplexer）—— 模块化 C 架构，单文件可执行。
+在一个终端窗口里管理多个 shell 会话，像 tmux 一样分标签页、分屏、搜历史。
 
-当前版本：**v1.8.52**
+当前版本：**v2.0.0**（正式支持 Windows / Linux / macOS 三个系统）
+
+## 平台支持
+
+| 系统 | 后端 | 产物 | 状态 |
+|---|---|---|---|
+| Windows 10 1809+ | ConPTY + `CreateProcessW` | `termux.exe` | ✅ CI 每次构建 |
+| Linux (glibc) | `forkpty` + termios raw | `termux-linux` | ✅ CI 每次构建 |
+| macOS (Apple silicon / Intel) | `forkpty`（libSystem） | `termux-macos` | ✅ CI 每次构建 |
+
+三个系统共用同一份引擎代码（screen / render / input / split / vt / theme / config …），
+只有平台相关的部分抽在平台层：
+
+```
+Windows : src/main.c + src/platform_win.c + src/conpty_loader.c
+POSIX   : src/main_posix.c + src/platform_posix.c + src/term_input_posix.c
+接口    : include/platform.h
+```
+
+后端映射：ConPTY ↔ `forkpty`；`ResizePseudoConsole` ↔ `TIOCSWINSZ`；
+`WriteConsoleA` ↔ `write(1)`；`ReadConsoleInputW` ↔ termios raw 自解析；
+`GetConsoleScreenBufferInfo` ↔ `TIOCGWINSZ`；`WINDOW_BUFFER_SIZE_EVENT` ← `SIGWINCH`；
+剪贴板 ↔ OSC 52 + `pbcopy` / `wl-copy` / `xclip`。
 
 > ⚠️ **警告 / 注意事项**：
 > 控制台终端**必须配置使用等宽字体**（Monospace Font，例如 *Cascadia Code*、*Consolas*、*JetBrains Mono*、*Fira Code* 等）。
@@ -72,6 +94,8 @@ Windows 终端复用器（Terminal Multiplexer）—— 模块化 C 架构，基
 
 ## 编译
 
+**Windows**（需要 MinGW-w64；MSVC 也可）
+
 ```bat
 :: MSVC
 cl /O2 /Iinclude src\*.c /Fe:termux.exe /link user32.lib shell32.lib
@@ -82,12 +106,41 @@ make
 x86_64-w64-mingw32-gcc -O2 -s -Wall -Wextra -Iinclude src/*.c -o termux.exe -luser32 -lshell32
 ```
 
+**Linux**
+
+```sh
+make linux          # -> ./termux-linux（需要 -lutil 提供 forkpty）
+```
+
+**macOS**（必须在 macOS 上编：`forkpty` 在 libSystem、没有 `-lutil`；
+`_NSGetExecutablePath` 在 `<mach-o/dyld.h>`。Makefile 里有 `uname -s` 护栏，
+在别的系统上跑 `make darwin` 会直接 exit 1，不会产出一个改名的 Linux 二进制冒充）
+
+```sh
+make darwin         # -> ./termux-macos
+```
+
+**跑测试**
+
+```sh
+make check-posix    # POSIX 侧一把梭：编译 + 79+ 条移植不变量 + 4 个单测 + 真 pty 冒烟
+make unittest       # 主题 / 键位 / 配置（-Werror）
+python3 verify_all.py
+```
+
+三个系统的完整检查见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
+
 ## 运行
 
 ```bat
-termux.exe          :: 正常启动
+termux.exe          :: Windows
 set TERMUX_DUMP=1   :: 启用诊断日志（termux_dump.log / render_dump.log / mouse_dump.log）
-termux.exe
+```
+
+```sh
+./termux-linux      # Linux
+./termux-macos      # macOS
+TERMUX_DUMP=1 ./termux-linux
 ```
 
 ## ⚙️ 配置文件 (termux.ini)
@@ -198,9 +251,12 @@ default_startup = 0        # 0 = 启动进终端，1 = 启动显示帮助
 
 ## 系统要求
 
-- Windows 10 1809 (RS5) 或更高（ConPTY 支持）
-- 从真实控制台窗口运行（cmd / Windows Terminal / ConEmu 等）
-- **必须使用等宽字体**（如 Cascadia Code, Consolas 等），否则会出现渲染故障与排版错位
+- **Windows**：Windows 10 1809 (RS5) 或更高（ConPTY 支持）
+- **Linux**：任何带 `forkpty`（libutil / glibc）的发行版
+- **macOS**：Apple silicon 或 Intel 均可
+- 从真实终端窗口运行（Windows Terminal / cmd / ConEmu / iTerm2 / kitty / GNOME Terminal …）
+- **必须使用等宽字体**（如 Cascadia Code, Consolas, JetBrains Mono, Menlo 等），
+  否则会出现渲染故障与排版错位
 
 ## 开发说明
 
@@ -245,7 +301,13 @@ python3 verify_config_theme.py     # 配置体系：主题参考色板完整性 
 
 ## 版本历史
 
-详见 [history.md](history.md)。
+**v2.0.0** —— 正式支持 Windows / Linux / macOS 三个系统。引擎代码三系统共用，
+平台相关部分抽到平台层；CI 在三个系统上各跑一遍完整检查并发布二进制。
+移植过程中修掉的 7 个真 bug（剪贴板死路、配置路径两层错、宽字符多字搜索、
+`plat_write_fd` EAGAIN 丢输入 41%、关于页写死 Windows 文案、命令行不认引号、
+启动目录不展开且静默失败）都有验红的回归钉住。
+
+更早的版本详见 [history.md](history.md)。
 
 ## 开源协议
 

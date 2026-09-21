@@ -52,7 +52,24 @@
 #endif
 
 #ifndef TERMUX_VERSION
-#define TERMUX_VERSION "1.8.52"
+/* v2.0.0：正式支持 Windows / Linux / macOS 三个系统。
+ * 1.x 是 Windows-only（ConPTY 后端）；2.0 起引擎代码三系统共用，只有平台层分家：
+ *   Windows : main.c + platform_win.c + conpty_loader.c     (ConPTY + CreateProcessW)
+ *   POSIX   : main_posix.c + platform_posix.c + term_input_posix.c   (forkpty)
+ * 接口见 include/platform.h。 */
+#define TERMUX_VERSION "2.0.0"
+
+/* 平台副标题。帮助页 / 关于页那几行共用 UI 代码里要用，所以跟 TERMUX_VERSION
+ * 放一起（render.c 只 include 了 common.h，没有 platform.h）。
+ * ★ 原来在共用的 render.c 里写死 "Windows Terminal Multiplexer (Win10 1809+)"，
+ *   Linux/macOS 上照样这么显示 —— 和之前修掉的关于页文案是同一类问题。 */
+#ifdef _WIN32
+#define TERMUX_HELP_PLATFORM_U8  "Windows Terminal Multiplexer (Win10 1809+)"
+#elif defined(__APPLE__)
+#define TERMUX_HELP_PLATFORM_U8  "macOS Terminal Multiplexer (forkpty)"
+#else
+#define TERMUX_HELP_PLATFORM_U8  "Linux Terminal Multiplexer (forkpty)"
+#endif
 #endif
 
 #define MAX_PANES         16

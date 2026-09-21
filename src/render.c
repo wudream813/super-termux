@@ -2057,7 +2057,7 @@ void render_command_palette(char *out, int bs, int *posp, int host_rows, int hos
 
 static const char *const g_help_head[] = {
     "\x1b[038;2;255;255;255m\x1b[048;2;031;111;235m termux - 帮助",
-    "\x1b[038;2;139;148;158m  版本 v" TERMUX_VERSION " | Windows Terminal Multiplexer (Win10 1809+)\x1b[0m",
+    "\x1b[038;2;139;148;158m  版本 v" TERMUX_VERSION " | " TERMUX_HELP_PLATFORM_U8 "\x1b[0m",
     "",
     "\x1b[038;2;121;192;255;1m  键盘快捷键\x1b[0m",
 };

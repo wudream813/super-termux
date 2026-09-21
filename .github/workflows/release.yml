@@ -1,0 +1,182 @@
+name: Release
+
+# 打版本 tag（v*）时触发：三个系统各自构建、跑完整检查、把二进制传到同一个
+# GitHub Release 上。检查和 ci.yml 是同一套 —— 发布的东西必须是 CI 验过的东西。
+#
+# 发版流程：
+#   1. 改 include/common.h 里的 TERMUX_VERSION
+#   2. git tag v2.0.0 && git push origin v2.0.0
+#   3. 三个作业跑完后，Release 页面上会有三个平台的二进制
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（例如 v2.0.0）'
+        required: true
+
+env:
+  # 手动触发时用输入的 tag；打 tag 触发时用 tag 本身
+  REL_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  # ==========================================================================
+  windows:
+    name: 构建 Windows 二进制
+    runs-on: windows-latest
+    permissions:
+      contents: write          # 上传 Release 资产需要
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-python
+            make
+
+      - name: 构建
+        run: make CC=gcc CXX=g++ all 2>&1 | tee build.log
+
+      - name: 断言 0 error / 0 warning
+        run: |
+          if grep -n "error:\|warning:" build.log; then exit 1; fi
+          test -f termux.exe
+
+      - name: 移植不变量静态检查
+        run: python tests/verify_port.py
+
+      - name: 打包
+        run: |
+          # 版本号从源码里读，避免和 tag 对不上
+          V=$(sed -n 's/.*#define TERMUX_VERSION "\([^"]*\)".*/\1/p' include/common.h)
+          echo "版本 = $V"
+          cp termux.exe "termux-${V}-windows-x64.exe"
+          sha256sum "termux-${V}-windows-x64.exe" > "termux-${V}-windows-x64.exe.sha256"
+          cat "termux-${V}-windows-x64.exe.sha256"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.REL_TAG }}
+          files: |
+            termux-*-windows-x64.exe
+            termux-*-windows-x64.exe.sha256
+          fail_on_unmatched_files: true
+
+  # ==========================================================================
+  linux:
+    name: 构建 Linux 二进制
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 clang
+
+      - name: 构建 Linux 版
+        run: make -B linux 2>&1 | tee build.log
+
+      - name: 断言 0 error / 0 warning 且是 ELF
+        run: |
+          if grep -n "error:\|warning:" build.log; then exit 1; fi
+          file termux-linux | grep -q ELF
+
+      - name: 跑完整检查
+        run: |
+          set -e
+          make check-posix
+          python3 tests/verify_port.py
+          make unittest
+          python3 verify_all.py
+          bash tests/verify_cascade.sh
+          bash tests/verify_clip_behavior.sh
+          bash tests/verify_sb_drag.sh
+          python3 verify_screen_state.py
+          python3 verify_split.py
+          python3 verify_search.py
+          python3 verify_palette_search.py
+          python3 verify_search_box.py
+          python3 verify_search_refresh.py
+
+      - name: 打包
+        run: |
+          V=$(sed -n 's/.*#define TERMUX_VERSION "\([^"]*\)".*/\1/p' include/common.h)
+          echo "版本 = $V"
+          cp termux-linux "termux-${V}-linux-x64"
+          chmod +x "termux-${V}-linux-x64"
+          sha256sum "termux-${V}-linux-x64" > "termux-${V}-linux-x64.sha256"
+          cat "termux-${V}-linux-x64.sha256"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.REL_TAG }}
+          files: |
+            termux-*-linux-x64
+            termux-*-linux-x64.sha256
+          fail_on_unmatched_files: true
+
+  # ==========================================================================
+  macos:
+    name: 构建 macOS 二进制
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建 macOS 版
+        run: make darwin 2>&1 | tee build.log
+
+      - name: 断言 0 error / 0 warning 且是 Mach-O
+        run: |
+          if grep -n "error:\|warning:" build.log; then exit 1; fi
+          file termux-macos
+          file termux-macos | grep -q Mach-O
+
+      - name: 跑完整检查
+        run: |
+          set -e
+          make check-posix
+          python3 tests/verify_port.py
+          make unittest
+          python3 verify_all.py
+          python3 verify_screen_state.py
+          python3 verify_split.py
+          python3 verify_search.py
+          python3 verify_palette_search.py
+          python3 verify_search_box.py
+          python3 verify_search_refresh.py
+
+      - name: 打包
+        run: |
+          V=$(sed -n 's/.*#define TERMUX_VERSION "\([^"]*\)".*/\1/p' include/common.h)
+          echo "版本 = $V"
+          # runner 是 arm64；如实标出来，别写成通用二进制
+          ARCH=$(uname -m)
+          cp termux-macos "termux-${V}-macos-${ARCH}"
+          chmod +x "termux-${V}-macos-${ARCH}"
+          shasum -a 256 "termux-${V}-macos-${ARCH}" > "termux-${V}-macos-${ARCH}.sha256"
+          cat "termux-${V}-macos-${ARCH}.sha256"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.REL_TAG }}
+          files: |
+            termux-*-macos-*
+          fail_on_unmatched_files: true
