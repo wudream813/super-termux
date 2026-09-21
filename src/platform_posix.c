@@ -554,6 +554,38 @@ int posix_split_cmdline(char *buf, char **argv, int max_args) {
     return argc;
 }
 
+/* environ 在 glibc 上要 _GNU_SOURCE 才由 <unistd.h> 声明，macOS 上虽然声明了但
+ * Apple 官方推荐 _NSGetEnviron()。自己声明一份 extern 两边都能用，最省事。 */
+extern char **environ;
+
+/* 把命令名解析成绝对路径（父进程调用）。含 '/' 的原样返回；否则扫 PATH。
+ * 目的见 plat_proc_spawn 里的说明：execvp 会在子进程里扫 PATH 并 malloc，
+ * 而 execve 是 async-signal-safe 的。 */
+static int resolve_program(const char *name, char *out, size_t out_sz) {
+    if (!name || !*name || out_sz == 0) return -1;
+    if (strchr(name, '/')) {
+        if (access(name, X_OK) == 0) { snprintf(out, out_sz, "%s", name); return 0; }
+        return -1;
+    }
+    const char *path = getenv("PATH");
+    if (!path || !*path) path = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    const char *p = path;
+    while (*p) {
+        const char *colon = strchr(p, ':');
+        size_t n = colon ? (size_t)(colon - p) : strlen(p);
+        if (n == 0) { p += 1; continue; }
+        if (n + strlen(name) + 2 <= out_sz) {
+            memcpy(out, p, n);
+            out[n] = '/';
+            snprintf(out + n + 1, out_sz - n - 1, "%s", name);
+            if (access(out, X_OK) == 0) return 0;
+        }
+        if (!colon) break;
+        p = colon + 1;
+    }
+    return -1;
+}
+
 int plat_proc_spawn(const char *cmd_utf8, const char *workdir_utf8,
                     int cols, int rows, HANDLE *out_in, HANDLE *out_out,
                     HANDLE *out_proc) {
@@ -566,37 +598,96 @@ int plat_proc_spawn(const char *cmd_utf8, const char *workdir_utf8,
     pid_t pid = forkpty(&master, NULL, NULL, &ws);
     if (pid < 0) return -1;
 
+    /* ======================================================================
+     * ★ fork 之后到 exec 之前【只能】调 async-signal-safe 的函数。
+     *
+     * 以前这里在子进程里做了 setenv ×2、fprintf、strerror、getpwuid（在
+     * env_home() 里）、snprintf、execvp —— 每一个都会 malloc 或取全局锁。
+     * termux 是多线程的（每个 pane 一个读线程），fork 的那一刻别的线程可能
+     * 正持有 malloc 锁；子进程一碰 malloc 就永久死锁。glibc 对此相当宽容，
+     * macOS 的 libsystem 不宽容 —— CI 的 macOS 作业在第二次分屏（也就是第三
+     * 次 spawn）之后整个应用不再出帧、SIGTERM 5 秒都杀不掉，正是这个形态。
+     *
+     * 所以现在：argv、envp、命令的绝对路径、报错文本【全部在父进程里】准备好，
+     * 子进程只剩 chdir + write + execve 三个 async-signal-safe 调用。
+     * fork 会复制整个地址空间，父进程栈上的 argv/cmdbuf 在子进程里照样有效。
+     * ==================================================================== */
+    char cmdbuf[512];
+    snprintf(cmdbuf, sizeof(cmdbuf), "%s", cmd_utf8 && *cmd_utf8 ? cmd_utf8 : "/bin/sh");
+    char *argv[32];
+    int argc = posix_split_cmdline(cmdbuf, argv, 32);
+    if (argc == 0) { argv[0] = (char *)"/bin/sh"; argv[1] = NULL; argc = 1; }
+
+    /* execvp 会在子进程里扫 PATH（要 malloc）。改成父进程先解析出绝对路径，
+     * 子进程用 execve —— 它是 async-signal-safe 的。 */
+    char prog[1024];
+    if (resolve_program(argv[0], prog, sizeof(prog)) != 0) {
+        snprintf(prog, sizeof(prog), "%s", argv[0]);   /* 解析不到就照原样交给内核 */
+    }
+    argv[0] = prog;
+
+    /* 环境变量：在父进程里拷一份 environ 出来改，而不是在子进程里 setenv。 */
+    char term_kv[] = "TERM=xterm-256color";
+    char color_kv[] = "COLORTERM=truecolor";
+    int envn = 0;
+    while (environ[envn]) envn++;
+    char **envp = (char **)malloc((size_t)(envn + 3) * sizeof(char *));
+    if (!envp) { close(master); return -1; }
+    {
+        int k = 0, replaced_term = 0, replaced_color = 0;
+        for (int i = 0; i < envn; i++) {
+            if (!strncmp(environ[i], "TERM=", 5))     { envp[k++] = term_kv;  replaced_term = 1; }
+            else if (!strncmp(environ[i], "COLORTERM=", 10)) { envp[k++] = color_kv; replaced_color = 1; }
+            else envp[k++] = environ[i];
+        }
+        if (!replaced_term)  envp[k++] = term_kv;
+        if (!replaced_color) envp[k++] = color_kv;
+        envp[k] = NULL;
+    }
+
+    /* 启动目录的报错文本也在父进程里备好：strerror / snprintf 都不能在子进程调。
+     * 用 access 预先探一次；万一父进程探测通过而子进程 chdir 仍失败（权限/竞态），
+     * 就退化成一句不带 errno 的通用提示。 */
+    char errmsg[600];
+    int errmsg_len = 0;
+    char homedir[512] = {0};
+    if (workdir_utf8 && *workdir_utf8) {
+        const char *h = env_home();
+        if (h) snprintf(homedir, sizeof(homedir), "%s", h);
+        if (access(workdir_utf8, X_OK) != 0) {
+            const char *why = strerror(errno);
+            if (homedir[0])
+                errmsg_len = snprintf(errmsg, sizeof(errmsg),
+                    "termux: 启动目录 \"%s\" 不可用（%s），已改用 %s\r\n",
+                    workdir_utf8, why, homedir);
+            else
+                errmsg_len = snprintf(errmsg, sizeof(errmsg),
+                    "termux: 启动目录 \"%s\" 不可用（%s），留在当前目录\r\n",
+                    workdir_utf8, why);
+        } else {
+            errmsg_len = snprintf(errmsg, sizeof(errmsg),
+                "termux: 启动目录 \"%s\" 切不进去%s\r\n", workdir_utf8,
+                homedir[0] ? "，已改用主目录" : "");
+        }
+    }
+
     if (pid == 0) {
-        /* ---- 子进程：已经有控制终端了，直接 exec shell ---- */
+        /* ---- 子进程：只有 async-signal-safe 的调用 ---- */
         if (workdir_utf8 && *workdir_utf8) {
             if (chdir(workdir_utf8) != 0) {
-                /* 目录不存在 / 没权限。原来这里只有一句注释、什么都不做，于是
-                 * 静默留在 termux 的启动目录 —— 用户完全不知道自己的设置没生效。
-                 * 现在按注释承诺退回 HOME，并且把这件事说出来。 */
-                int e = errno;
-                const char *h = env_home();
-                fprintf(stderr, "termux: 启动目录 \"%s\" 不可用（%s）",
-                        workdir_utf8, strerror(e));
-                if (h && *h && chdir(h) == 0)
-                    fprintf(stderr, "，已改用 %s\r\n", h);
-                else
-                    fprintf(stderr, "，留在当前目录\r\n");
+                if (errmsg_len > 0) {
+                    ssize_t wr = write(2, errmsg, (size_t)errmsg_len);
+                    (void)wr;
+                }
+                if (homedir[0]) {
+                    if (chdir(homedir) != 0) { /* 连主目录都进不去就留在原地 */ }
+                }
             }
         }
-        setenv("TERM", "xterm-256color", 1);
-        setenv("COLORTERM", "truecolor", 1);
-
-        /* cmd_utf8 可能带参数（菜单项里可以写 "bash -l"，也可以写
-         * /bin/sh -c "echo hi; sleep 6"），按 shell 的习惯切成 argv。 */
-        char cmdbuf[512];
-        snprintf(cmdbuf, sizeof(cmdbuf), "%s", cmd_utf8 && *cmd_utf8 ? cmd_utf8 : "/bin/sh");
-        char *argv[32];
-        int argc = posix_split_cmdline(cmdbuf, argv, 32);
-        if (argc == 0) { argv[0] = (char *)"/bin/sh"; argv[1] = NULL; }
-        execvp(argv[0], argv);
-        fprintf(stderr, "termux: 无法启动 \"%s\": %s\r\n", argv[0], strerror(errno));
+        execve(prog, argv, envp);
         _exit(127);
     }
+    free(envp);   /* 只有父进程走到这里；子进程已经 exec 或 _exit 了 */
 
     /* ---- 父进程 ---- */
     int fl = fcntl(master, F_GETFL, 0);

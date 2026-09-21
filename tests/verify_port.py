@@ -277,10 +277,30 @@ ck("posix_expand_env 认开头的 ~", "'~'" in PLAT_POSIX)
 ck("pane.c 的 POSIX 分支调用了 posix_expand_env", "posix_expand_env(raw_dir" in PANE)
 _sp = PLAT_POSIX.split("int plat_proc_spawn(", 1)[1]
 _sp = _sp[:_sp.find("/* ---- 父进程 ----")]
-ck("chdir 失败不再被静默吞掉（有 fprintf 报告）", "fprintf(stderr" in _sp)
-ck("chdir 失败真的会退回 HOME", "chdir(h)" in _sp or "chdir(env_home())" in _sp)
+ck("chdir 失败不再被静默吞掉（子进程里会报错）", "write(2, errmsg" in _sp)
+ck("chdir 失败真的会退回 HOME", "chdir(homedir)" in _sp)
 ck("chdir 失败不再是空语句",
    "{ /* 目录不存在就退回 HOME */ }" not in PLAT_POSIX)
+
+# --- fork 之后到 exec 之前只能用 async-signal-safe 的调用 ---------------------
+# termux 是多线程的（每个 pane 一个读线程）。fork 那一刻别的线程可能正持有
+# malloc 锁，子进程一碰 malloc 就永久死锁。glibc 宽容，macOS 的 libsystem 不
+# 宽容：CI 的 macOS 作业在第二次分屏（第三次 spawn）之后整个应用不再出帧、
+# SIGTERM 5 秒都杀不掉。所以 argv / envp / 绝对路径 / 报错文本必须全在父进程
+# 里备好，子进程只剩 chdir + write + execve。
+# ★ 必须限定在 plat_proc_spawn 里：本文件还有另一个 fork（剪贴板兜底调
+#   pbcopy/wl-copy/xclip 的那个），它用 execvp 是对的 —— 那个 fork 之前没有
+#   起过读线程，而且是 fire-and-forget。全文 split 会取到它，断言就全假红。
+assert _sp.count("if (pid == 0) {") == 1, "plat_proc_spawn 里的子进程块定位失败"
+_child = _sp.split("if (pid == 0) {", 1)[1]
+_child = _child[:_child.find("free(envp);")]
+assert "execve(" in _child, "子进程块切片没切对（里面应该有 execve）"
+for bad in ("setenv(", "fprintf(", "strerror(", "getpwuid(", "snprintf(", "execvp("):
+    ck("fork 子进程里没有 %s（非 async-signal-safe）" % bad, bad not in _child)
+ck("fork 子进程用 execve（async-signal-safe）", "execve(" in _child)
+ck("命令的绝对路径在父进程里解析（resolve_program）", "resolve_program(argv[0]" in _sp)
+ck("environ 显式声明（glibc 要 _GNU_SOURCE，自己声明两边通用）",
+   "extern char **environ;" in PLAT_POSIX)
 
 # ===========================================================================
 # 自证：故意把一条断言的条件取反，必须失败。

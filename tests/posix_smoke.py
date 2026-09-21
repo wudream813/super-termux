@@ -113,6 +113,8 @@ def main():
                 pass
             time.sleep(0.02)
 
+    prev_total = [0]
+
     def step(label, keys, wait=1.0):
         drain(0.05)
         if keys:
@@ -120,6 +122,15 @@ def main():
         drain(wait)
         grid, total = decode(dump, COLS)
         print("\n[%s] 帧数=%d" % (label, total))
+        # ★ 诊断：帧数没涨 = 应用【停止渲染】了（卡死或崩溃）。CI 的 macOS 作业
+        #   就是从这里开始一路红到底，但日志里只有「帧里没有 XXX」，看不出是
+        #   渲染停了还是内容不对。把进程状态和帧数变化直接打出来。
+        if total <= prev_total[0]:
+            rc = p.poll()
+            print("  [警告] 帧数没增加（%d -> %d）：应用已停止渲染。进程状态=%s"
+                  % (prev_total[0], total,
+                     "还活着（卡死）" if rc is None else "已退出，退出码=%s" % rc))
+        prev_total[0] = total
         return grid, total
 
     # 剧本：(标签, 发送的字节, 等待秒, [(断言名, 必须出现的子串)])
@@ -171,7 +182,13 @@ def main():
                 ck(name, grid.count("\u00d7") >= 2,
                    "× 只出现 %d 次" % grid.count("\u00d7"))
             else:
-                ck(name, needle in grid, "帧里没有 %r" % needle)
+                ok = needle in grid
+                extra = "帧里没有 %r" % needle
+                if not ok:
+                    # 失败时把标签栏那一行也打出来，省得再去猜实际渲染成什么样
+                    lines = [ln for ln in grid.split("\n") if ln.strip()]
+                    extra += "；标签栏实际是 %r" % (lines[0].strip()[:60] if lines else "(空帧)")
+                ck(name, ok, extra)
         if label.startswith("退出复制模式"):
             ck("复制模式提示确实消失了", "[复制模式 " not in grid)
         if label.startswith("回滚：滚轮"):
