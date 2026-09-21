@@ -1,11 +1,26 @@
 #include "vt.h"
 
 static void screen_put_cp(ScreenBuffer *s, unsigned int cp) {
+    s->cup_eol_row = -1;   /* 写了内容，「刚 CUP 到底行末列」的判定窗口即作废 */
     if (s->wraparound_pending) {
         s->cursor_x = 0;
         screen_newline(s);
         screen_mark_softwrap(s);   /* 自动折行：新物理行是上一行的软换行续行 */
         s->wraparound_pending = 0;
+    }
+    /* ConPTY 右缘填充空格：宽字符正好写完一行的最后两列时，conhost 会在折行前
+     * 补一个空格把右缘填满（实测字节流 uploads/termux_dump.log 偏移 6145，
+     * [pane 0 len 115]：「…Windows驱 \n」，窗格宽 40，「驱」占 36-37 列，那个空格
+     * 落在 38 列）。这个空格是纯排版填充、不是内容，但一旦写进模型就会把 used 撑大，
+     * 之后窗格变宽 reflow 把折行拼回去，它就永久夹在宽字符和下一个字之间——表现为
+     * 「驱 动」「洛 谷」这类中文里凭空多出空格（cell_diag.log F104-F131 实测 26 条）。
+     * 判据：本格左邻是宽字符次格（ch==0）、且光标已贴近右缘。此时丢弃该空格。
+     * 阈值取 cols-2 而非 cols-1：conhost 自己算的右缘与本模型可能差一列（实测
+     * 「驱」占 36-37、cursor_x=38、cols=40，填充空格仍会发来），只卡 cols-1 会漏。
+     * 左邻非次格、或光标远离右缘（中文词间的真实空格，如「洛谷 题解」）都不受影响。 */
+    if (cp == 0x20 && s->cursor_x > 0 && s->cursor_x >= s->cols - 2) {
+        CHAR_INFO *prev = screen_cell(s, s->cursor_y, s->cursor_x - 1);
+        if (prev && prev->Char.UnicodeChar == 0) return;
     }
     int wide = is_wide_cp(cp);
     if (wide && s->cursor_x >= s->cols - 1) {
@@ -223,6 +238,7 @@ void execute_osc(ScreenBuffer *s) {
 void execute_esc(ScreenBuffer *s, char final, const char *inter, int inter_len) {
     (void)inter;
     if (inter_len > 0) return;
+    s->cup_eol_row = -1;
 
     switch (final) {
         case 'D': screen_newline(s); break;
@@ -245,6 +261,13 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
     int p2 = pc > 1 ? params[1] : 0;
 
     if (inter_len > 0) return;
+    /* CSI ? Ps h/l（DECTCEM 光标显隐、鼠标模式等私有开关）既不移光标也不动内容，
+     * 不能作废「底行末列 CUP」的判定窗口 —— 真机字节里它就夹在那个 CUP 和随后的
+     * CRLF 中间（uploads/termux_dump.log 2026-09-17 14:10 那批，pane0 偏移 3878）：
+     *     ESC[29;39H ESC[?25l CR LF "            Users  "
+     * 一并作废就会让这条记录被拆成「<DIR> 那半 + 名字那半」两行（本地回放实测）。
+     * 除此之外任何 CSI 都作废该窗口。 */
+    if (!(prefix == '?' && (final == 'h' || final == 'l'))) s->cup_eol_row = -1;
 
     if (prefix == '?') {
         if (final == 'h') {
@@ -255,7 +278,34 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
                     case 25:
                         s->cursor_visible = 1;
                         s->repaint_candidate = 0;
-                        s->repaint_active = 0;
+                        /* 整屏重绘到此结束：若提示符下方被 conhost 补了一串空行，
+                         * 从 scrollback 拉等量历史把它顶回最后一行（见函数注释）。
+                         * 用户正在回看历史时不动，免得视图跳。 */
+                        if (s->repaint_active) {
+                            int pi = s->pane_index;
+                            int at_bottom = !(pi >= 0 && pi < MAX_PANES &&
+                                              g_mux.panes[pi].scroll_offset != 0);
+                            int pending = s->resize_repaint_pending;
+                            s->repaint_active = 0;
+                            /* 用户正在回看历史时不动，免得视图跳。 */
+                            if (at_bottom && pending) {
+                                /* 返回 1 = 这趟重绘写到了最后一行、没东西可锚定，
+                                 * 是 conhost 两趟重绘的第一趟：pending 和快照都留给
+                                 * 下一趟（真机 2026-09-20：第一趟 ESC[29;1H ESC[?25h
+                                 * 收尾，第二趟才是 ESC[5;26H + 24 行 ESC[K）。
+                                 * 让过一趟就封顶，免得 pending 长期挂着。 */
+                                if (screen_repaint_reanchor(s) == 1 &&
+                                    ++s->resize_repaint_pass < 2) {
+                                    /* 保留 resize_repaint_pending 与 repaint_snap */
+                                } else {
+                                    s->resize_repaint_pending = 0;
+                                    screen_repaint_snapshot_free(s);
+                                }
+                            } else {
+                                s->resize_repaint_pending = 0;
+                                screen_repaint_snapshot_free(s);
+                            }
+                        }
                         break;
                     case 47: case 1047:
                         if (!s->in_alt_screen) {
@@ -346,8 +396,14 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
             /* ConPTY resize repaint 固定以隐藏光标后 HOME 开始。仅用控制状态识别，
              * 不检查提示符文本；这样启动 banner 的合法空行也不会被误删。 */
             if (s->repaint_candidate && (p1 == 0 || p1 == 1) &&
-                (p2 == 0 || p2 == 1) && !s->in_alt_screen)
+                (p2 == 0 || p2 == 1) && !s->in_alt_screen) {
                 s->repaint_active = 1;
+                /* 存下重绘前的可见行：conhost 增高后只发它 viewport 里那几行，
+                 * 少发的那几行要靠这份快照在重绘结束时补回顶部。
+                 * 同一次 resize 只取【第一趟】重绘前的快照：第二趟之前屏幕已经被
+                 * 第一趟改过了，那时再取就存到一份被污染的快照。 */
+                if (s->resize_repaint_pending && !s->repaint_snap) screen_repaint_snapshot(s);
+            }
             s->cursor_y = (p1 ? p1 : 1) - 1; s->cursor_x = (p2 ? p2 : 1) - 1;
             if (s->origin_mode) s->cursor_y += s->scroll_region_top;
             if (s->cursor_y >= s->rows) s->cursor_y = s->rows - 1;
@@ -355,6 +411,37 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
             if (s->cursor_x >= s->cols) s->cursor_x = s->cols - 1;
             if (s->cursor_x < 0) s->cursor_x = 0;
             s->wraparound_pending = 0;
+            /* 这里曾经有一整套「ConPTY 窄屏行内续写」的 line_wrap 特殊处理
+             * （bug #11 加的置 1 + bug #15 第一层加的 CUP 换行清 0）。
+             * 2026-09-17 用真机字节流证明【两个分支都是错的】，已全部删除。
+             *
+             * conhost 折行续写的真实字节形态（uploads/termux_dump.log 2026-09-17
+             * 那批，pane0 偏移 1288，窗格 24 列，共 55 处）：
+             *     …are ESC]0;…cmd.exe - dir BEL ESC[?25h CR LF ESC[28;24H ena CR LF …
+             * ESC[28;24H = 0 基 (27,23) = 【刚写满那一行的最后一列】。写第一个字符
+             * 就触发自动折行，所以真正的续行是【下面那一行】—— 而 screen_put_cp
+             * 的自动折行路径（screen_newline + screen_mark_softwrap）本来就会正确
+             * 地把它标成 line_wrap=1。不需要任何额外规则。
+             *
+             * 旧代码却标 line_wrap[cursor_y]（= 被续写的那一行），语义正好反了：
+             * line_wrap[r]=1 的含义是「r 是 r-1 的续行」。每误标一次就多并一条记录
+             * 边界 —— 那次真机会话里触发 47 次，于是 24 列下整份 dir 列表被并成
+             * 一条 1484 字符的逻辑行，拖宽到 82 后按 82 重折，就是用户看到的
+             * 「内容顺序完好、词从中间切开」的级联错位。
+             *
+             * CUP 换行清 0 同样错：ESC[28;24H 的落点行本来就在一条逻辑行【中间】，
+             * 清掉它的标记会把记录拆成两行（本地实测 A 变体：
+             * 「2026-09-17  13:52」与「319,844 cell_diag.log」被拆成上下两行）。
+             *
+             * 保留的只有 screen_lf() 里那条 LF 清 0（硬换行落点行不可能是续行），
+             * A/B 证明它是必需的：去掉它，2026-09-15 那批字节流在 split=4200..4800
+             * 复现跨记录拼接。 */
+            /* 形态 (2) 的识别：CUP 落在屏幕【最后一行的末列】。conhost 用它把
+             * 「已自动折到下一行」的内部光标收回末列，紧跟的 CR LF 才会在底行触发
+             * 整屏滚动，续写文本落在滚出来的新底行上（判定见 screen_lf 滚动分支）。
+             * 真机字节：ESC[29;47H —— 窗格 24x29，列 47 越界被钳到末列 23。 */
+            s->cup_eol_row = (s->cursor_y == s->rows - 1 && s->cursor_x == s->cols - 1)
+                             ? s->cursor_y : -1;
             if (p1 <= 1 && p2 <= 1) s->detect_count = 0;
             break;
         }
@@ -476,9 +563,24 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
 /* LF 必须始终按终端字节流行进。CR 与 LF 之间允许夹 OSC 标题，因此
  * `CR OSC LF` 仍是真实换行；连续的另一个 `OSC LF` 则明确产生空行。
  * 不能因为光标已在底部空行就吸收裸 LF，否则长命令输出结束时
- * `LINE-80, blank, prompt` 会错误地压成 `LINE-80, prompt`。 */
+ * `LINE-80, blank, prompt` 会错误地压成 `LINE-80, prompt`。
+ *
+ * ⚠️ 别再把「裸 LF 吸收」加回来。cmd 命令结束后那个空行有 4 种真实字节形态
+ * （verify_wide_wrap.py 已逐条固化）：
+ *   A  ESC]0;标题 BEL + LF      ← 无 CR
+ *   B  LF                       ← 无 CR
+ *   C  CR LF CR LF
+ *   D  CR + ESC]0;标题 BEL + LF
+ * A / B 是【裸 LF】，任何「裸 LF 且底行空白就吸收」的规则都会把它们吃掉，真机
+ * 症状就是「命令结束后少了一个空行」。cr_pending 那条规则（ESC 不打断 CR/LF
+ * 配对）只救得了 D，救不了 A / B。幻影空行的正主是 ConPTY 的整屏重绘，已由
+ * repaint_active + screen_scroll_viewport_up 处理，不需要靠猜裸 LF。 */
 static void screen_lf(ScreenBuffer *s, int real_newline) {
     (void)real_newline;
+    /* 形态 (2)：CUP 刚把光标收到【本行末列且本行是屏幕底行】，那么这个 LF 不是
+     * 逻辑行结束，而是 conhost 为了继续写这条逻辑行而强制的一次滚动。 */
+    int eol_cont = (s->cup_eol_row >= 0 && s->cup_eol_row == s->cursor_y);
+    s->cup_eol_row = -1;
     if (s->cursor_y >= s->scroll_region_bottom) {
         /* 整屏重绘的 CRLF 只是按行遍历 viewport。若在底边产生普通滚动，
          * 每次拖动分隔线都会把重绘尾部空行塞入历史，并最终挤掉下方 pane 的
@@ -490,8 +592,38 @@ static void screen_lf(ScreenBuffer *s, int real_newline) {
             return;
         }
         screen_scroll_up(s, s->scroll_region_top, s->scroll_region_bottom, 1);
+        /* 滚出来的新底行是上一行的【软换行续行】。前提：上一行确实被写满 —— 写满
+         * 才可能是折行；没写满就说明那个 CUP 只是碰巧停在右下角，LF 是真硬换行。
+         * 只在整屏滚动分支成立：部分滚动不旋转环形缓冲，行号语义不同。
+         * 不加这条会怎样（本地实测，tests/fixtures_pane0_stream_v2.bin，24 列）：
+         * bin / Ext2Fsd / Vape 三条记录的 <DIR> 半截与名字半截分家，拖宽后名字
+         * 独占一行、前面挂着一串空格 —— 用户报的「多余空格」。 */
+        if (eol_cont && !s->in_alt_screen && s->line_wrap && s->cursor_y > 0 &&
+            s->scroll_region_top == 0 && s->scroll_region_bottom == s->rows - 1) {
+            int pr = screen_phys_row(s, s->cursor_y - 1);
+            if (pr >= 0 && pr < s->total_lines && s->lines && s->lines[pr].cells &&
+                s->lines[pr].used >= s->cols)
+                screen_mark_softwrap(s);
+        }
     } else if (s->cursor_y < s->rows - 1) {
         s->cursor_y++;
+        /* 硬换行落到一个【已有旧内容】的行上时，必须清掉它残留的软换行标记。
+         *
+         * 这一行可能上一轮输出里是自动折行的续行（line_wrap=1）。LF 是硬换行，
+         * 落到这里的内容是一条新的逻辑行，绝不是上一行的续行；标记不清就会让
+         * 之后的 reflow 把两行并成一行。
+         *
+         * 真机触发路径（2026-09-15 那批日志）：拖动分屏 -> ConPTY 用 ESC[H 整屏
+         * 重绘 -> 重绘的 CRLF 落在上一轮残留的续行上 -> line_wrap 仍是 1 ->
+         * 松手 reflow 把「1,593 termux_dump.log」和下一条「2025/12/23 … test.bat」
+         * 并成一行（cell_diag F110..F220 第一行恒为「…docx.txt2026/0…」）。
+         * 滚动分支不需要处理：screen_scroll_up 会把新底行填空并清标记。
+         * 自动折行也不受影响：那条路径走 screen_newline + screen_mark_softwrap，
+         * 不经过本函数，且在本函数之后才置 1。 */
+        if (s->line_wrap && !s->in_alt_screen) {
+            int pr = screen_phys_row(s, s->cursor_y);
+            if (pr >= 0 && pr < s->total_lines) s->line_wrap[pr] = 0;
+        }
     }
 }
 
@@ -516,6 +648,9 @@ static void screen_process_byte(ScreenBuffer *s, unsigned char c) {
     switch (s->state) {
         case ST_NORMAL:
             if (c < 0x20) {
+                /* CR 不打断（它与随后的 LF 是一对）；LF/VT/FF 由 screen_lf 消费；
+                 * 其余 C0 一律作废「底行末列 CUP」的判定窗口。 */
+                if (c != 0x0A && c != 0x0B && c != 0x0C && c != 0x0D) s->cup_eol_row = -1;
                 switch (c) {
                     case 0x07: break;
                     case 0x08: if (s->cursor_x > 0) s->cursor_x--; s->wraparound_pending = 0; break;

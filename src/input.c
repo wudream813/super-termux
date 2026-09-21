@@ -1,4 +1,5 @@
 #include "input.h"
+#include "platform.h"   /* TERMUX_DEFAULT_SHELL_* */
 #include "cliphtml.h"
 #include "split.h"
 #include <ctype.h>
@@ -61,6 +62,25 @@ static int PALETTE_TO_SPLIT_ACT(int a) {
 /* 分屏边框拖拽状态：drag_dir='V' 拖竖线(左右调宽) / 'H' 拖横线(上下调高)。 */
 static int g_split_drag_pane = -1;   /* 拖拽时作为「a 侧」锚点的 pane */
 static char g_split_drag_dir = 0;    /* 'V' / 'H' / 0 */
+/* 按下那一刻定好的【要改哪个分屏节点】。不能等到拖动时现算：拖动过程中矩形一直在
+ * 变，而「用户抓的是哪条线」必须在按下时就锁定。见 split_drag_pick_node() 的注释
+ * （src/split.c，bug #27）。 */
+static int g_split_drag_node = -1;
+
+/* 分屏边框是否正在被拖动。pane_resize_to 用它把【本地 screen_resize 和
+ * ResizePseudoConsole 一起】推迟到松手。
+ *
+ * 为什么两侧都要推迟（不是只推迟 ConPTY）：
+ * - 只推迟 ConPTY、本地照常逐帧 resize 会错位：conhost 输出始终按冻结的旧宽度
+ *   排版，模型却每帧按新宽度 reflow，拿窄屏碎片拼宽屏行，拼出来必然是错的。
+ *   症状是「拖动过程中有错位，要等停止拖动才消失」。
+ * - 只推迟本地、ConPTY 照常逐帧 resize 会吃历史：conhost 每帧整屏重绘，重绘只
+ *   覆盖自己的视口且宽度滞后于本地模型，screen_repaint_align 对不齐（返回 2 不
+ *   动作），滚出视口的行被就地覆盖而 hist_lines 不增长。真机实测一次拖动把 hist
+ *   从 93 一路吃到 0（用户报的「历史被截断」）。
+ * 两侧一起冻结就没有宽度差：拖动中画面稳定（窗格边界仍跟鼠标动，布局矩形由
+ * split_layout 算，不经过 pane_resize_to），松手后第一帧一次性 reflow + 补发。 */
+int split_drag_active(void) { return g_split_drag_dir != 0 && g_split_drag_pane >= 0; }
 
 /* 算出当前各 pane 的内容区矩形（与 render 同源 split_layout）。 */
 static void split_mouse_rects(PaneRect *rects) {
@@ -81,6 +101,23 @@ static void split_mouse_rects(PaneRect *rects) {
  * 故内容区第 r0 行 = 终端行 r0+2 = 控制台 my = r0+1）。 */
 static int handle_split_mouse(MOUSE_EVENT_RECORD *me) {
     if (!split_is_split() || g_split_zoom) return 0;
+    /* 滚动条拖动期间的鼠标捕获（2026-09-20 用户报「滚动时光标移到另一个窗格会
+     * 直接变成移动另一个窗格的滚动条」）：
+     *  - 松手：就地结束拖动并吃掉这一下。必须放在坐标裁剪【之前】—— 在窗格外面
+     *    松手的话，下面那些重置分支根本走不到，g_sb_dragging 会一直卡住，从此
+     *    分屏层再也不切焦点。
+     *  - 拖动中：一律不切焦点、也不吞事件，交回常规路径按【原窗格】继续算。否则
+     *    下面第 3 步会 switch_pane，后续 move 事件就去拖另一个窗格的条，而
+     *    grab_offset 还是原窗格算出来的。
+     * 分隔条拖动本来就有同样的捕获（第 1 步直接 return 1），这边补上。 */
+    if (g_sb_dragging) {
+        if (!(me->dwButtonState & (FROM_LEFT_1ST_BUTTON_PRESSED | FROM_LEFT_2ND_BUTTON_PRESSED))) {
+            g_sb_dragging = 0; g_sb_drag_pane = -1; g_sb_grab_offset = 0;
+            g_mux.needs_redraw = 1;
+            return 1;
+        }
+        return 0;
+    }
     int mx = me->dwMousePosition.X, my = me->dwMousePosition.Y;
     int content_y = my - 1;   /* 内容区 0 基行（标签栏占 my=0） */
     int content_x = mx;       /* 内容区 0 基列 */
@@ -94,40 +131,28 @@ static int handle_split_mouse(MOUSE_EVENT_RECORD *me) {
 
     /* 1) 正在拖边框：根据鼠标移动调 frac。 */
     if (g_split_drag_dir && g_split_drag_pane >= 0) {
-        if (!pressed) { g_split_drag_dir = 0; g_split_drag_pane = -1; return 1; }
+        if (!pressed) {
+            g_split_drag_dir = 0; g_split_drag_pane = -1; g_split_drag_node = -1;
+            /* 拖动期间 pane_resize_to 一直跳过 ResizePseudoConsole（见 split_drag_active
+             * 的注释）。松手后必须再渲染一帧，那一帧里的 pane_resize_to 才会检测到
+             * conpty_cols 与布局宽度不一致并把 resize 补发给 ConPTY。主循环在
+             * needs_redraw==0 时要等 25ms 且不渲染，所以这里必须显式点亮。 */
+            g_mux.needs_redraw = 1;
+            return 1;
+        }
+        /* 百分比一律按【被改的那个节点】自己的子树跨度算（split_drag_pct），不再
+         * 用「锚点外接宽 + 1 + 屏幕上右邻宽」。后者只在锚点与右邻恰好是同一个节点
+         * 的直接兄弟时才等于那个节点的跨度；嵌套分屏下拖中间格的右侧分隔线，右邻
+         * 落在节点子树之外，分母就不对了 —— 而且被改的还是【里层】那条分隔线，
+         * 表现为「动的是另一条分隔条」。（2026-09-20 用户报，bug #27。） */
         int root = split_active_root();
-        if (g_split_drag_dir == 'V') {
-            /* 鼠标在锚点 pane 右边缘附近：以相对位置算目标百分比并 resize。
-             * 用【外接分配宽度】（分隔线位置即外接边界，内容内缩不影响比例）。 */
-            PaneRect *a = &rects[g_split_drag_pane];
-            if (a->valid) {
-                /* 找到该分隔的总宽 = a 外接宽 + 1 + 右邻外接宽。 */
-                int bx = content_x;            /* 期望竖线列 */
-                int total = a->ocols + 1;
-                for (int i = 0; i < MAX_PANES; i++)
-                    if (rects[i].valid && rects[i].oc0 == a->oc0 + a->ocols + 1) total += rects[i].ocols;
-                int left_w = bx - a->oc0;
-                int pct = total > 1 ? (left_w * 100) / (total - 1) : 50;
-                if (pct < 5) pct = 5;
-                if (pct > 95) pct = 95;
-                /* 直接设置锚点所在 V 分隔的 frac。 */
-                split_resize_set_frac(root, g_split_drag_pane, 'V', pct);
-                g_mux.needs_redraw = 1;
-            }
-        } else {
-            PaneRect *a = &rects[g_split_drag_pane];
-            if (a->valid) {
-                int by = content_y;
-                int total = a->orows + 1;
-                for (int i = 0; i < MAX_PANES; i++)
-                    if (rects[i].valid && rects[i].or0 == a->or0 + a->orows + 1) total += rects[i].orows;
-                int top_h = by - a->or0;
-                int pct = total > 1 ? (top_h * 100) / (total - 1) : 50;
-                if (pct < 5) pct = 5;
-                if (pct > 95) pct = 95;
-                split_resize_set_frac(root, g_split_drag_pane, 'H', pct);
-                g_mux.needs_redraw = 1;
-            }
+        PaneRect *a = &rects[g_split_drag_pane];
+        int pct = 0;
+        if (root >= 0 && a->valid && g_split_drag_node >= 0 &&
+            split_drag_pct(rects, g_split_drag_node, g_split_drag_dir,
+                           g_split_drag_dir == 'V' ? content_x : content_y, &pct)) {
+            split_set_frac_node(g_split_drag_node, g_split_drag_pane, pct);
+            g_mux.needs_redraw = 1;
         }
         return 1;
     }
@@ -145,7 +170,13 @@ static int handle_split_mouse(MOUSE_EVENT_RECORD *me) {
                 if (rects[j].valid && j != i && rects[j].oc0 == vx + 1 &&
                     content_y >= r->or0 && content_y < r->or0 + r->orows) has_r = 1;
             if (has_r && content_x == vx && content_y >= r->or0 && content_y < r->or0 + r->orows) {
-                g_split_drag_dir = 'V'; g_split_drag_pane = i; return 1;
+                g_split_drag_dir = 'V'; g_split_drag_pane = i;
+                /* 按下时就锁定该改哪个节点。同一列上可能有多个 pane 的右沿重合
+                 * （上/中/下三格的右沿都在外层分隔线上），但 y 范围把候选限成了
+                 * 一个；真正会搞错的是【嵌套方向】—— 中间格右沿那条线属于外层
+                 * 祖先，不是中间格自己那个 V 节点。 */
+                g_split_drag_node = split_drag_pick_node(rects, split_active_root(), i, 'V', vx);
+                return 1;
             }
             int hy = r->or0 + r->orows;
             int has_d = 0;
@@ -153,7 +184,10 @@ static int handle_split_mouse(MOUSE_EVENT_RECORD *me) {
                 if (rects[j].valid && j != i && rects[j].or0 == hy + 1 &&
                     content_x >= r->oc0 && content_x < r->oc0 + r->ocols) has_d = 1;
             if (has_d && content_y == hy && content_x >= r->oc0 && content_x < r->oc0 + r->ocols) {
-                g_split_drag_dir = 'H'; g_split_drag_pane = i; return 1;
+                g_split_drag_dir = 'H'; g_split_drag_pane = i;
+                /* 同上：横线也有同样的嵌套问题（左右分三格后再把中间那格上下分）。 */
+                g_split_drag_node = split_drag_pick_node(rects, split_active_root(), i, 'H', hy);
+                return 1;
             }
         }
     }
@@ -263,13 +297,21 @@ static void run_search(int live) {
     EnterCriticalSection(&g_mux.cs);
     int total_lines = s->in_alt_screen ? s->rows : (s->hist_lines + s->rows);
     WCHAR *row_chars = (WCHAR *)malloc(s->cols * sizeof(WCHAR));
-    if (!row_chars) {
+    int *row_x = (int *)malloc(s->cols * sizeof(int));
+    if (!row_chars || !row_x) {
+        free(row_chars);
+        free(row_x);
         LeaveCriticalSection(&g_mux.cs);
         return;
     }
 
     for (int abs_y = 0; abs_y < total_lines; abs_y++) {
-        int rlen = s->cols;
+        /* 把整行压成「只含主格」的紧凑序列。宽字符在缓冲里占两格：主格存码点、
+         * 次格 UnicodeChar==0。若按物理列逐格比较，查询串的第二个字符会撞上
+         * 次格的 0，于是「中文」这类跨宽字的多字词永远匹配不上（单字「中」却能
+         * 命中，因为主格本身就在）——同理「a中」能中而「中b」不能。所以先压缩，
+         * 匹配完再用 row_x[] 把结果映射回物理列。 */
+        int n_prim = 0;
         for (int x = 0; x < s->cols; x++) {
             CHAR_INFO *cell = NULL;
             if (s->in_alt_screen) {
@@ -281,29 +323,45 @@ static void run_search(int live) {
                 if (pr >= 0 && pr < s->total_lines && s->lines && s->lines[pr].cells)
                     cell = &s->lines[pr].cells[x];
             }
-            row_chars[x] = cell ? cell->Char.UnicodeChar : L' ';
+            WCHAR ch = cell ? cell->Char.UnicodeChar : L' ';
+            /* 次格判据与 snap_left_to_char 一致：本格为空且左邻是宽字主格。 */
+            if (ch == 0 && n_prim > 0 && is_wide_cp((unsigned int)row_chars[n_prim - 1]))
+                continue;
+            row_chars[n_prim] = ch;
+            row_x[n_prim] = x;
+            n_prim++;
         }
 
-        for (int x = 0; x <= rlen - wq_len; x++) {
+        for (int i = 0; i + wq_len <= n_prim; i++) {
             int match = 1;
             for (int k = 0; k < wq_len; k++) {
                 /* 锁定大小写时逐字符精确比较，否则统一折叠成小写。 */
-                WCHAR c1 = g_search_case_sensitive ? row_chars[x + k] : towlower(row_chars[x + k]);
-                WCHAR c2 = g_search_case_sensitive ? wquery[k] : towlower(wquery[k]);
+                /* towlower() 返回 wint_t。Windows 上 WCHAR 和 wint_t 都是
+                 * unsigned short，POSIX 上 WCHAR 是 int（有符号）而 wint_t 是
+                 * unsigned int，?: 两个分支符号性不一致会报 -Wsign-compare。
+                 * 显式转回 WCHAR：两边都是恒等操作，只是把意图写明白。 */
+                WCHAR c1 = g_search_case_sensitive ? row_chars[i + k] : (WCHAR)towlower(row_chars[i + k]);
+                WCHAR c2 = g_search_case_sensitive ? wquery[k] : (WCHAR)towlower(wquery[k]);
                 if (c1 != c2) {
                     match = 0;
                     break;
                 }
             }
             if (match && g_search_match_count < MAX_SEARCH_MATCHES) {
+                int last = i + wq_len - 1;
+                int end_x = row_x[last];
+                /* 末字符是宽字时高亮要连次格一起盖住，否则只亮半个字。 */
+                if (is_wide_cp((unsigned int)row_chars[last]) && end_x + 1 < s->cols)
+                    end_x++;
                 g_search_matches[g_search_match_count].abs_y = abs_y;
-                g_search_matches[g_search_match_count].start_x = x;
-                g_search_matches[g_search_match_count].end_x = x + wq_len - 1;
+                g_search_matches[g_search_match_count].start_x = row_x[i];
+                g_search_matches[g_search_match_count].end_x = end_x;
                 g_search_match_count++;
             }
         }
     }
     free(row_chars);
+    free(row_x);
 
     if (g_search_match_count > 0) {
         g_search_active = 1;
@@ -333,6 +391,50 @@ void execute_search(void) {
 /* 搜索框内边打字边高亮（VSCode 式实时预览）：不滚动、不退出输入框。 */
 void search_preview_live(void) {
     run_search(1);
+}
+
+/* 重扫之后把用户停留的那条匹配找回来。
+ *
+ * run_search() 会重建整张匹配表，index 全变，所以只能按坐标认。终端持续输出时
+ * 内容整体往下推（老的行被挤出滚动缓冲），同一个匹配的 abs_y 会变小甚至消失，
+ * 所以判据是「同一列 + 行号最接近」而不是精确相等：
+ *   - start_x 必须相同 —— 关键词在同一行的同一列，才算同一条；
+ *   - abs_y 取绝对差最小的一条。
+ * 找不到同列的（那条匹配已经被挤出去了）就退回 -1，让调用方保持 run_search 给的 0。 */
+int search_relocate_cur(const SearchMatch *ms, int n, int want_abs_y, int want_x) {
+    if (!ms || n <= 0) return -1;
+    int best = -1, best_d = 0;
+    for (int m = 0; m < n; m++) {
+        if (want_x >= 0 && ms[m].start_x != want_x) continue;
+        int d = ms[m].abs_y - want_abs_y;
+        if (d < 0) d = -d;
+        if (best < 0 || d < best_d) { best = m; best_d = d; }
+    }
+    return best;
+}
+
+void search_mark_dirty(void) {
+    /* 只有搜索真的开着、且关键词非空时才值得重扫整个滚动缓冲。 */
+    if (!g_search_mode && !g_search_active) return;
+    if (g_search_len <= 0) return;
+    g_search_dirty = 1;
+}
+
+void search_refresh_live(void) {
+    if (!g_search_dirty) return;
+    g_search_dirty = 0;
+    if (!g_search_mode && !g_search_active) return;
+    if (g_search_len <= 0) return;
+    if (g_mux.active_pane < 0 || g_mux.active_pane >= g_mux.pane_count) return;
+    if (!g_mux.panes[g_mux.active_pane].active) return;
+    /* 记住停留项的坐标：重扫会重建整张表，index 会变。 */
+    int had_cur = (g_search_match_cur >= 0 && g_search_match_cur < g_search_match_count);
+    int want_abs_y = had_cur ? g_search_matches[g_search_match_cur].abs_y : 0;
+    int want_x = had_cur ? g_search_matches[g_search_match_cur].start_x : -1;
+    run_search(1);                       /* live：只高亮，不滚动、不动视图 */
+    if (!had_cur || g_search_match_count <= 0) return;
+    int m = search_relocate_cur(g_search_matches, g_search_match_count, want_abs_y, want_x);
+    if (m >= 0) g_search_match_cur = m;
 }
 
 void search_jump_next(void) {
@@ -571,10 +673,10 @@ static int palette_add_item_from_source(const ChooserItem *source, int preset_in
         g_chooser_items[idx].workdir[0] = 0;
         g_chooser_items[idx].color = 0;
         if (strcmp(g_chooser_items[idx].cmd, ":custom") == 0)
-            snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[idx].cmd), "cmd.exe");
+            snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[idx].cmd), TERMUX_DEFAULT_SHELL_U8);
     } else {
         snprintf(g_chooser_items[idx].name, sizeof(g_chooser_items[idx].name), "新 panel");
-        snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[idx].cmd), "cmd.exe");
+        snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[idx].cmd), TERMUX_DEFAULT_SHELL_U8);
         g_chooser_items[idx].workdir[0] = 0;
         g_chooser_items[idx].color = 0;
     }
@@ -2222,7 +2324,7 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
             if (g_chooser_item_count < MAX_CHOOSER_ITEMS) {
                 int idx = g_chooser_item_count++;
                 snprintf(g_chooser_items[idx].name, sizeof(g_chooser_items[0].name), "新终端");
-                snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[0].cmd), "cmd.exe");
+                snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[0].cmd), TERMUX_DEFAULT_SHELL_U8);
                 g_chooser_items[idx].workdir[0] = 0;
                 g_chooser_items[idx].color = 0;
                 save_config();
@@ -2472,7 +2574,7 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             if (g_chooser_item_count < MAX_CHOOSER_ITEMS) {
                 int idx = g_chooser_item_count++;
                 snprintf(g_chooser_items[idx].name, sizeof(g_chooser_items[0].name), "新终端");
-                snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[0].cmd), "cmd.exe");
+                snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[0].cmd), TERMUX_DEFAULT_SHELL_U8);
                 g_chooser_items[idx].workdir[0] = 0;
                 g_chooser_items[idx].color = 0;
                 save_config();
@@ -2644,7 +2746,7 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                     if (g_chooser_item_count < MAX_CHOOSER_ITEMS) {
                         int idx = g_chooser_item_count++;
                         snprintf(g_chooser_items[idx].name, sizeof(g_chooser_items[0].name), "新终端");
-                        snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[0].cmd), "cmd.exe");
+                        snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[0].cmd), TERMUX_DEFAULT_SHELL_U8);
                         g_chooser_items[idx].workdir[0] = 0;
                         g_chooser_items[idx].color = 0;
                         save_config();
@@ -2919,7 +3021,13 @@ void action_execute(int action, int arg, DWORD ctrl) {
             Pane *cur = &g_mux.panes[g_mux.active_pane];
             WCHAR wdir[256] = {0};
             (void)cur;
-            int np = create_pane_shell_with_dir(L"cmd.exe", wdir[0] ? wdir : NULL);
+#ifdef _WIN32
+            int np = create_pane_shell_with_dir(TERMUX_DEFAULT_SHELL_W, wdir[0] ? wdir : NULL);
+#else
+            /* POSIX：分屏出来的新窗格跟第一个窗格一样用 $SHELL，而不是写死
+             * /bin/sh —— 否则用户配了 zsh，一分屏就掉回 sh。 */
+            int np = create_pane_shell_with_dir(plat_default_shell(), wdir[0] ? wdir : NULL);
+#endif
             if (np < 0) break;
             int dir = (action == ACT_SPLIT_HORIZONTAL) ? SPLIT_H : SPLIT_V;
             if (!split_split_active(dir, np)) {
@@ -3250,7 +3358,11 @@ void handle_key(KEY_EVENT_RECORD *ke) {
             if (g_mux.custom_cmd_len > 0) {
                 MultiByteToWideChar(CP_UTF8, 0, g_mux.custom_cmd_buf, -1, wcmd, 255);
             } else {
-                wcscpy(wcmd, L"cmd.exe");
+#ifdef _WIN32
+                wcscpy(wcmd, TERMUX_DEFAULT_SHELL_W);
+#else
+                wcscpy(wcmd, plat_default_shell());
+#endif
             }
             int ni = create_pane_shell(wcmd);
             if (ni >= 0) switch_pane(ni);
@@ -3959,6 +4071,12 @@ void handle_mouse(MOUSE_EVENT_RECORD *me) {
         p->input_history_pos = 0;
     }
 
+    /* 焦点若在拖动中被别的路径改走（键盘 Ctrl+B n / 点标签栏之类），立刻结束
+     * 拖动 —— 绝不能拿原窗格的 grab_offset 去拖新窗格的条。 */
+    if (g_sb_dragging && g_sb_drag_pane >= 0 && g_sb_drag_pane != g_mux.active_pane) {
+        g_sb_dragging = 0; g_sb_drag_pane = -1; g_sb_grab_offset = 0;
+    }
+
     if (s->hist_lines > 0 && !s->in_alt_screen) {
         int has_btn = (me->dwButtonState & (FROM_LEFT_1ST_BUTTON_PRESSED | FROM_LEFT_2ND_BUTTON_PRESSED | RIGHTMOST_BUTTON_PRESSED)) != 0;
         int span = screen_scroll_limit(s);   /* 可回看显示行数（滚动条跨度）。物理历史虽>0，
@@ -3992,9 +4110,13 @@ void handle_mouse(MOUSE_EVENT_RECORD *me) {
                      * s->cols-1。这样分屏后每个活动窗格右缘的滚动条也能点/拖。 */
                     int sb_col = (split_is_split() && !g_split_zoom) ? (s->cols - 1)
                                                                      : (g_mux.host_cols - 1);
-                    if (mx == sb_col && my >= 1) {
+                    /* 命中门槛必须与渲染同一个判据：窗格窄到不画滚动条时也别让
+                     * 它能被拖，否则就是「拖一条看不见的滚动条」。 */
+                    if (render_sb_cols_ok(sb_col + 1, s->in_alt_screen) &&
+                        mx == sb_col && my >= 1) {
                         if (click_y >= sb_top && click_y < sb_bot) {
                             g_sb_dragging = 1;
+                            g_sb_drag_pane = g_mux.active_pane;   /* 锁定，见上面的捕获 */
                             g_sb_grab_offset = click_y - sb_top;
                             return;
                         } else {
@@ -4004,6 +4126,7 @@ void handle_mouse(MOUSE_EVENT_RECORD *me) {
                                 else center_offset = th / 2;
                             }
                             g_sb_dragging = 1;
+                            g_sb_drag_pane = g_mux.active_pane;   /* 锁定，见上面的捕获 */
                             g_sb_grab_offset = center_offset;
                             int desired_tpos = click_y - center_offset;
                             if (desired_tpos < 0) desired_tpos = 0;
@@ -4033,10 +4156,12 @@ void handle_mouse(MOUSE_EVENT_RECORD *me) {
             }
         } else {
             g_sb_dragging = 0;
+            g_sb_drag_pane = -1;
             g_sb_grab_offset = 0;
         }
     } else {
         g_sb_dragging = 0;
+        g_sb_drag_pane = -1;
         g_sb_grab_offset = 0;
     }
 

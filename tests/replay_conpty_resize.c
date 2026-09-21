@@ -7,7 +7,8 @@
  *   （pane0 = `for /l %i in (1,1,30) do @echo %i`，宽度 120→59 的 ConPTY 重绘）。
  *
  * 重放规则与 src/pane.c 的 pane_read_thread 一致：每块先 screen_repaint_align
- * 再喂 screen_process_output；块头若带 ESC[8;rows;colst 先做本地 reflow。
+ * 再喂 screen_process_output；
+ * 块头若带 ESC[8;rows;colst 先做本地 reflow。
  *
  * 验收（本轮 bug 的直接断言）：
  *   1) 数字 1..30 一旦出现就永不消失（历史上 chunk14/chunk87 两次整屏重绘各吞

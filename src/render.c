@@ -2,6 +2,8 @@
 #include "framediff.h"
 #include "split.h"
 #include "pane.h"
+#include "input.h"   /* split_drag_active()：拖动分屏边框期间不夹取 scroll_offset */
+#include <stdarg.h>   /* cell_diag 诊断（TERMUX_CELLDIAG） */
 
 
 #define TB_BG        "\x1b[048;2;022;027;034m"
@@ -1130,8 +1132,10 @@ static void badge_collapsed_text(char *out, int n) {
         return;
     }
     char query[28] = {0};
-    snprintf(query, sizeof(query), "%s", g_search_buf);
-    /* 长关键词截断，徽章宽度必须可预测。 */
+    /* 长关键词截断，徽章宽度必须可预测。g_search_buf 是 64 字节，比 query 大，
+     * 所以这里【故意】截断 —— 用 %.*s 把这件事写明，顺带消掉 -Wformat-truncation。
+     * snprintf 本来就会在这个长度上截断并补 NUL，输出完全一致。 */
+    snprintf(query, sizeof(query), "%.*s", (int)sizeof(query) - 1, g_search_buf);
     int qcols = utf8_cols(query, (int)strlen(query));
     if (qcols > 16) {
         int keep = 0, cols = 0;
@@ -2370,6 +2374,70 @@ static void render_split_borders(char *out, int bs, int *posp, PaneRect *rects) 
 }
 
 /* 画单个 pane 的一个单元格（带真彩/16 色与宽字符处理），定位到内容区绝对坐标。 */
+/* 诊断（TERMUX_CELLDIAG）：把分屏逐格渲染【实际读到】的模型内容写进 cell_diag.log。
+ * 排查「中文里凭空多出空格」——需要知道宽字符次格在渲染那一刻到底是 0（正确，会被
+ * 跳过）还是空格（会被当成内容发出去）。默认关闭，getenv 门控，无环境变量时零开销。
+ *
+ * 帧号对齐（2026-09-13 修正）：早先这里声称「cell_diag_frame 与 render_dump.log 的
+ * 帧序一致（都在 render_screen 每帧自增一次）」——【这句是错的】，真机日志证明两份
+ * 日志对不上：cell_diag 记录 pane 86+33，而 render_dump 全文 307 帧的 model 宽度
+ * 只有 {120,60,59,20,49,71,48}，【从未出现过 86 或 33】。
+ *
+ * 真实原因（不是帧号跳号——cell_diag 的 F71–F140 是连续的）：两个计数器不同源。
+ * cell_diag_frame 是 render_screen 里自增的本地计数器，从 1 开始；而 render_dump
+ * 那份 307 帧里包含大量 cell_diag 根本没有落盘的帧（cell_diag 只在「该行含宽字符」
+ * 时才输出），于是同一个 F 号在两份日志里指向完全不同的时刻。日志里 70 帧 vs 307 帧
+ * 的差距就是证据。
+ *
+ * 现在改成：每帧都写一行 FRAME 帧头，位置就在 dump_render_output 的紧前面，且受
+ * 【完全相同】的三道门约束（TERMUX_DUMP、len>0、active pane 有效）；帧头里带上
+ * render_dump 同一帧会打的 model 尺寸，以及每个 pane 的 rc->cols / s->cols /
+ * min(两者)。这样两份日志可以逐帧核对，不用再靠猜。 */
+static int cell_diag_frame = 0;
+
+/* 帧头素材：render_split_pane 逐 pane 填写，render_screen 末尾（与
+ * dump_render_output 同一位置）一次性写出。这样 cell_diag.log 与 render_dump.log
+ * 的帧号严格同源，可以逐帧对照。 */
+typedef struct {
+    int valid;
+    int oc0, ocols;        /* 布局：外接起点列 / 外接宽度 */
+    int scols, srows;      /* 模型：s->cols / s->rows */
+    int cols, rows;        /* 实际逐格渲染的 min(rc,s) */
+    int vo, hist;          /* scroll_offset / hist_lines */
+    int conpty_cols;       /* 上次下发给 ConPTY 的宽度 */
+    int narrow;            /* 1 = 渲染宽度窄于模型宽度（拖动中），本帧走 reflow 网格 */
+} CellDiagPane;
+static CellDiagPane g_cd_pane[MAX_PANES];
+
+/* 帧内缓冲：行级诊断先攒在这里，帧末与帧头一起落盘，日志里每帧就是一个完整块
+ * （FRAME 行 + 该帧的行级明细），不会出现「明细在上、帧头在下」的割裂。
+ * 容量给 1 MB：单帧最多 MAX_PANES*rows 行，每行约 300 字节，足够。 */
+#define CELL_DIAG_BUF (1024 * 1024)
+static char g_cd_buf[CELL_DIAG_BUF];
+static int  g_cd_len = 0;
+
+static void cell_diag_frame_buf(const char *fmt, ...) {
+    if (g_cd_len >= CELL_DIAG_BUF - 1) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(g_cd_buf + g_cd_len, (size_t)(CELL_DIAG_BUF - g_cd_len), fmt, ap);
+    va_end(ap);
+    if (n > 0) g_cd_len += (n < CELL_DIAG_BUF - g_cd_len) ? n : (CELL_DIAG_BUF - 1 - g_cd_len);
+}
+
+static void cell_diag(const char *fmt, ...) {
+    static int diag_on = -1;
+    if (diag_on < 0) diag_on = getenv("TERMUX_CELLDIAG") ? 1 : 0;
+    if (!diag_on) return;
+    FILE *f = fopen("cell_diag.log", "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fclose(f);
+}
+
 static void render_split_cell(char *out, int bs, int *posp, ScreenBuffer *s,
                               Pane *pane, int leaf, int px, int py, int rr, int cc,
                               int use_rf) {
@@ -2459,13 +2527,58 @@ static void render_split_cell(char *out, int bs, int *posp, ScreenBuffer *s,
     *posp = pos;
 }
 
+/* 滚动条可见性门槛（bug #22，2026-09-20）。
+ *
+ * 原来渲染侧写死 cols >= 10：窗格窄于 10 列时整条滚动条不画。而 src/input.c 的
+ * 命中测试【没有】同样的门槛 —— 于是窄窗格里能拖一条看不见的滚动条，用户看到的
+ * 就是「窗格 <=6 列时滚动条没了」。
+ *
+ * 滚动条只在鼠标悬停到窗格右缘时才出现，而且是【覆盖 pane 右缘内列】、不另占宽度，
+ * 所以窄窗格照样画没有布局代价。只保留 >=2 的下限：1 列的窗格整个就是滚动条，
+ * 画了只会把唯一一列内容全盖掉。
+ *
+ * alt 屏（vim 之类）没有滚动缓冲，一律不画。 */
+#define SB_MIN_COLS 2
+
+int render_sb_cols_ok(int cols, int in_alt_screen) {
+    if (in_alt_screen) return 0;
+    return cols >= SB_MIN_COLS;
+}
+
+/* 见 include/render.h 的说明。cursor_x 可以等于 cols（延迟换行的挂起态），
+ * 所以判据是 >= cols-1 而不是 == cols-1。 */
+int render_sb_spare_row(int cursor_visible, int cursor_x, int cursor_y, int cols) {
+    if (!cursor_visible || cols < 1) return -1;
+    if (cursor_x < cols - 1) return -1;
+    if (cursor_y < 0) return -1;
+    return cursor_y;
+}
+
 static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *rc) {
     Pane *pane = &g_mux.panes[leaf];
     ScreenBuffer *s = &pane->screen;
     int pos = *posp;
     if (pane->scroll_offset < 0) pane->scroll_offset = 0;
     if (pane->scroll_offset > 0) {
-        int lim_sc = screen_scroll_limit(s);
+        /* 夹取必须按【实际渲染宽度】算，不能按 s->cols。拖动分屏边框时渲染宽度是
+         * min(rc->cols, s->cols)，而 s->cols 已被冻结在拖动前的值（见
+         * pane_resize_to），两者差得很多：真机实测同一份内容在 92 列下
+         * scroll_limit=1367、在 4 列下=31409。按 s->cols 夹会把 scroll_offset
+         * 写成一个和当前显示宽度无关的值。
+         * 更关键的是这个夹取会【写回】pane->scroll_offset —— 用户正往上翻着
+         * （比如 vo=5000），拖宽后 limit 骤降到 1367，vo 被永久夹到 1367，
+         * 视图直接跳到底部，松手后 limit 恢复了但 vo 已经丢了、翻不回去。
+         * 症状就是用户报的「左右拖动分屏导致历史直接消失」。
+         * 拖动期间干脆不夹不写回：视图位置保持稳定，松手后再按新宽度夹一次。 */
+        int lim_sc;
+        if (split_drag_active()) {
+            lim_sc = pane->scroll_offset;   /* 拖动中：不夹 */
+        } else {
+            int rw = rc->cols < s->cols ? rc->cols : s->cols;
+            int h = screen_reflow_height(s, rw);
+            lim_sc = h - s->rows;
+            if (lim_sc < 0) lim_sc = 0;
+        }
         if (pane->scroll_offset > lim_sc) pane->scroll_offset = lim_sc;
     }
     if (getenv("TERMUX_DUMP")) {
@@ -2474,10 +2587,37 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
     }
     int rows = rc->rows < s->rows ? rc->rows : s->rows;
     int cols = rc->cols < s->cols ? rc->cols : s->cols;
+    /* 渲染宽度窄于模型宽度：拖动分屏边框期间模型被冻结（见 pane_resize_to）。
+     * 2026-09-15 起这个标志【只用于诊断】，不再触发 reflow —— 详见下面 use_rf
+     * 处的说明。曾经认为「不走 reflow 就会右侧内容消失」，实测确认那是真的，但
+     * 相比之下 reflow 把硬换行折断造成的行序错乱更糟，两害相权选择裁剪。 */
+    int narrow_view = (cols < s->cols);
+    /* 诊断帧头素材：记下本 pane 这一帧的四个宽度。rc->cols 是布局给的外接宽度，
+     * s->cols 是模型宽度，cols=min(两者) 才是真正逐格渲染的宽度。上次排查「渲染错位」
+     * 时缺的正是 rc->cols 与 s->cols 的逐帧对照——只有末态的 render_dump 里那个
+     * active pane 的 s->cols，无法知道另一个 pane 当时的值。 */
+    if (leaf >= 0 && leaf < MAX_PANES) {
+        g_cd_pane[leaf].valid = 1;
+        g_cd_pane[leaf].oc0 = rc->c0;  g_cd_pane[leaf].ocols = rc->cols;
+        g_cd_pane[leaf].scols = s->cols; g_cd_pane[leaf].srows = s->rows;
+        g_cd_pane[leaf].cols = cols;  g_cd_pane[leaf].rows = rows;
+        g_cd_pane[leaf].vo = pane->scroll_offset;
+        g_cd_pane[leaf].hist = s->hist_lines;
+        g_cd_pane[leaf].conpty_cols = pane->conpty_cols;
+        g_cd_pane[leaf].narrow = narrow_view;
+    }
     /* 窗格先铺底色：整矩形清成终端底色（TH_BG0，与 ConPTY 程序默认黑底一致），
      * 避免残留；未填充格与铺底无色差，分屏窗格之间不会冒出奇怪色块。 */
     for (int py = 0; py < rows; py++) {
-        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[0" TERM_BG,
+        /* 不要写成 "\x1b[0" TERM_BG：TERM_BG 自身已是完整的 "\x1b[048;2;...m"
+         * （首参数 0 就是 SGR reset）。多出来的 "\x1b[0" 是一条没有终结字节的残缺
+         * CSI，而紧跟其后的 TERM_BG 里那个 '['（0x5b）正落在 VT 终结字节区间
+         * 0x40-0x7e 内 —— 终端会把 "ESC[0 ESC[" 当成一条以 '[' 收尾的完整 CSI，
+         * 然后把剩下的 "048;2;013;017;023m" 当【正文】写进窗格：每行凭空多 17 个
+         * 字符、光标右移 17 列，铺底的空格从第 18 列起写满 120 列并折行溢到下一行。
+         * 分屏铺底逐行如此，整屏内容被冲成一片重复/错位的碎片（左右分屏拖动时的
+         * 「渲染出现严重故障」，render_dump.log 第 39 帧起可见）。 */
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH" TERM_BG,
                         rc->r0 + py + 2, rc->c0 + 1);
         for (int px = 0; px < cols; px++) pos += snprintf(out + pos, bs - pos, " ");
     }
@@ -2485,25 +2625,102 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
     /* v1.8.47/50：向上回看（非 alt 屏、scroll_offset>0）时，【整窗】统一用逻辑行
      * reflow 网格——网格含「历史 + 当前可见」按视口宽重排、底部锚定，vo 跳过最新
      * vo 个显示行，历史与实时内容在同一坐标系、边界连续不重复/不错位。vo==0（看
-     * 实时屏）仍直取 ConPTY 缓冲。 */
-    int use_rf = (pane->scroll_offset > 0 && !s->in_alt_screen && s->line_wrap != NULL);
+     * 实时屏）仍直取 ConPTY 缓冲。
+     *
+     * 追加（2026-09-14）：渲染宽度窄于模型宽度时【也必须】走网格。原因是
+     * pane_resize_to 在拖动分屏边框期间冻结了模型（bug #12 的 freeze_model），
+     * 于是 s->cols 停在拖动前的值、而 rc->cols 跟着鼠标变小，cols=min(两者) 只取
+     * 到每行前 cols 列，【右侧内容直接消失，不折行】。真机日志实测（帧 53→60，
+     * 模型冻结 59 列、窗格拖到 33 列）：
+     *   帧53 |2026-04-19  14:38        20,549,329 EXPR.exe|
+     *   帧60 |2026-04-19  14:38        20,549,3|     ← "29 EXPR.exe" 没了
+     * 走网格则由 screen_reflow_view 按 cols 宽重新折行，内容完整。Linux 侧对同一份
+     * 内容验证过：逐格取 33 列丢掉 "29 EXPR.exe"/"71 liquidbounce b100.jar"/
+     * "10 P6008_6.in"，而 screen_reflow_view(width=33) 全部保留并正常折行。
+     *
+     * 与 bug #12 的区别：#12 的错位来自【模型】每帧 reflow（本地与 ConPTY 不同步）；
+     * 这里只重排显示网格 rf_grid，s 与 ConPTY 都不动，所以不会让 #12 复发。
+     * 代价：光标仍按模型坐标定位（见 render_screen 的分屏光标段），在拖动中可能与
+     * 重排后的文本差几列；相比整行内容消失，这个代价可以接受。 */
+    /* 2026-09-15 决定（方案 B）：拖动变窄时【不再】走 reflow，只有用户显式往上
+     * 翻历史（scroll_offset>0）才重排。
+     *
+     * v5/v7/v8 三次失败的共同原因是：它们都保留「narrow_view 就 reflow」，只在
+     * reflow 之后调 vo（看哪一段）。而 screen_reflow_view 会把【硬换行】的行也按
+     * 新宽度折断 —— src/screen.c 的 reflow_append_rows 无条件按宽度折行，不看
+     * line_wrap。于是一条逻辑行变成两条显示行：
+     *   - 视觉上像「内容重复 / 行序混乱」（用户报的原话）；
+     *   - 行数翻倍把老内容挤出视口，看起来像「光标乱跳」。
+     * 本地 harness 实测（宿主 120→50，模型冻结 59 列，10 行 CUP 硬换行内容，
+     * line_wrap 全 0，screen_reflow_height 却从 10 变 20）：
+     *   reflow 版：|R05 ......|  |......ZZ|  |R06 ......|  视口从 R00 跳到 R05
+     *   裁剪版：  |R00 ......|  |R01 ......|  |R02 ......|  行序与视口都不动
+     * 见 analysis/拖动错乱-根因与三种可选行为.md 与
+     * analysis/fixtures/harness_narrow_{reflow,noreflow}.log。
+     *
+     * 代价：拖动期间每行超出窗格宽度的右侧部分看不见，松手后模型同步即恢复。
+     * 换来的是行序与视口在拖动全程完全稳定 —— 这也让「提示符正好在最下面一行」
+     * 天然成立，因为行数根本不变。
+     *
+     * 回看路径不受影响：scroll_offset>0 时两版行为逐帧一致（已用 hist=500/2000
+     * 验证），因为那条路径本来就该按当前宽度重排历史。 */
+    int use_rf = (pane->scroll_offset > 0 &&
+                  !s->in_alt_screen && s->line_wrap != NULL);
     if (use_rf) {
         RGlyph *grid = (RGlyph *)pane->rf_grid;
-        /* 网格尺寸恒等于 rows×cols（读写同一步长），任何尺寸变化都重分配。 */
+        /* 网格尺寸恒等于 rows×cols（读写同一步长），任何尺寸变化都重分配。
+         *
+         * 两条失败路径都必须退回逐格，不能用半成品网格（2026-09-14）：
+         * 拖动分屏边框时 cols 每帧都变，于是每帧都要 realloc，函数内部还每帧
+         * malloc —— 原本罕见的失败路径变成了每帧都在赌。一旦失败还继续用网格，
+         * 表现就是用户报的「内容重复 / 行序错乱」：
+         *   a) realloc 失败：grid 还是旧指针、旧步长（比如上一帧的 rows*59），
+         *      但 rf_cols 会被写成新的 cols，逐格按 grid[py*cols+px] 读一份按
+         *      旧步长摆放的数据 —— 行与行互相串位。
+         *   b) screen_reflow_view 返回 0（内部 malloc 失败）：grid 只填了一部分
+         *      甚至完全没填，rf_valid 却照样置 1，渲染读到上一帧残留。
+         * 退回逐格的代价只是「窄窗下右侧内容不折行」，不会错乱，可以接受。 */
+        int rf_ready = 1;
         if (pane->rf_rows != rows || pane->rf_cols != cols || !grid) {
             RGlyph *ng = (RGlyph *)realloc(grid, (size_t)rows * cols * sizeof(RGlyph));
-            if (ng) grid = ng;
+            if (ng) {
+                grid = ng;
+            } else {
+                /* realloc 失败不会释放原块，这里自己释放，避免泄漏。
+                 * 同时必须把 pane->rf_grid 置空：它此前指向的正是这块已释放的
+                 * 内存，留着就是悬垂指针，下一帧会用到已释放的堆块。 */
+                free(grid);
+                grid = NULL;
+                pane->rf_grid = NULL;
+                rf_ready = 0;
+            }
         }
-        if (grid) {
+        /* 锚定方向：底部锚定（vo = scroll_offset）。
+         *
+         * 2026-09-15 回退记录：v7 曾在 narrow_view 时改用顶部锚定
+         * （vo = screen_reflow_height(s, cols) - rows），理由是「拖动中内容顶端
+         * 不动」。真机日志证明这是错的 —— render_dump.log 帧 40 vs 帧 60：
+         *   帧40（拖动前，窗格 59 列）r2 = |2026-04-19  14:38  20,549,329 EXPR.exe|
+         *   帧60（拖动中，窗格 33 列）r2 = |Microsoft Windows [版本 10.0.2620|
+         * 顶部锚定把视口钉在【全部历史的第一行】，于是画面跳回 cmd 的 banner，
+         * 用户正在看的内容和光标区整个被推出视口。这比 v5 的症状更糟。
+         *
+         * 底部锚定（vo=0）才是拖动中想要的：视口恒显示最新 rows 个显示行，
+         * 光标所在区域始终可见；cols 每帧变化时只有上方内容被挤掉，下方稳定。
+         * 用户往上翻历史时 vo = scroll_offset 本身就是他的显式意图，同样适用。 */
+        if (rf_ready && grid &&
+            screen_reflow_view(s, pane->scroll_offset, rows, cols, grid)) {
+            /* 整窗 reflow 成功（返回 1 表示已填满整个视口）才发布这块网格。 */
             pane->rf_grid = grid;
             pane->rf_rows = rows;
             pane->rf_cols = cols;
-            /* 整窗 reflow：返回 1 表示已填充整个视口。 */
-            screen_reflow_view(s, pane->scroll_offset, rows, cols, grid);
             pane->rf_valid = 1;
             pane->rf_n = rows;
         } else {
+            /* 失败：退回逐格。grid 此刻要么是有效但未填充的块（保留给下一帧复用），
+             * 要么已经是 NULL。两种情况都不能标成有效网格。 */
             use_rf = 0;
+            pane->rf_grid = grid;
             pane->rf_valid = 0;
             pane->rf_rows = pane->rf_cols = 0;
             pane->rf_n = 0;
@@ -2516,16 +2733,85 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
     for (int py = 0; py < rows; py++) {
         /* vo>0 整窗走 reflow 网格；vo==0 走实时 ConPTY 缓冲。 */
         int use_rf_row = use_rf;
+        /* 诊断（TERMUX_CELLDIAG）：只在该行含宽字符或次格疑似异常时落盘，避免日志暴涨。
+         * 记录渲染那一刻【实际读到】的 wc 与次格，用于区分「次格=0（会被跳过，正确）」
+         * 与「次格=空格（会被当内容发出，就是中文里的多余空格）」。 */
+        if (getenv("TERMUX_CELLDIAG")) {
+            int hit = 0;
+            for (int px = 0; px < cols && !hit; px++) {
+                WCHAR w = 0; int ud = -1;
+                if (use_rf_row) {
+                    RGlyph *grid = (RGlyph *)pane->rf_grid;
+                    if (grid && pane->rf_cols > 0) w = grid[py * pane->rf_cols + px].ci.Char.UnicodeChar;
+                } else {
+                    CHAR_INFO *c = screen_cell(s, py, px);
+                    if (c) w = c->Char.UnicodeChar;
+                }
+                if (w != 0 && w != L' ' && is_wide_cp((unsigned int)w)) hit = 1;
+                (void)ud;
+            }
+            if (hit) {
+                int pr_used = -1;
+                if (!use_rf_row && s->lines) {
+                    int apr = screen_phys_row(s, py);
+                    if (apr >= 0 && apr < s->total_lines) pr_used = s->lines[apr].used;
+                }
+                cell_diag_frame_buf("F%d leaf%d pane=%dx%d s=%dx%d rf=%d vo=%d py=%d rr=%d used=%d |",
+                          cell_diag_frame, leaf, rc->cols, rc->rows, s->cols, s->rows,
+                          use_rf_row, pane->scroll_offset, py, rc->r0 + py, pr_used);
+                for (int px = 0; px < cols; px++) {
+                    WCHAR w = L' ', nx = L'?';
+                    if (use_rf_row) {
+                        RGlyph *grid = (RGlyph *)pane->rf_grid;
+                        if (grid && pane->rf_cols > 0) {
+                            w = grid[py * pane->rf_cols + px].ci.Char.UnicodeChar;
+                            if (px + 1 < pane->rf_cols) nx = grid[py * pane->rf_cols + px + 1].ci.Char.UnicodeChar;
+                        }
+                    } else {
+                        CHAR_INFO *c = screen_cell(s, py, px);
+                        CHAR_INFO *c2 = (px + 1 < s->cols) ? screen_cell(s, py, px + 1) : NULL;
+                        if (c) w = c->Char.UnicodeChar;
+                        if (c2) nx = c2->Char.UnicodeChar;
+                    }
+                    cell_diag_frame_buf(" [%d]%s/%s", px,
+                              w == 0 ? "0" : (w == L' ' ? "sp" : (w < 128 ? "a" : "W")),
+                              nx == 0 ? "0" : (nx == L' ' ? "sp" : (nx < 128 ? "a" : "W")));
+                }
+                cell_diag_frame_buf("\n");
+                /* 附带把该行的实际字符码点也打出来，便于和 render_dump.log 对齐。 */
+                cell_diag_frame_buf("   cps:");
+                for (int px = 0; px < cols; px++) {
+                    WCHAR w = L' ';
+                    if (use_rf_row) {
+                        RGlyph *grid = (RGlyph *)pane->rf_grid;
+                        if (grid && pane->rf_cols > 0) w = grid[py * pane->rf_cols + px].ci.Char.UnicodeChar;
+                    } else {
+                        CHAR_INFO *c = screen_cell(s, py, px);
+                        if (c) w = c->Char.UnicodeChar;
+                    }
+                    if (w == 0) cell_diag_frame_buf(" {0}");
+                    else if (w == L' ') cell_diag_frame_buf(" _");
+                    else if (w < 128) cell_diag_frame_buf(" %c", (char)w);
+                    else cell_diag_frame_buf(" <%04X>", w);
+                }
+                cell_diag_frame_buf("\n");
+            }
+        }
         for (int px = 0; px < cols; px++) {
             int rr = rc->r0 + py, cc = rc->c0 + px;
+            int pos_before = *posp;
             render_split_cell(out, bs, posp, s, pane, leaf, px, py, rr, cc, use_rf_row);
             pos = *posp;
+            /* 诊断：本格是否真的发了字节。次格（wc==0）不发字节 → 铺底那格的空格残留。
+             * 这条是「中文里多空格」的另一条可能路径，必须能和模型侧区分开。 */
+            if (getenv("TERMUX_CELLDIAG") && pos == pos_before)
+                cell_diag_frame_buf("   NOBYTE px=%d cc=%d（次格未写，铺底空格残留）\n", px, cc);
         }
     }
 
     /* 滚动条：与整屏路径同款，画在 pane 右缘内列（覆盖该列，不另占宽度）。
      * 非 alt 屏、pane 足够宽且有历史时显示；活动 pane 才响应 hover/拖动。 */
-    if (!s->in_alt_screen && cols >= 10 && leaf == g_mux.active_pane) {
+    if (render_sb_cols_ok(cols, s->in_alt_screen) && leaf == g_mux.active_pane) {
         int rr = rows;
         int sb_top = 0, sb_bot = rr;
         int hist = screen_scroll_limit(s);   /* 滚动条跨度 = 可回看的显示行数 */
@@ -2565,7 +2851,14 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
          * 否则整列什么都不画，滚动条「消失」（不常驻）。无历史（hist<=0）时 track
          * 与 thumb 都没有意义，同样不画。 */
         if (is_hover && s->hist_lines > 0) {
+            /* 光标正落在右缘列时让开那一行，否则刚敲的字会被滚动条盖掉。
+             * 回看历史时终端光标本来就不显示（帧尾光标段有 scroll_offset==0 的
+             * 条件），没有要让的东西。 */
+            int spare = (pane->scroll_offset == 0)
+                      ? render_sb_spare_row(s->cursor_visible, s->cursor_x, s->cursor_y, cols)
+                      : -1;
             for (int py = 0; py < rows && pos < bs - 64; py++) {
+                if (py == spare) continue;
                 int term_col = rc->c0 + cols;           /* 右缘列，1 基 */
                 int term_row = rc->r0 + py + 2;
                 int in_thumb = (py >= sb_top && py < sb_bot);
@@ -2605,7 +2898,8 @@ static void render_split(char *out, int bs, int *posp) {
      * 显式铺满整行后，行块一定包含每一列的字节，布局一变整行必判脏、整行重建，
      * 随后窗格铺底/单元格/边框再各自覆盖。 */
     for (int r = 0; r < g_mux.host_rows; r++) {
-        pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H\x1b[0" TERM_BG, r + 2);
+        /* 同上：TERM_BG 已是完整 CSI，前面不能再挂一条残缺的 "\x1b[0"。 */
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H" TERM_BG, r + 2);
         for (int c = 0; c < g_mux.host_cols; c++)
             pos += snprintf(out + pos, bs - pos, " ");
         pos += snprintf(out + pos, bs - pos, "\x1b[0m");
@@ -2618,6 +2912,13 @@ static void render_split(char *out, int bs, int *posp) {
 
 void render_screen(void) {
     EnterCriticalSection(&g_mux.cs);
+    /* 诊断帧号在这里自增，且【无条件】——本函数下面有多条提前 return 的路径
+     * （host 尺寸非法、help_mode 等），若在别处自增会让帧号跳号，与
+     * render_dump.log 的帧序错开。帧缓冲同样在帧首清空，避免提前 return 时
+     * 把上一帧的残留明细带到下一帧。 */
+    cell_diag_frame++;
+    g_cd_len = 0;
+    for (int i = 0; i < MAX_PANES; i++) g_cd_pane[i].valid = 0;
     if (g_mux.host_cols < 1 || g_mux.host_rows < 1 || g_mux.total_host_rows < 1) { LeaveCriticalSection(&g_mux.cs); return; }
     update_host_title();
 
@@ -2655,11 +2956,25 @@ void render_screen(void) {
             WORD la_attr = 0xFFFF, la_fr = 0, la_br = 0; int la_fv = -1, la_bv = -1;
             if (pane->scroll_offset < 0) pane->scroll_offset = 0;
             if (pane->scroll_offset > 0) {
-                int lim_sc = screen_scroll_limit(s);
+                /* 同 render_split_pane：拖动分屏边框期间不夹取、不写回，否则
+                 * scroll_offset 会被一个与当前显示宽度无关的 limit 永久夹小，
+                 * 表现为「拖动分屏后历史翻不上去」。 */
+                int lim_sc = pane->scroll_offset;
+                if (!split_drag_active()) {
+                    int rw = g_mux.host_cols < s->cols ? g_mux.host_cols : s->cols;
+                    int h = screen_reflow_height(s, rw);
+                    lim_sc = h - s->rows;
+                    if (lim_sc < 0) lim_sc = 0;
+                }
                 if (pane->scroll_offset > lim_sc) pane->scroll_offset = lim_sc;
             }
             int vo = pane->scroll_offset, rr = s->rows < g_mux.host_rows ? s->rows : g_mux.host_rows, rc = s->cols < g_mux.host_cols ? s->cols : g_mux.host_cols;
-            int show_sb = (!s->in_alt_screen && g_mux.host_cols >= 10);
+            int show_sb = render_sb_cols_ok(g_mux.host_cols, s->in_alt_screen);
+            /* 与分屏路径同理：光标压在右缘列时，那一行不画滚动条轨道，
+             * 否则刚敲的字被盖掉、看着像光标卡住。 */
+            int sb_spare = (vo == 0)
+                         ? render_sb_spare_row(s->cursor_visible, s->cursor_x, s->cursor_y, rc)
+                         : -1;
             int sb_top = 0, sb_bot = 0;
             if (show_sb) {
                 int hist = screen_scroll_limit(s);   /* 滚动条跨度 = 可回看的显示行数 */
@@ -2907,7 +3222,7 @@ void render_screen(void) {
                  * 字符覆盖，必须用 \x1b[K 清行尾，否则布局收缩（关闭分屏窗格后
                  * 活动窗格扩宽）时会残留上一帧的内容（右侧屏幕不重置）。 */
                 pos += snprintf(out + pos, bs - pos, "\x1b[0m\x1b[K");
-                if (show_sb && dist <= 10) {
+                if (show_sb && dist <= 10 && y != sb_spare) {
                     /* 滚动条轨道画在最右列：先清行尾（上面已发 \x1b[K），再回到
                      * 最右列画 thumb / track。 */
                     pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH", y + 2, g_mux.host_cols);
@@ -3170,6 +3485,47 @@ void render_screen(void) {
         pos += snprintf(out + pos, bs - pos, "\x1b[?25l");
     }
 
+    /* 诊断帧头：必须与 dump_render_output 在同一位置打印，两份日志的帧号才同源。
+     * 每帧一行，即使这一帧没有任何宽字符也照打——上次两份日志对不上，就是因为
+     * cell_diag 只在含宽字符的行才输出，帧号跳过了大量帧。
+     *
+     * 条件必须与 dump_render_output 的调用条件【逐条相同】，否则一边写了另一边没写，
+     * 帧号又会错开。dump_render_output 有三道门：外层要求 active_pane 有效且 .active，
+     * 函数内部还要求 g_dump_enabled（TERMUX_DUMP）与 len>0。这里全部照抄。
+     * 所以抓这份日志时 TERMUX_DUMP 和 TERMUX_CELLDIAG 必须【同时】设置。 */
+    int cd_dump_will_write =
+        (getenv("TERMUX_DUMP") != NULL) && pos > 0 &&
+        (g_mux.active_pane >= 0 && g_mux.active_pane < g_mux.pane_count &&
+         g_mux.panes[g_mux.active_pane].active);
+    if (getenv("TERMUX_CELLDIAG") && cd_dump_will_write) {
+        /* pb 必须初始化：某个 pane 都没有的帧（例如分屏关闭到只剩一个窗格、
+         * 走整屏路径）pn 会是 0，此时 snprintf 不写入 pb，后面 "%s" 读到的就是
+         * 栈上上一次调用残留的字节 —— 会把上一帧的 pane 列表拼到本帧帧头后面。 */
+        char pb[512]; pb[0] = '\0'; int pn = 0;
+        for (int i = 0; i < MAX_PANES; i++) {
+            if (!g_cd_pane[i].valid) continue;
+            pn += snprintf(pb + pn, sizeof pb - pn,
+                           " pane%d[c0=%d ocols=%d scols=%d srows=%d cols=%d rows=%d vo=%d hist=%d conpty_cols=%d narrow=%d]",
+                           i, g_cd_pane[i].oc0, g_cd_pane[i].ocols, g_cd_pane[i].scols,
+                           g_cd_pane[i].srows, g_cd_pane[i].cols, g_cd_pane[i].rows,
+                           g_cd_pane[i].vo, g_cd_pane[i].hist, g_cd_pane[i].conpty_cols,
+                           g_cd_pane[i].narrow);
+        }
+        char hdr[640];
+        int hn = snprintf(hdr, sizeof hdr,
+                          "FRAME %d host=%dx%d model=%dx%d panes=%d active=%d drag=%d len=%d%s\n",
+                          cell_diag_frame, g_mux.host_cols, g_mux.host_rows,
+                          g_mux.panes[g_mux.active_pane].screen.cols,
+                          g_mux.panes[g_mux.active_pane].screen.rows,
+                          g_mux.pane_count, g_mux.active_pane,
+                          split_drag_active(), pos, pb);
+        if (hn < 0) hn = 0;
+        if (hn > (int)sizeof hdr - 1) hn = (int)sizeof hdr - 1;
+        /* 帧头在前、明细在后，一次写盘：日志里每帧是一个完整块。 */
+        cell_diag("%.*s%.*s", hn, hdr, g_cd_len, g_cd_buf);
+        g_cd_len = 0;
+        for (int i = 0; i < MAX_PANES; i++) g_cd_pane[i].valid = 0;
+    }
     if (g_mux.active_pane >= 0 && g_mux.active_pane < g_mux.pane_count && g_mux.panes[g_mux.active_pane].active)
         dump_render_output(out, pos, g_mux.panes[g_mux.active_pane].screen.cols, g_mux.panes[g_mux.active_pane].screen.rows, g_mux.host_cols, g_mux.host_rows);
     g_mux.needs_redraw = 0;

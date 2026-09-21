@@ -10,3 +10,25 @@ __pycache__/
 
 # 单元测试产物
 .test_config.bin
+
+# ---- 构建产物（CI 会自己编，不入库）----
+termux-linux
+termux-macos
+termux_cpp.exe
+*.o
+
+# ---- 发布包：只留源码，历史版本的 exe/zip 不入库 ----
+release_v*/
+release_v*.zip
+
+# ---- 第三方二进制：Microsoft 的 ConPTY 组件，按需自行放置 ----
+conpty.dll
+OpenConsole.exe
+third_party/conpty.dll
+third_party/OpenConsole.exe
+
+# ---- 跟踪用的 trace ----
+*_trace.log
+
+# 运行时生成的用户配置
+termux.ini

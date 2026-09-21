@@ -130,6 +130,21 @@ int split_remove_leaf(int root, int node, int *removed_pane) {
 
 /* ---------------------------- 纯布局 ------------------------------------- */
 
+/* 最后一道闸：无论 frac 是怎么来的（拖分隔条 / 键盘 prefix+方向键 / 窗口变小后
+ * 旧 frac 变得太极端），都不许把某一侧压到最小尺寸以下。
+ *
+ * 为什么必须有这道闸而不只靠 split_drag_pct() 夹百分比：键盘 resize 走
+ * split_resize_pane()，它只按百分比加减、手里根本没有像素尺寸，夹不了；窗口
+ * 拖窄之后同一个 frac 对应的列数也会缩到 1。（2026-09-20 用户报「纵向压缩可以
+ * 把一个终端压缩到 <3 行/列」。）
+ *
+ * 空间连 2*min 都不够时不动手 —— 那种情况 layout_rec 的均分兜底已经接管了。 */
+static void clamp_side(int *side, int total, int min_side) {
+    if (total < min_side * 2) return;
+    if (*side < min_side) *side = min_side;
+    if (total - *side < min_side) *side = total - min_side;
+}
+
 static void layout_rec(SplitNode *nodes, int n, int c0, int r0, int cols, int rows,
                        PaneRect *rects) {
     if (n < 0 || !nodes[n].used) return;
@@ -158,6 +173,8 @@ static void layout_rec(SplitNode *nodes, int n, int c0, int r0, int cols, int ro
         int right = total - left;
         /* 保证两边都不小于最小宽；空间不够时均分。 */
         if (cols < SPLIT_MIN_COLS * 2 + 1) { left = total / 2; right = total - left; }
+        clamp_side(&left, total, SPLIT_MIN_COLS);
+        right = total - left;
         layout_rec(nodes, nodes[n].a, c0, r0, left, rows, rects);
         layout_rec(nodes, nodes[n].b, c0 + left + 1, r0, right, rows, rects);
     } else {
@@ -167,6 +184,8 @@ static void layout_rec(SplitNode *nodes, int n, int c0, int r0, int cols, int ro
         int top = total * frac / 100;
         int bot = total - top;
         if (rows < SPLIT_MIN_ROWS * 2 + 1) { top = total / 2; bot = total - top; }
+        clamp_side(&top, total, SPLIT_MIN_ROWS);
+        bot = total - top;
         layout_rec(nodes, nodes[n].a, c0, r0, cols, top, rects);
         layout_rec(nodes, nodes[n].b, c0, r0 + top + 1, cols, bot, rects);
     }
@@ -285,26 +304,120 @@ int split_resize_pane(int root, int from_pane, char where, int delta_pct) {
     return 0;
 }
 
-void split_resize_set_frac(int root, int anchor_pane, char dir, int pct) {
-    if (root < 0) return;
-    if (pct < 5) pct = 5;
-    if (pct > 95) pct = 95;
+int split_subtree_leaves(int node, int side, int *out, int cap) {
+    if (node < 0 || node >= MAX_SPLIT_NODES || !out || cap <= 0) return 0;
+    if (!g_split_nodes[node].used || g_split_nodes[node].leaf) return 0;
+    int child = side ? g_split_nodes[node].b : g_split_nodes[node].a;
+    if (child < 0) return 0;
+    return collect_leaves(g_split_nodes, child, out, cap, 0);
+}
+
+int split_dir_ancestors(int root, int anchor_pane, char dir, int *out, int cap) {
+    if (root < 0 || !out || cap <= 0) return 0;
     int leaf = split_find_leaf(root, anchor_pane);
-    if (leaf < 0) return;
-    int par = g_split_nodes[leaf].parent;
+    if (leaf < 0) return 0;
     int want_dir = (dir == 'V') ? SPLIT_V : SPLIT_H;
-    while (par >= 0) {
-        if (g_split_nodes[par].dir == want_dir) {
-            /* anchor 在 a 子树时 pct 就是 a 占比；在 b 子树时 a 占比 = 100-pct。 */
-            int leaves[MAX_PANES];
-            int in_a = 0;
-            int na = collect_leaves(g_split_nodes, g_split_nodes[par].a, leaves, MAX_PANES, 0);
-            for (int i = 0; i < na; i++) if (leaves[i] == anchor_pane) { in_a = 1; break; }
-            g_split_nodes[par].frac_pct = in_a ? pct : (100 - pct);
-            return;
-        }
+    int n = 0;
+    int par = g_split_nodes[leaf].parent;
+    while (par >= 0 && n < cap) {
+        if (g_split_nodes[par].dir == want_dir) out[n++] = par;
         par = g_split_nodes[par].parent;
     }
+    return n;
+}
+
+void split_set_frac_node(int node, int anchor_pane, int pct) {
+    if (node < 0 || node >= MAX_SPLIT_NODES || !g_split_nodes[node].used) return;
+    if (g_split_nodes[node].leaf) return;
+    if (pct < 5) pct = 5;
+    if (pct > 95) pct = 95;
+    /* anchor 在 a 子树时 pct 就是 a 占比；在 b 子树时 a 占比 = 100-pct。 */
+    int leaves[MAX_PANES];
+    int in_a = 0;
+    int na = collect_leaves(g_split_nodes, g_split_nodes[node].a, leaves, MAX_PANES, 0);
+    for (int i = 0; i < na; i++) if (leaves[i] == anchor_pane) { in_a = 1; break; }
+    g_split_nodes[node].frac_pct = in_a ? pct : (100 - pct);
+}
+
+/* 语义保持不变：取【最内层】那个方向匹配的祖先。拖分隔条的路径不再走这里，
+ * 改用 split_drag_pick_node() 挑出用户真正抓住的那条线所属的节点。 */
+void split_resize_set_frac(int root, int anchor_pane, char dir, int pct) {
+    if (root < 0) return;
+    int anc[MAX_SPLIT_NODES];
+    int n = split_dir_ancestors(root, anchor_pane, dir, anc, MAX_SPLIT_NODES);
+    if (n > 0) split_set_frac_node(anc[0], anchor_pane, pct);
+}
+
+/* 子树在屏幕上的跨度：'V' 取列区间 [lo,hi)，'H' 取行区间。hi 是【排他】的右沿/
+ * 底沿 —— 也就是这个子树与它兄弟之间那条分隔线所在的列/行。lo/hi 可传 NULL。
+ * 返回 0 表示算不出来（子树空 / 有 pane 矩形无效）。 */
+static int subtree_span(const PaneRect *rects, int node, int side, char dir,
+                        int *lo, int *hi) {
+    int ls[MAX_PANES];
+    int n = split_subtree_leaves(node, side, ls, MAX_PANES);
+    if (n <= 0) return 0;
+    int l = 0x7fffffff, h = -0x7fffffff;
+    for (int i = 0; i < n; i++) {
+        const PaneRect *r = &rects[ls[i]];
+        if (!r->valid) return 0;
+        int rl = (dir == 'V') ? r->oc0 : r->or0;
+        int rh = (dir == 'V') ? r->oc0 + r->ocols : r->or0 + r->orows;
+        if (rl < l) l = rl;
+        if (rh > h) h = rh;
+    }
+    if (l >= h) return 0;
+    if (lo) *lo = l;
+    if (hi) *hi = h;
+    return 1;
+}
+
+int split_drag_pick_node(const PaneRect *rects, int root, int grab_pane, char dir,
+                         int grab_pos) {
+    if (!rects || root < 0) return -1;
+    int anc[MAX_SPLIT_NODES];
+    int nanc = split_dir_ancestors(root, grab_pane, dir, anc, MAX_SPLIT_NODES);
+    for (int k = 0; k < nanc; k++) {
+        int alo, ahi, blo;
+        if (!subtree_span(rects, anc[k], 0, dir, &alo, &ahi)) continue;
+        if (!subtree_span(rects, anc[k], 1, dir, &blo, NULL)) continue;
+        /* a 子树的排他右沿/底沿 == 用户抓的那条线，且 b 子树紧贴其后 —— 就是它。 */
+        if (ahi == grab_pos && blo == grab_pos + 1) return anc[k];
+    }
+    /* 兜底：位置对不上任何该方向的分界线。抓得到分隔线就一定对得上（该 pane 必是
+     * 某个子树 a 侧的最外沿），走到这里说明矩形还没算好；退回最内层祖先，至少不
+     * 比改动前更差。 */
+    return nanc > 0 ? anc[0] : -1;
+}
+
+int split_drag_pct(const PaneRect *rects, int node, char dir, int mouse_pos, int *out_pct) {
+    if (!rects || !out_pct || node < 0) return 0;
+    int alo, ahi, blo, bhi;
+    if (!subtree_span(rects, node, 0, dir, &alo, &ahi)) return 0;
+    if (!subtree_span(rects, node, 1, dir, &blo, &bhi)) return 0;
+    /* 这个节点自己的总跨度（含中间那 1 格分隔线）—— 分母必须用它，不是屏幕上
+     * 「锚点 + 右邻」的宽度。 */
+    int total = (ahi - alo) + 1 + (bhi - blo);
+    if (total <= 1) return 0;
+    int span = total - 1;                 /* layout_rec 里真正参与分配的格数 */
+    int pct = ((mouse_pos - alo) * 100) / span;
+    /* 夹到两侧都不小于最小尺寸：只夹 5..95 是不够的 —— 窗格小的时候 5% 就是
+     * 0 行/0 列，一路拖到底能把一个终端压没。（2026-09-20 用户报。）
+     * 阈值与 layout_rec 的均分兜底保持一致：span >= 2*min 才谈得上满足最小尺寸。 */
+    int min_side = (dir == 'V') ? SPLIT_MIN_COLS : SPLIT_MIN_ROWS;
+    if (span >= min_side * 2) {
+        int lo = (min_side * 100 + span - 1) / span;   /* ceil  -> left  >= min_side */
+        int hi = ((span - min_side) * 100) / span;     /* floor -> right >= min_side */
+        if (lo < 5) lo = 5;
+        if (hi > 95) hi = 95;
+        if (lo <= hi) {
+            if (pct < lo) pct = lo;
+            if (pct > hi) pct = hi;
+        }
+    }
+    if (pct < 5) pct = 5;
+    if (pct > 95) pct = 95;
+    *out_pct = pct;
+    return 1;
 }
 
 /* ---------------------------------------------------------------------------

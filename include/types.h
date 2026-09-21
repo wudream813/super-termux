@@ -73,8 +73,47 @@ typedef struct {
     int hist_lines;
     int alt_hist_lines;
     int cr_pending;   /* 上一个逻辑文本控制是否为 CR；OSC 标题不打断 CRLF */
+    /* ConPTY 在【屏幕最后一行的末列】上的定位标记，-1 表示没有。
+     *
+     * conhost 窄屏折行续写有两种字节形态（09-17 真机 pane0 流实测）：
+     *   (1) <写满一行> CR LF ESC[<下一行>;<末列>H <剩余内容>     —— 偏移 1327 等 52 处
+     *   (2) <写满一行> ESC[<末行>;<越界列>H CR LF <剩余内容>     —— 偏移 1589/1899/3258
+     * 形态 (1) 的续写首字符落在被续写行的末列，随后自动折行，screen_put_cp 的
+     * screen_newline + screen_mark_softwrap 会把新行正确标成续行，无需额外规则。
+     * 形态 (2) 不同：那个 CUP 只是 conhost 把「已折到下一行」的内部光标收回末列，
+     * 紧跟的 CR LF 在底行触发【整屏滚动】，续写文本落在滚出来的新底行上 —— 而
+     * screen_scroll_up 会把新底行的 line_wrap 清 0，于是这条记录被拆成两半
+     * （实测 24 列下 bin / Ext2Fsd / Vape 三条：<DIR> 那半与名字那半分家）。
+     * cup_eol_row 记下形态 (2) 的 CUP 落点行，供随后那个 LF 判定「滚动出来的新
+     * 底行是上一行的续行」。只在 CUP 落到 (rows-1, cols-1) 时置位，任何其它输入
+     * （可打印字符、别的 CSI/ESC、别的 C0）立即清掉，判定窗口极窄。 */
+    int cup_eol_row;
     int repaint_candidate; /* 收到 DECTCEM hide，等待 HOME 确认 ConPTY 整屏重绘 */
     int repaint_active;    /* ConPTY viewport 重绘中：底边 CRLF 不得写入 scrollback */
+    /* resize 后的第一次整屏重绘：conhost 增高时不回收滚动历史、只在下方补空行，
+     * 所以重绘只带「它 viewport 里的那几行」，比窗格矮一截。repaint_snap 保存重绘前
+     * 的可见行，重绘结束后用它把内容顶回底行（见 screen_repaint_reanchor）。 */
+    int resize_repaint_pending;
+    /* 同一次 resize 已经「让过」几趟重绘。conhost 的 resize 重绘常常是两趟：
+     * 第一趟以 ESC[<rows>;1H ESC[?25h 收尾（光标停在最后一行 ⇒ 无事可做），
+     * 第二趟才把光标停在提示符下面一行、并在下方补一串 ESC[K 空行 —— 真正需要
+     * 重锚定的是第二趟。2026-09-20 真机 render_dump.log 实测：左窗格 61→5→92，
+     * 第一趟就把 pending 吃掉，第二趟拿不到快照，24 行 dir 列表被空行覆盖。
+     * 计数用来给「让过」封顶，避免 pending 一直挂着让后面无关的重绘误触发。 */
+    int resize_repaint_pass;
+    ScreenLine *repaint_snap;
+    /* 与 repaint_snap 一一对应的软换行续行标志。2026-09-17：早先快照只存 cells，
+     * reanchor 补回顶部那几行时无条件把 line_wrap 清 0，于是 conhost 重绘后整片
+     * 可见区的续行标记丢失 —— 拖宽 reflow 无法把它们并回逻辑行，dir 记录被拆成
+     * 「<DIR>」+ 一行纯空格 + 「   arena」这种三行（用户报的「有些地方多出了空格」）。
+     * 打点实测：[CLR repaint顶部] dp=90..107 配 scroll_top=90 正好覆盖 rel 0..17。 */
+    unsigned char *repaint_snap_wrap;
+    int repaint_snap_rows;
+    int repaint_snap_cols;
+    /* 重绘前本地内容流的行数（hist + 可见区里到最后一条非空行为止）。conhost 把更老
+     * 的行滚进它自己的滚动缓冲后，重绘只带最新那几行；拿它和这个数一比就知道该不该
+     * 重新锚定、该下移几行（见 screen_repaint_reanchor）。 */
+    int repaint_snap_content;
 } ScreenBuffer;
 
 typedef struct {
@@ -206,6 +245,9 @@ extern int g_hover_settings_cmd_active;
 
 extern int g_sb_dragging;
 extern int g_sb_grab_offset;
+/* 滚动条拖动锁定在哪个 pane 上（-1 = 没在拖）。拖动期间分屏层不得切焦点，
+ * 否则鼠标划过另一个窗格就会变成拖那个窗格的滚动条（2026-09-20 用户报）。 */
+extern int g_sb_drag_pane;
 
 /* 瞬时警告提示（toast）：分屏空间不足等操作失败时，在屏幕底部中央短暂显示一条
  * 黄字消息。g_toast_until 为 GetTickCount64() 过期时刻（0=无提示）。 */
@@ -236,6 +278,9 @@ extern int g_search_mode;
 extern int g_search_active;
 extern char g_search_buf[64];
 extern int g_search_len, g_search_pos;
+/* 终端来了新数据、搜索匹配需要重算。由 pane 读线程置位，主循环在渲染前消费一次
+ * （每帧最多重扫一次，避免每个 ReadFile 分块都扫一遍整个滚动缓冲）。 */
+extern int g_search_dirty;
 
 // Diagnostic functions
 void dump_pane_bytes(int pane_idx, const char *data, int len);

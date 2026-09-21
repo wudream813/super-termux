@@ -10,13 +10,40 @@
 #define UNICODE
 #define _UNICODE
 
+#ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
+#include <process.h>
+#else
+/* 非 Windows（Linux / macOS）。这里有三条编译路径，靠「找不找得到 windows.h」
+ * 来分流：
+ *   1. 单元测试 / 回归 harness：用 -Itests/stub 或 -Itests/loaderstub 提供一份
+ *      最小 windows.h 替身（还带 g_stub_* 那套假控制台状态）。这些 harness 在
+ *      移植之前就存在，必须继续原样编过 —— 而它们本来就是靠
+ *      「#include <windows.h> 被 -I 目录截走」生效的，所以优先走这条。
+ *   2. 真正的移植构建（make linux / make darwin）：只有 -Iinclude，找不到
+ *      windows.h，落到移植兼容层 wincompat.h。
+ * 一份引擎源码，三种 Win32 定义各拿各的，互不干扰。 */
+#if defined(__has_include)
+#  if __has_include(<windows.h>)
+#    include <windows.h>
+#  else
+#    include "wincompat.h"
+#  endif
+#else
+#  include "wincompat.h"
+#endif
+#endif
+
+/* 空句柄常量：三条路径都要有。pane.c / platform_*.c 用它判空，不用裸 NULL ——
+ * POSIX 侧 HANDLE 是 intptr_t，跟指针常量比会报符号比较警告。 */
+#ifndef NULL_HANDLE
+#define NULL_HANDLE ((HANDLE)0)
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
-#include <process.h>
 #include <wctype.h>
 
 #ifdef _MSC_VER

@@ -1,4 +1,8 @@
 #include "pane.h"
+#include "platform.h"
+#ifdef _WIN32
+#include "conpty_loader.h"
+#endif
 #include "render.h"
 #include "input.h"
 #include "split.h"
@@ -8,8 +12,7 @@ extern int g_split_zoom;
 
 void write_to_pane_internal(Pane *pane, const char *data, int len) {
     if (!pane || !pane->active) return;
-    DWORD w;
-    WriteFile(pane->pipe_in, data, len, &w, NULL);
+    plat_write_fd(pane->pipe_in, data, len);
 }
 
 void write_to_pane(const char *data, int len) {
@@ -47,18 +50,16 @@ void reap_dead_panes(void) {
     for (int i = 0; i < g_mux.pane_count; i++) {
         Pane *p = &g_mux.panes[i];
         if (!p->active) {
-            if (p->read_thread != NULL) close_pane(i);
+            if (p->read_thread != NULL_HANDLE) close_pane(i);
             continue;
         }
         if (p->exited_hold) {
             continue;
         }
-        if (p->process != NULL && WaitForSingleObject(p->process, 0) == WAIT_OBJECT_0) {
-            DWORD exit_code = 0;
-            GetExitCodeProcess(p->process, &exit_code);
+        DWORD exit_code = 0;
+        if (p->process != NULL_HANDLE && plat_proc_exited(p->process, &exit_code)) {
             if (exit_code != 0) {
-                if (p->read_thread != NULL)
-                    WaitForSingleObject(p->read_thread, 250);
+                plat_thread_join(&p->read_thread, 250);
                 char msg[256];
                 int mlen = snprintf(msg, sizeof(msg),
                     "\r\n\x1b[31;1m[进程异常退出，退出码: %lu (0x%lX)]\x1b[0m \x1b[33m按任意键关闭该标签页...\x1b[0m\r\n",
@@ -71,8 +72,7 @@ void reap_dead_panes(void) {
                 LeaveCriticalSection(&g_mux.cs);
                 continue;
             }
-            if (p->read_thread != NULL)
-                WaitForSingleObject(p->read_thread, 250);
+            plat_thread_join(&p->read_thread, 250);
             pane_mark_dead(i);
             close_pane(i);
         }
@@ -84,25 +84,29 @@ unsigned __stdcall pane_read_thread(void *arg) {
     Pane *pane = &g_mux.panes[idx];
     char buf[READ_BUF_SIZE];
     while (pane->active) {
-        DWORD br = 0;
-        if (!ReadFile(pane->pipe_out, buf, sizeof(buf), &br, NULL) || br == 0) break;
-        dump_pane_bytes(idx, buf, (int)br);
+        int br = plat_read(pane->pipe_out, buf, (int)sizeof(buf));
+        if (br <= 0) break;
+        dump_pane_bytes(idx, buf, br);
         EnterCriticalSection(&g_mux.cs);
-        /* ConPTY 整屏重绘（ESC[H 起逐行重画）按其自身滚动缓冲对齐，顶行可能比本地
-         * reflow 环的可见顶行深若干行（拖动分隔条时 ConPTY 侧会因反复重绘累积漂移，
-         * 或本地 resize 后 ConPTY 多留一条“刚滚出”行）。重绘若直接落下会把本地还
-         * 可见的顶部内容覆盖吞行。喂解析器前先尝试对齐：重绘顶行若与本地更深处某行
-         * 内容一致，就把环前滚对齐（内容不变）；顶行即本地 rel0 或非重绘块则不动作。 */
-        screen_repaint_align(&pane->screen, buf, (int)br);
-        screen_process_output(&pane->screen, buf, br);
-        DWORD avail = 0;
-        while (PeekNamedPipe(pane->pipe_out, NULL, 0, NULL, &avail, NULL) && avail > 0) {
-            DWORD to_read = avail > sizeof(buf) ? sizeof(buf) : avail;
-            DWORD br2 = 0;
-            if (!ReadFile(pane->pipe_out, buf, to_read, &br2, NULL) || br2 == 0) break;
-            dump_pane_bytes(idx, buf, (int)br2);
-            screen_repaint_align(&pane->screen, buf, (int)br2);
-            screen_process_output(&pane->screen, buf, br2);
+        /* ConPTY 整屏重绘（ESC[H 起逐行重画）按其自身滚动缓冲对齐：重绘顶行可能比
+         * 本地 reflow 环的可见顶行深若干行，直接落下会把本地还可见的顶部内容覆盖吞行。
+         * 对齐只接受【正向】偏移且要求整块逐行吻合（见 screen_repaint_align 头注）。
+         * 重绘比窗格高时由 screen_process_output 内部的重绘视口上滚对齐，比窗格矮时
+         * 由 screen_repaint_reanchor 把提示符顶回底行。 */
+        screen_repaint_align(&pane->screen, buf, br);
+        screen_process_output(&pane->screen, buf, (size_t)br);
+        /* 搜索开着时，新输出里的关键词也要能被找到（重扫在主循环里做，每帧一次）。
+         * 只有活动窗格的内容会被搜索，别的窗格来了输出不用置脏。 */
+        if (idx == g_mux.active_pane) search_mark_dirty();
+        int avail;
+        while ((avail = plat_peek_avail(pane->pipe_out)) > 0) {
+            int br2 = plat_read(pane->pipe_out, buf,
+                                avail > (int)sizeof(buf) ? (int)sizeof(buf) : avail);
+            if (br2 <= 0) break;
+            dump_pane_bytes(idx, buf, br2);
+            screen_repaint_align(&pane->screen, buf, br2);
+            screen_process_output(&pane->screen, buf, (size_t)br2);
+            if (idx == g_mux.active_pane) search_mark_dirty();
         }
         if (pane->screen.response_len > 0) {
             write_to_pane_internal(pane, pane->screen.response_buf, pane->screen.response_len);
@@ -115,12 +119,18 @@ unsigned __stdcall pane_read_thread(void *arg) {
     return 0;
 }
 
+#ifdef _WIN32   /* 注册表只有 Windows 有；POSIX 侧走 plat_sysinfo(uname)。 */
 typedef LSTATUS (APIENTRY *RegOpenKeyExW_fn)(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY);
 typedef LSTATUS (APIENTRY *RegQueryValueExW_fn)(HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
 typedef LSTATUS (APIENTRY *RegCloseKey_fn)(HKEY);
+#endif
 
 void get_system_version_string(char *out, int max_len) {
     out[0] = 0;
+#ifndef _WIN32
+    plat_sysinfo(out, max_len);
+    if (!out[0]) snprintf(out, (size_t)max_len, "%s", "POSIX");
+#else
     HMODULE hAdv = LoadLibraryA("advapi32.dll");
     if (hAdv) {
         RegOpenKeyExW_fn pOpen = (RegOpenKeyExW_fn)(void*)GetProcAddress(hAdv, "RegOpenKeyExW");
@@ -169,13 +179,14 @@ void get_system_version_string(char *out, int max_len) {
         }
         FreeLibrary(hAdv);
     }
-    snprintf(out, max_len, "Windows 10 / Windows 11 (NT 10.0)");
+    snprintf(out, (size_t)max_len, "%s", "Windows 10 / Windows 11 (NT 10.0)");
+#endif
 }
 
 int create_about_pane(void) {
     int idx = -1;
     for (int i = 0; i < MAX_PANES; i++) {
-        if (!g_mux.panes[i].active && g_mux.panes[i].read_thread == NULL) {
+        if (!g_mux.panes[i].active && g_mux.panes[i].read_thread == NULL_HANDLE) {
             idx = i;
             break;
         }
@@ -209,8 +220,8 @@ int create_about_pane(void) {
         "  \x1b[038;2;255;255;255m\x1b[048;2;217;119;054;1m ╔══════════════════════════════════════════════════════════╗ \x1b[0m\r\n"
         "  \x1b[038;2;255;255;255m\x1b[048;2;217;119;054;1m ║                  termux - 关于 (About)                   ║ \x1b[0m\r\n"
         "  \x1b[038;2;255;255;255m\x1b[048;2;217;119;054;1m ╚══════════════════════════════════════════════════════════╝ \x1b[0m\r\n\r\n"
-        "  \x1b[038;2;217;119;054;1mWindows 终端复用器 (Terminal Multiplexer)\x1b[0m\r\n"
-        "  \x1b[038;2;139;148;158m基于 Windows ConPTY 的高性能单文件 C 终端复用多标签环境\x1b[0m\r\n\r\n"
+        "  \x1b[038;2;217;119;054;1m" TERMUX_ABOUT_TITLE_U8 "\x1b[0m\r\n"
+        "  \x1b[038;2;139;148;158m" TERMUX_ABOUT_SUB_U8 "\x1b[0m\r\n\r\n"
         "  \x1b[038;2;048;054;061m────────────────────────────────────────────────────────────\x1b[0m\r\n"
         "  \x1b[038;2;217;119;054;1m■ 版本号 (Version)      :\x1b[0m \x1b[038;2;230;237;243;1mv" TERMUX_VERSION "\x1b[0m\r\n"
         "  \x1b[038;2;217;119;054;1m■ 作  者 (Author)       :\x1b[0m \x1b[038;2;063;185;080;1mwu_dream813\x1b[0m\r\n"
@@ -233,7 +244,7 @@ int create_about_pane(void) {
 int create_pane_shell_with_dir(const WCHAR *shell, const WCHAR *workdir) {
     int idx = -1;
     for (int i = 0; i < MAX_PANES; i++)
-        if (!g_mux.panes[i].active && g_mux.panes[i].read_thread == NULL) { idx = i; break; }
+        if (!g_mux.panes[i].active && g_mux.panes[i].read_thread == NULL_HANDLE) { idx = i; break; }
     if (idx < 0) return -1;
 
     Pane *pane = &g_mux.panes[idx]; memset(pane, 0, sizeof(*pane));
@@ -241,6 +252,8 @@ int create_pane_shell_with_dir(const WCHAR *shell, const WCHAR *workdir) {
     if (!screen_init(&pane->screen, pane_cols, g_mux.host_rows)) return -1;
     pane->screen.pane_index = idx;
 
+#ifdef _WIN32
+    /* ---- Windows：ConPTY + CreateProcessW ---- */
     HANDLE pi_r = NULL, pi_w = NULL, po_r = NULL, po_w = NULL;
     COORD sz = {(SHORT)pane_cols, (SHORT)g_mux.host_rows};
     STARTUPINFOEXW si;
@@ -256,7 +269,7 @@ int create_pane_shell_with_dir(const WCHAR *shell, const WCHAR *workdir) {
 
     if (!CreatePipe(&pi_r, &pi_w, NULL, 0)) goto create_fail;
     if (!CreatePipe(&po_r, &po_w, NULL, 0)) goto create_fail;
-    if (FAILED(CreatePseudoConsole(sz, pi_r, po_w, 0, &pane->hpc))) goto create_fail;
+    if (FAILED(conpty_create(sz, pi_r, po_w, conpty_default_flags(), &pane->hpc))) goto create_fail;
 
     InitializeProcThreadAttributeList(NULL, 1, 0, &as);
     if (as == 0) goto create_fail;
@@ -335,7 +348,7 @@ int create_pane_shell_with_dir(const WCHAR *shell, const WCHAR *workdir) {
     pane->read_thread = (HANDLE)_beginthreadex(NULL, 0, pane_read_thread, (void*)(intptr_t)idx, 0, NULL);
     if (!pane->read_thread) {
         pane->active = 0;
-        ClosePseudoConsole(pane->hpc);
+        conpty_close(pane->hpc);
         CloseHandle(pane->pipe_in); CloseHandle(pane->pipe_out);
         TerminateProcess(pane->process, 0); WaitForSingleObject(pane->process, 500);
         CloseHandle(pane->process); CloseHandle(pane->thread);
@@ -347,7 +360,7 @@ int create_pane_shell_with_dir(const WCHAR *shell, const WCHAR *workdir) {
 attr_fail:
     free(si.lpAttributeList);
 create_fail:
-    if (pane->hpc) ClosePseudoConsole(pane->hpc);
+    if (pane->hpc) conpty_close(pane->hpc);
     if (pi_r) CloseHandle(pi_r);
     if (pi_w) CloseHandle(pi_w);
     if (po_r) CloseHandle(po_r);
@@ -355,6 +368,48 @@ create_fail:
     screen_free(&pane->screen);
     memset(pane, 0, sizeof(*pane));
     return -1;
+
+#else  /* ---- POSIX（Linux / macOS）：forkpty ----
+        * 子进程拿到一个真 pty 作为控制终端，父进程持 master。pipe_in / pipe_out 都
+        * 是那个 master fd（读写同一端）；尺寸变化用 TIOCSWINSZ 通知，shell 自己
+        * 会重排 —— 这正是 Windows 侧 ResizePseudoConsole 的对应物。 */
+    char cmd_utf8[512] = {0};
+    WideCharToMultiByte(CP_UTF8, 0, shell, -1, cmd_utf8, (int)sizeof(cmd_utf8) - 1, NULL, NULL);
+    char dir_utf8[MAX_PATH] = {0};
+    if (workdir && *workdir) {
+        /* Windows 分支用 ExpandEnvironmentStringsW；POSIX 侧必须自己展开，
+         * 否则设置页承诺的「支持 %USERPROFILE%」在这边是死的。 */
+        char raw_dir[MAX_PATH] = {0};
+        WideCharToMultiByte(CP_UTF8, 0, workdir, -1, raw_dir, (int)sizeof(raw_dir) - 1, NULL, NULL);
+        posix_expand_env(raw_dir, dir_utf8, sizeof(dir_utf8));
+    }
+
+    if (plat_proc_spawn(cmd_utf8, dir_utf8[0] ? dir_utf8 : NULL,
+                        pane_cols, g_mux.host_rows,
+                        &pane->pipe_in, &pane->pipe_out, &pane->process) != 0) {
+        screen_free(&pane->screen);
+        memset(pane, 0, sizeof(*pane));
+        return -1;
+    }
+    pane->active = 1;
+
+    /* 标题：POSIX 上没有 cmd / powershell 的特例，统一取命令名。 */
+    snprintf(pane->full_title, sizeof(pane->full_title), "%s", cmd_utf8);
+    char *sp = strchr(cmd_utf8, ' ');
+    if (sp) *sp = 0;
+    sanitize_title(cmd_utf8, (int)strlen(cmd_utf8), pane->title, sizeof(pane->title));
+
+    if (idx >= g_mux.pane_count) g_mux.pane_count = idx + 1;
+    pane->read_thread = plat_thread_start(pane_read_thread, (void *)(intptr_t)idx);
+    if (pane->read_thread == NULL_HANDLE) {
+        pane->active = 0;
+        plat_proc_close(&pane->process, &pane->pipe_in, &pane->pipe_out);
+        screen_free(&pane->screen);
+        memset(pane, 0, sizeof(*pane));
+        return -1;
+    }
+    return idx;
+#endif
 }
 
 int create_pane_shell(const WCHAR *shell) {
@@ -393,7 +448,11 @@ int create_pane(void) {
     if (g_chooser_item_count > 0 && strcmp(g_chooser_items[0].cmd, ":custom") != 0) {
         return create_pane_from_item(0);
     }
+#ifdef _WIN32
     return create_pane_shell(L"cmd.exe");
+#else
+    return create_pane_shell(plat_default_shell());
+#endif
 }
 
 int open_settings_pane(void) {
@@ -405,7 +464,7 @@ int open_settings_pane(void) {
     }
     int idx = -1;
     for (int i = 0; i < MAX_PANES; i++) {
-        if (!g_mux.panes[i].active && g_mux.panes[i].read_thread == NULL) {
+        if (!g_mux.panes[i].active && g_mux.panes[i].read_thread == NULL_HANDLE) {
             idx = i;
             break;
         }
@@ -446,33 +505,16 @@ void close_pane(int idx) {
     pane->active = 0;
     LeaveCriticalSection(&g_mux.cs);
 
-    if (pane->hpc) {
-        ClosePseudoConsole(pane->hpc);
-        pane->hpc = NULL;
-    }
-    if (pane->pipe_in) {
-        CloseHandle(pane->pipe_in);
-        pane->pipe_in = NULL;
-    }
-    if (pane->pipe_out) {
-        CloseHandle(pane->pipe_out);
-        pane->pipe_out = NULL;
-    }
-    if (pane->read_thread) {
-        WaitForSingleObject(pane->read_thread, 2000);
-        CloseHandle(pane->read_thread);
-        pane->read_thread = NULL;
-    }
-    if (pane->process) {
-        TerminateProcess(pane->process, 0);
-        WaitForSingleObject(pane->process, 500);
-        CloseHandle(pane->process);
-        pane->process = NULL;
-    }
-    if (pane->thread) {
-        CloseHandle(pane->thread);
-        pane->thread = NULL;
-    }
+#ifndef _WIN32
+    /* POSIX：读线程阻塞在 pty 的 read 上，只有 shell 真的退了才拿得到 EOF，
+     * 所以必须【先杀进程再等线程】，否则 join 必然白等满 2000ms。
+     * Windows 侧不需要：CloseHandle 会让阻塞中的 ReadFile 立刻失败返回。 */
+    if (pane->process != NULL_HANDLE) plat_proc_kill(pane->process);
+#endif
+    plat_thread_join(&pane->read_thread, 2000);
+    plat_proc_close(&pane->process, &pane->pipe_in, &pane->pipe_out);
+    pane->hpc = NULL_HANDLE;
+    pane->thread = NULL_HANDLE;
 
     EnterCriticalSection(&g_mux.cs);
     free(pane->rf_grid); pane->rf_grid = NULL; pane->rf_valid = 0; pane->rf_rows = pane->rf_cols = 0;
@@ -512,6 +554,23 @@ void pane_resize_to(int idx, int cols, int rows) {
     if (!p->active) return;
     if (cols < 1) cols = 1;
     if (rows < 1) rows = 1;
+    /* 拖动分屏边框期间：本地 screen_resize 和 ResizePseudoConsole 都【不】做，
+     * 两边宽度一起冻结在拖动前的值，松手后第一帧一次性补齐。
+     *
+     * 早先只冻结了 ConPTY 那一侧、本地 screen_resize 照常逐帧做，理由是「拖动过程
+     * 中画面仍然实时重排」。那个实时重排本身就是错位的来源：conhost 的输出始终按
+     * 冻结的旧宽度排版，模型却每帧按新宽度 reflow，等于拿 16 列的碎片去拼 92 列的
+     * 行，拼出来必然是错的（真机实测一次拖动里模型宽度在 15/16/20/30/45/60/76/92
+     * 之间跳，非空历史行 8331→2771→1360→4167 来回剧变，而 conpty_cols 一直是 16）。
+     * 松手后补发 resize，conhost 按新宽度重排，画面才恢复正确 —— 症状就是用户报的
+     * 「拖动过程中有错位，要等停止拖动，错位才消失」。
+     *
+     * 两侧一起冻结后拖动中不存在宽度差，也就没有错位；窗格边界仍然跟鼠标动
+     * （布局矩形由 split_layout 算，不经过这里），只是内容在松手时才重排。 */
+    if (split_drag_active()) {
+        g_mux.needs_redraw = 1;
+        return;
+    }
     EnterCriticalSection(&g_mux.cs);
     if (p->screen.cols != cols || p->screen.rows != rows) {
         screen_resize(&p->screen, cols, rows);
@@ -525,9 +584,8 @@ void pane_resize_to(int idx, int cols, int rows) {
     /* 只在尺寸真正变化时才向 ConPTY 下发 resize：分屏渲染每帧都会按布局调
      * pane_resize_to，若同尺寸也下发，ConPTY 会整屏重绘（记录里逐帧重复的
      * 全屏 repaint），还会让行内容被以不同 wrap 覆写而残留过期 line_wrap。 */
-    if (p->hpc && (p->conpty_cols != cols || p->conpty_rows != rows)) {
-        COORD sz = {(SHORT)cols, (SHORT)rows};
-        ResizePseudoConsole(p->hpc, sz);
+    if (p->process != NULL_HANDLE && (p->conpty_cols != cols || p->conpty_rows != rows)) {
+        plat_proc_resize(p->process, p->pipe_in, p->pipe_out, cols, rows);
         p->conpty_cols = cols;
         p->conpty_rows = rows;
     }

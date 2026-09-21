@@ -1,0 +1,227 @@
+[?9001h[?1004h[?25l[2J[m[H
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[H]0;C:\windows\SYSTEM32\cmd.exe[?25h[?25lMicrosoft Windows [版本 10.0.26200.9457]
+(c) Microsoft Corporation。保留所有权利。[4;1HC:\Users\wu_dr\Downloads>[?25h[?25l[HMicrosoft Windows [版本 10.0.26200.9457][K
+(c) Microsoft Corporation。保留所有权利。[K
+[K
+C:\Users\wu_dr\Downloads>[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[4;26H[?25h[?25l[HMicrosoft Windows [版本 10.0.26200.9457][K
+(c) Microsoft Corporation。保留所有权利。[K
+[K
+C:\Users\wu_dr\Downloads>[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[4;26H[?25hdir
+[?25l 驱动器 C 中的卷是 dream-windows
+ 卷的序列号是 4389-E790[8;1H C:\Users\wu_dr\Downloads 的目录[10;1H2026/09/20  12:43    <DIR>          .
+2026/09/16  12:32    <DIR>          ..
+2026/08/07  17:17           517,963 19fdb758d11.yaml
+2026/08/23  18:55            45,658 2026年CSP-S1模拟题1.docx.txt
+2026/09/07  12:50    <DIR>          arena
+2026/08/14  19:24            72,192 better_cmd.exe
+2026/08/15  13:58           156,672 better_explorer.exe
+2026/09/19  22:06    <DIR>          bin
+2025/12/22  13:02        68,619,648 cloudflared.exe
+2026/09/20  12:43                46 conpty_source.log
+2026/09/19  22:05           268,104 dwm-topmost-x64.zip
+2026/04/19  14:38        20,549,329 EXPR.exe
+2026/02/24  06:37    <DIR>          Ext2Fsd v0.68 （Ext2,3,4文件系统的Windows驱动程序）
+2026/08/16  16:12        17,925,571 liquidbounce b100.jar
+2026/09/07  12:48         1,788,884 luogu-markdown-editor-1.2.19.vsix
+2026/09/20  12:43             3,664 mouse_dump.log
+2025/12/18  13:42        12,137,984 OpenArk64.exe
+2026/08/18  15:06         1,001,010 P6008_6.in
+2026/08/18  15:06                 9 P6008_6.out]0;C:\windows\SYSTEM32\cmd.exe - dir[?25h
+2026/09/20  12:37           880,169 release_v18.zip
+2026/09/20  12:43         4,750,011 render_delta.log
+2026/09/20  12:43        11,798,982 render_dump.log
+2026/09/20  12:43             6,514 screen_resize_trace.log
+2026/09/20  12:43            14,716 scroll_trace.log
+2026/09/06  17:01             1,142 termux.ini
+2026/09/20  12:43             6,426 termux_dump.log
+2026/09/20  12:38           275,456 termux_v18B.exe
+2025/12/23  13:09               132 test.bat
+2026/09/13  13:26            59,922 typst-latex-studio.html
+2026/08/23  19:02    <DIR>          Vape
+2026/09/07  12:52           523,582 洛谷题解_未命名.html
+2026/09/05  14:14             5,047 洛谷题解_未命名.md
+              26 个文件    141,408,833 字节
+               6 个目录 153,954,545,664 可用字节
+]0;C:\windows\SYSTEM32\cmd.exe
+C:\Users\wu_dr\Downloads>[?25l[H2026/04/19  14:38        20,549,329 EXPR.exe[K
+2026/02/24  06:37    <DIR>          Ext2Fsd v0.68 （Ext2,3,4文件系统的Windows驱动程序）[K
+2026/08/16  16:12        17,925,571 liquidbounce b100.jar 
+2026/09/07  12:48         1,788,884 luogu-markdown-editor-1.2.19.vsix[K
+2026/09/20  12:43             3,664 mouse_dump.log        
+2025/12/18  13:42        12,137,984 OpenArk64.exe[K
+2026/08/18  15:06         1,001,010 P6008_6.in[K
+2026/08/18  15:06                 9 P6008_6.out[K
+2026/09/20  12:37           880,169 release_v18.zip       
+2026/09/20  12:43         4,750,011 render_delta.log      
+2026/09/20  12:43        11,798,982 render_dump.log       
+2026/09/20  12:43             6,514 screen_resize_trace.log[K
+2026/09/20  12:43            14,716 scroll_trace.log      
+2026/09/06  17:01             1,142 termux.ini[K
+2026/09/20  12:43             6,426 termux_dump.log       
+2026/09/20  12:38           275,456 termux_v18B.exe       
+2025/12/23  13:09               132 test.bat[K
+2026/09/13  13:26            59,922 typst-latex-studio.html[K
+2026/08/23  19:02    <DIR>          Vape[K
+2026/09/07  12:52           523,582 洛谷题解_未命名.html  
+2026/09/05  14:14             5,047 洛谷题解_未命名.md    
+              26 个文件    141,408,833 字节[K
+               6 个目录 153,954,545,664 可用字节[K
+[K
+C:\Users\wu_dr\Downloads>[K[?25h[?25l[H2026/04/19  14:38        20,549,329 EXPR.exe[K
+2026/02/24  06:37    <DIR>          Ext2Fsd v0.68 （Ext2,3,4文件系统的Windows驱动程序）[K
+2026/08/16  16:12        17,925,571 liquidbounce b100.jar[K
+2026/09/07  12:48         1,788,884 luogu-markdown-editor-1.2.19.vsix[K
+2026/09/20  12:43             3,664 mouse_dump.log[K
+2025/12/18  13:42        12,137,984 OpenArk64.exe[K
+2026/08/18  15:06         1,001,010 P6008_6.in[K
+2026/08/18  15:06                 9 P6008_6.out[K
+2026/09/20  12:37           880,169 release_v18.zip[K
+2026/09/20  12:43         4,750,011 render_delta.log[K
+2026/09/20  12:43        11,798,982 render_dump.log[K
+2026/09/20  12:43             6,514 screen_resize_trace.log[K
+2026/09/20  12:43            14,716 scroll_trace.log[K
+2026/09/06  17:01             1,142 termux.ini[K
+2026/09/20  12:43             6,426 termux_dump.log[K
+2026/09/20  12:38           275,456 termux_v18B.exe[K
+2025/12/23  13:09               132 test.bat[K
+2026/09/13  13:26            59,922 typst-latex-studio.html[K
+2026/08/23  19:02    <DIR>          Vape[K
+2026/09/07  12:52           523,582 洛谷题解_未命名.html[K
+2026/09/05  14:14             5,047 洛谷题解_未命名.md[K
+              26 个文件    141,408,833 字节[K
+               6 个目录 153,954,545,664 可用字节[K
+[K
+C:\Users\wu_dr\Downloads>[K
+[K
+[K
+[K
+[K[25;26H[?25hdir
+[?25l 驱动器 C 中的卷是 dream-windows
+ 卷的序列号是 4389-E790[29;1H C:\Users\wu_dr\Downloads 的目录]0;C:\windows\SYSTEM32\cmd.exe - dir[?25h
+
+2026/09/20  12:43    <DIR>          .
+2026/09/16  12:32    <DIR>          ..
+2026/08/07  17:17           517,963 19fdb758d11.yaml
+2026/08/23  18:55            45,658 2026年CSP-S1模拟题1.docx.txt
+2026/09/07  12:50    <DIR>          arena
+2026/08/14  19:24            72,192 better_cmd.exe
+2026/08/15  13:58           156,672 better_explorer.exe
+2026/09/19  22:06    <DIR>          bin
+2025/12/22  13:02        68,619,648 cloudflared.exe
+2026/09/20  12:43                46 conpty_source.log
+2026/09/19  22:05           268,104 dwm-topmost-x64.zip
+2026/04/19  14:38        20,549,329 EXPR.exe
+2026/02/24  06:37    <DIR>          Ext2Fsd v0.68 （Ext2,3,4文件系统的Windows驱动程序）
+2026/08/16  16:12        17,925,571 liquidbounce b100.jar
+2026/09/07  12:48         1,788,884 luogu-markdown-editor-1.2.19.vsix
+2026/09/20  12:43             7,216 mouse_dump.log
+2025/12/18  13:42        12,137,984 OpenArk64.exe
+2026/08/18  15:06         1,001,010 P6008_6.in
+2026/08/18  15:06                 9 P6008_6.out
+2026/09/20  12:37           880,169 release_v18.zip
+2026/09/20  12:43         8,244,674 render_delta.log
+2026/09/20  12:43        27,418,831 render_dump.log
+2026/09/20  12:43            13,466 screen_resize_trace.log
+2026/09/20  12:43            35,169 scroll_trace.log
+2026/09/06  17:01             1,142 termux.ini
+2026/09/20  12:43            13,009 termux_dump.log
+2026/09/20  12:38           275,456 termux_v18B.exe
+2025/12/23  13:09               132 test.bat
+2026/09/13  13:26            59,922 typst-latex-studio.html
+2026/08/23  19:02    <DIR>          Vape
+2026/09/07  12:52           523,582 洛谷题解_未命名.html
+2026/09/05  14:14             5,047 洛谷题解_未命名.md
+              26 个文件    160,560,885 字节
+               6 个目录 153,950,183,424 可用字节
+]0;C:\windows\SYSTEM32\cmd.exe
+C:\Users\wu_dr\Downloads>[?25l[H2026/09/20  12:43            13,466 screen_resize_trace.log[K
+2026/09/20  12:43            35,169 scroll_trace.log  
+2026/09/06  17:01             1,142 termux.ini        
+2026/09/20  12:43            13,009 termux_dump.log   
+2026/09/20  12:38           275,456 termux_v18B.exe   
+2025/12/23  13:09               132 test.bat[K
+2026/09/13  13:26            59,922 typst-latex-studio.html[K
+2026/08/23  19:02    <DIR>          Vape[K
+2026/09/07  12:52           523,582 洛谷题解_未命名.html[K
+2026/09/05  14:14             5,047 洛谷题解_未命名.md
+              26 个文件    160,560,885 字节[K
+               6 个目录 153,950,183,424 可用字节      
+[K
+C:\Users\wu_dr\Downloads>  [29;26H[?25h

@@ -1,4 +1,8 @@
 #include "common.h"
+#ifdef _WIN32
+#include "conpty_loader.h"
+#endif
+#include "platform.h"
 #include "types.h"
 #include "screen.h"
 #include "utf8.h"
@@ -9,63 +13,8 @@
 #include "input.h"
 #include "split.h"
 
-// Global variable definitions
-MuxState g_mux;
-int g_pop_anchor_x = -1;
-int g_mouse_x = -1, g_mouse_y = -1;
-int g_mouse_prev_in_tabbar = 0;
-char g_toast_msg[96] = {0};
-DWORD64 g_toast_until = 0;
-void toast_show(const char *msg, unsigned int ms) {
-    if (!msg) { g_toast_until = 0; return; }
-    strncpy(g_toast_msg, msg, sizeof(g_toast_msg) - 1);
-    g_toast_msg[sizeof(g_toast_msg) - 1] = 0;
-    g_toast_until = GetTickCount64() + ms;
-    g_mux.needs_redraw = 1;
-}
-WCHAR g_high_surrogate = 0;
-WCHAR g_orig_title[256] = {0};
-
-int g_hover_preview_pane = -1;
-DWORD64 g_hover_preview_start = 0;
-int g_hover_preview_active = 0;
-int g_hover_chooser_idx = -1;
-DWORD64 g_hover_chooser_start = 0;
-int g_hover_chooser_active = 0;
-int g_hover_settings_name_idx = -1;
-DWORD64 g_hover_settings_name_start = 0;
-int g_hover_settings_name_active = 0;
-int g_hover_settings_cmd_idx = -1;
-DWORD64 g_hover_settings_cmd_start = 0;
-int g_hover_settings_cmd_active = 0;
-
-int g_sb_dragging = 0;
-int g_sb_grab_offset = 0;
-
-// Copy Mode & Selection
-int g_copy_mode = 0;
-int g_copy_sel_active = 0;
-int g_copy_cx = 0, g_copy_cy = 0;
-int g_copy_end_x = 0;   /* 选区端点列：键盘=光标主格；鼠标=原始点击列（交给渲染/复制按方向整字扩展） */
-int g_copy_anchor_x = 0, g_copy_anchor_abs_y = 0;
-int g_copy_block = 0;
-int g_copy_quick = 0;
-int g_ui_mode_pane = -1;
-int g_mouse_selecting = 0;
-int g_mouse_sel_sx = 0, g_mouse_sel_s_abs_y = 0;
-int g_mouse_sel_ex = 0, g_mouse_sel_e_abs_y = 0;
-
-// Scrollback History Search
-SearchMatch g_search_matches[MAX_SEARCH_MATCHES];
-int g_search_match_count = 0;
-int g_search_match_cur = -1;
-int g_search_mode = 0;
-int g_search_active = 0;
-char g_search_buf[64] = {0};
-int g_search_len = 0, g_search_pos = 0;
-
-static int g_dump_enabled = 0;
-static int g_mouse_log_moves = 0;
+/* 定义在 src/globals.c。 */
+extern int g_dump_enabled;
 
 void host_write(const char *s, int len) {
     while (len > 0) {
@@ -87,72 +36,6 @@ static void host_printf(const char *fmt, ...) {
         if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
         host_write(buf, len);
     }
-}
-
-void dump_pane_bytes(int idx, const char *data, int len) {
-    if (!g_dump_enabled || len <= 0) return;
-    FILE *f = fopen("termux_dump.log", "ab");
-    if (!f) return;
-    fprintf(f, "[pane %d len %d]\n", idx, len);
-    fwrite(data, 1, (size_t)len, f);
-    fputc('\n', f);
-    fclose(f);
-}
-
-void dump_render_output(const char *data, int len, int mcols, int mrows, int hcols, int hrows) {
-    if (!g_dump_enabled || len <= 0) return;
-    FILE *f = fopen("render_dump.log", "ab");
-    if (!f) return;
-    fprintf(f, "[render len %d model %dx%d host %dx%d]\n", len, mcols, mrows, hcols, hrows);
-    fwrite(data, 1, (size_t)len, f);
-    fputc('\n', f);
-    fclose(f);
-}
-
-/* v1.8.15 诊断：实际通过帧差分发给宿主终端的增量字节（整帧 vs 增量对照）。
- * 仅在 TERMUX_DUMP 环境变量存在时写 render_delta.log，用于排查脏区渲染问题。 */
-void dump_delta_output(const char *data, int delta_len, int full_len) {
-    if (!g_dump_enabled || delta_len <= 0) return;
-    static int s_frame = 0;
-    s_frame++;
-    /* 采样：每 20 帧记一次，避免日志暴涨；增量帧（delta<full）始终记，
-     * 因为脏区问题只出现在增量路径。 */
-    if (delta_len >= full_len && (s_frame % 20) != 0) return;
-    FILE *f = fopen("render_delta.log", "ab");
-    if (!f) return;
-    fprintf(f, "[delta %d / full %d]\n", delta_len, full_len);
-    fwrite(data, 1, (size_t)delta_len, f);
-    fputc('\n', f);
-    fclose(f);
-}
-
-void log_mouse_event(const char *tag, const MOUSE_EVENT_RECORD *me) {
-    if (!g_dump_enabled) return;
-    unsigned btn = (unsigned)me->dwButtonState;
-    int is_press = (btn & (FROM_LEFT_1ST_BUTTON_PRESSED | FROM_LEFT_2ND_BUTTON_PRESSED | RIGHTMOST_BUTTON_PRESSED)) &&
-                   (me->dwEventFlags == 0 || me->dwEventFlags == DOUBLE_CLICK);
-    int is_release = (btn & 0x7) == 0 && me->dwEventFlags == 0;
-    if (me->dwEventFlags == MOUSE_MOVED) {
-        if (++g_mouse_log_moves < 20) return;
-        g_mouse_log_moves = 0;
-    }
-    if (me->dwEventFlags == MOUSE_WHEELED || me->dwEventFlags == MOUSE_HWHEELED) return;
-    FILE *f = fopen("mouse_dump.log", "ab");
-    if (!f) return;
-    fprintf(f, "[v8.54] %s pos=%d,%d flags=%u btn=0x%X ctrl=0x%X%s | chooser=%d ctx=%d rename=%d help=%d pop_anchor=%d mouse=%d,%d tab_count=%d\n",
-            tag, (int)me->dwMousePosition.X, (int)me->dwMousePosition.Y,
-            (unsigned)me->dwEventFlags, btn, (unsigned)me->dwControlKeyState,
-            is_press ? " PRESS" : (is_release ? " RELEASE" : ""),
-            g_mux.chooser_mode, g_mux.ctx_mode, g_mux.rename_mode, g_mux.help_mode,
-            g_pop_anchor_x, g_mouse_x, g_mouse_y, g_mux.tab_count);
-    if (is_press) {
-        for (int i = 0; i < g_mux.tab_count; i++) {
-            PaneTabInfo *t = &g_mux.tab_info[i];
-            fprintf(f, "  tab[%d] pane=%d cols[%d,%d) close[%d,%d)\n", i, t->pane_idx,
-                    t->start_col, t->end_col, t->close_start, t->close_end);
-        }
-    }
-    fclose(f);
 }
 
 static void handle_resize(void) {
@@ -185,7 +68,7 @@ static void handle_resize(void) {
         if (!split_now && g_mux.panes[i].hpc &&
             (g_mux.panes[i].conpty_cols != pane_cols || g_mux.panes[i].conpty_rows != nr)) {
             COORD sz = {(SHORT)pane_cols, (SHORT)nr};
-            ResizePseudoConsole(g_mux.panes[i].hpc, sz);
+            conpty_resize(g_mux.panes[i].hpc, sz);
             g_mux.panes[i].conpty_cols = pane_cols;
             g_mux.panes[i].conpty_rows = nr;
         }
@@ -255,6 +138,10 @@ static void handle_input(void) {
         if (g_mux.needs_redraw) {
             ULONGLONG now = GetTickCount64();
             if (has_input || (now - last_render >= 12)) {
+                /* 搜索开着时，新到的终端输出要先重算匹配再画，否则新打印出来的
+                 * 内容里的关键词永远不会被高亮（2026-09-20 用户要求）。放在这里
+                 * 而不是 pane 读线程里：每帧最多重扫一次。 */
+                search_refresh_live();
                 render_screen();
                 last_render = now;
             }

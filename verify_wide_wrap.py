@@ -94,6 +94,33 @@ static int hist_content(ScreenBuffer *s) {
     return n;
 }
 
+/* 某行是否全空白（未分配的槽渲染为空白，也算空白）。 */
+static int row_is_blank(ScreenBuffer *s, int rel) {
+    int pr = screen_phys_row(s, rel);
+    if (pr < 0 || pr >= s->total_lines || !s->lines || !s->lines[pr].cells) return 1;
+    ScreenLine *l = &s->lines[pr];
+    for (int x = 0; x < l->len; x++) {
+        WCHAR c = l->cells[x].Char.UnicodeChar;
+        if (c != L' ' && c != 0) return 0;
+    }
+    return 1;
+}
+
+/* 40x6 屏幕先输出 8 行把光标顶到底行，再喂 tail（命令结束的字节序列 + 提示符），
+ * 返回「提示符上一行」是否仍是空行。 */
+static int blank_kept(const char *tail) {
+    ScreenBuffer s;
+    screen_init(&s, 40, 6);
+    for (int i = 1; i <= 8; i++) {
+        char b[64]; snprintf(b, sizeof b, "LINE-%d\r\n", i);
+        screen_process_output(&s, b, (int)strlen(b));
+    }
+    screen_process_output(&s, tail, (int)strlen(tail));
+    int ok = row_is_blank(&s, s.cursor_y - 1);
+    screen_free(&s);
+    return ok;
+}
+
 int main(void) {
     /* 宽 12 列。先写满 12 个窄字符（列0-11 都有真实内容，末列也是真实字符，
        模拟 ConPTY 重绘前的脏缓冲），此时 cursor 触发 wraparound_pending；
@@ -147,21 +174,37 @@ int main(void) {
         ck("真实空行(CRLF CRLF)：内容行不丢", hist_content(&s) >= 8);
         screen_free(&s);
     }
+    /* ---- 「命令结束后少一个空行」回归（真机报的） --------------------------
+     * cmd/ConPTY 在命令结束时发出的空行有 4 种字节形态，其中两种【没有 CR】。
+     * 曾经为了消除 ConPTY 留位标记造成的幻影空行，用过「光标在底行且底行空白就
+     * 吸收裸 LF」的规则；它会把下面 A / B 两种真实空行一起吃掉，真机症状就是
+     * 「命令结束后少了一个空行」。幻影空行现在由 repaint_active 负责（见下一组），
+     * 不再靠猜裸 LF —— 加回吸收这 4 条立刻红。 */
+    ck("A 命令结束空行: ESC]0;标题 BEL + 裸LF + 提示符 -> 保留",
+       blank_kept("\x1b]0;C:\\work\x07\nC:\\work>"));
+    ck("B 命令结束空行: 裸LF + 提示符 -> 保留",
+       blank_kept("\nC:\\work>"));
+    ck("C 命令结束空行: CR LF CR LF + 提示符 -> 保留",
+       blank_kept("\r\n\r\nC:\\work>"));
+    ck("D 命令结束空行: CR + ESC]0;标题 BEL + LF + 提示符 -> 保留",
+       blank_kept("\r\x1b]0;C:\\work\x07\nC:\\work>"));
+
+    /* ---- 幻影空行的正主：整屏重绘（repaint_active）不得把尾部空行塞进历史 ----
+     * ConPTY 重绘 = ESC[?25l + ESC[H + 逐行「文本 ESC[K CRLF」。重绘按行遍历
+     * viewport，底边的 CRLF 必须走 screen_scroll_viewport_up（只移可见行），
+     * 否则每拖一次分隔线就往 scrollback 里塞一批空行。 */
     {
         ScreenBuffer s; screen_init(&s, 40, 6);
-        for (int i = 1; i <= 6; i++) {
+        for (int i = 1; i <= 12; i++) {
             char b[64]; snprintf(b, sizeof b, "row%d\r\n", i);
             screen_process_output(&s, b, (int)strlen(b));
         }
-        screen_process_output(&s, "\n\n\n", 3);          /* ConPTY 留位裸 LF */
-        screen_process_output(&s, "after-gap\r\n", 11);
-        int hb0 = hist_blank(&s);
-        for (int i = 1; i <= 6; i++) {
-            char b[64]; snprintf(b, sizeof b, "tail%d\r\n", i);
-            screen_process_output(&s, b, (int)strlen(b));
-        }
-        ck("裸 LF 留位标记：不产生幻影空行", hb0 == 0);
-        ck("裸 LF 后继续 CRLF 输出：仍无幻影空行", hist_blank(&s) == 0);
+        int h0 = s.hist_lines;
+        char rp[512]; int n = 0;
+        n += sprintf(rp + n, "\x1b[?25l\x1b[H");
+        for (int i = 1; i <= 8; i++) n += sprintf(rp + n, "row%d\x1b[K\r\n", i);
+        screen_process_output(&s, rp, n);
+        ck("整屏重绘(repaint_active)：底边 CRLF 不进滚动历史", s.hist_lines == h0);
         screen_free(&s);
     }
 

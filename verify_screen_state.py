@@ -54,6 +54,7 @@ for sig in ("static void line_free(",
             "static int reflow_glyph_w(",
             "static int reflow_append_rows(",
             "static int reflow_acc_cb(",
+            "static int reflow_rows_for(",
             "static int screen_row_reflow_len(",
             "static int screen_content_span(",
             "int screen_reflow_height(",
@@ -66,7 +67,15 @@ for sig in ("static void line_free(",
             "static void line_store_rglyph(",
             "static int screen_trace_on(",
             "static void screen_trace_row(",
+            "static void screen_trace_wrapmap(",
             "static void screen_trace_ring(",
+            "static int screen_row_blank(",
+            "void screen_repaint_snapshot_free(",
+            "void screen_repaint_snapshot(",
+            "static int screen_reanchor_enabled(",
+            "static int line_ends_with_longer(",
+            "static void screen_trace_reanchor(",
+            "int screen_repaint_reanchor(",
             "static int screen_resize_reflow(",
             "static int screen_resize_legacy(",
             "int screen_resize("):
@@ -129,6 +138,12 @@ typedef struct {
     int hist_lines;
     int alt_hist_lines;
     unsigned char *line_wrap;
+    int resize_repaint_pending;
+    int resize_repaint_pass;
+    ScreenLine *repaint_snap;
+    unsigned char *repaint_snap_wrap;   /* 与 repaint_snap 一一对应的续行标志 */
+    int repaint_snap_rows, repaint_snap_cols;
+    int repaint_snap_content;
 } ScreenBuffer;
 
 typedef struct {
@@ -338,7 +353,25 @@ static void logical_text(ScreenBuffer *s, char *out, int outcap) {
     }
     out[pos < outcap ? pos : outcap - 1] = 0;
 }
-static int texts_eq(const char *a, const char *b) { return strcmp(a, b) == 0; }
+/* 比较两段逻辑文本，忽略首/尾的整屏空白行 —— 两端都是合法排版产生的空白：
+ *   尾部空白行：reflow 后一条逻辑行按新宽度占不同数量的物理行，末尾未使用的
+ *               屏幕留白行数必然变化（v1.8.52 起 resize 只扫描内容跨度）；
+ *   首部空白行：有历史时按底部锚定（提示符必须贴在最后一行），内容不足一屏
+ *               就会在上方留白。
+ * 内容之间的真实空行仍然逐字比较，所以「历史里的空行丢失」照样会被抓到；
+ * 锚定行为本身由 tests/resize_history_repro.c 单独断言。 */
+static int texts_eq(const char *a, const char *b) {
+    char ba[4096], bb[4096];
+    size_t la = strlen(a), lb = strlen(b);
+    char *pa, *pb;
+    if (la >= sizeof ba || lb >= sizeof bb) return 0;
+    memcpy(ba, a, la + 1); memcpy(bb, b, lb + 1);
+    while (la && ba[la - 1] == '\n') ba[--la] = 0;
+    while (lb && bb[lb - 1] == '\n') bb[--lb] = 0;
+    for (pa = ba; *pa == '\n'; pa++) { }
+    for (pb = bb; *pb == '\n'; pb++) { }
+    return strcmp(pa, pb) == 0;
+}
 /* v1.8.43: 宽窗格跑出历史后【收窄宽度】，历史必须逐行完整保留、内容不错位。 */
 static int test_resize_narrow_keeps_history(void) {
     ScreenBuffer s;

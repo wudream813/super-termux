@@ -1,4 +1,11 @@
 #include "config.h"
+/* platform.h 两侧都要：它提供 TERMUX_DEFAULT_SHELL_* / TERMUX_PATH_SEP* /
+ * plat_user_home() / plat_default_shell()，这些宏和声明在 Windows 上同样需要
+ * （展开出来就是原来的 cmd.exe 与反斜杠，行为不变）。 */
+#include "platform.h"
+#ifndef _WIN32
+#include <string.h>        /* strrchr */
+#endif
 
 ChooserItem g_chooser_items[MAX_CHOOSER_ITEMS];
 int g_chooser_item_count = 0;
@@ -53,6 +60,7 @@ char g_edit_dir[256] = {0};
 int g_edit_color = 0;
 int g_edit_dir_len = 0, g_edit_dir_pos = 0;
 
+#ifdef _WIN32
 const ChooserItem g_presets[] = {
     {"cmd", "cmd.exe", "", 0},
     {"PowerShell", "powershell.exe", "", 0},
@@ -63,6 +71,19 @@ const ChooserItem g_presets[] = {
     {"Node.js", "node", "", 0},
     {"自定义命令行", ":custom", "", 0},
 };
+#else
+/* POSIX 上没有 cmd.exe / powershell.exe；预设换成登录 shell 与常见解释器。
+ * 「自定义命令行」必须留着，它是设置页里唯一能自填命令的入口。 */
+const ChooserItem g_presets[] = {
+    {"Bash", "bash -l", "", 0},
+    {"Sh", "/bin/sh", "", 0},
+    {"Zsh", "zsh -l", "", 0},
+    {"Fish", "fish", "", 0},
+    {"Python", "python3 -i", "", 0},
+    {"Node.js", "node", "", 0},
+    {"自定义命令行", ":custom", "", 0},
+};
+#endif
 const int g_preset_count = (int)(sizeof(g_presets) / sizeof(g_presets[0]));
 
 void init_default_config(void) {
@@ -75,6 +96,7 @@ void init_default_config(void) {
     g_search_case_sensitive = 0;
     theme_init();
     keymap_init();
+#ifdef _WIN32
     g_chooser_item_count = 3;
     snprintf(g_chooser_items[0].name, sizeof(g_chooser_items[0].name), "cmd");
     snprintf(g_chooser_items[0].cmd, sizeof(g_chooser_items[0].cmd), "cmd.exe");
@@ -85,11 +107,31 @@ void init_default_config(void) {
     snprintf(g_chooser_items[1].cmd, sizeof(g_chooser_items[1].cmd), "powershell.exe");
     g_chooser_items[1].workdir[0] = 0;
     g_chooser_items[1].color = 0;
+#else
+    /* 默认只放一项：$SHELL。名字取 basename，标签栏才会显示 "bash" 而不是
+     * 一长串全路径；cmd 存全路径，免得 PATH 里找不到。 */
+    g_chooser_item_count = 2;
+    {
+        char sh_u8[256] = {0};
+        const char *base;
+        WideCharToMultiByte(CP_UTF8, 0, plat_default_shell(), -1,
+                            sh_u8, (int)sizeof(sh_u8) - 1, NULL, NULL);
+        base = strrchr(sh_u8, '/');
+        base = (base && base[1]) ? base + 1 : sh_u8;
+        snprintf(g_chooser_items[0].name, sizeof(g_chooser_items[0].name), "%s", base);
+        snprintf(g_chooser_items[0].cmd, sizeof(g_chooser_items[0].cmd), "%s", sh_u8);
+        g_chooser_items[0].workdir[0] = 0;
+        g_chooser_items[0].color = 0;
+    }
+#endif
 
-    snprintf(g_chooser_items[2].name, sizeof(g_chooser_items[2].name), "自定义命令行");
-    snprintf(g_chooser_items[2].cmd, sizeof(g_chooser_items[2].cmd), ":custom");
-    g_chooser_items[2].workdir[0] = 0;
-    g_chooser_items[2].color = 0;
+    /* 「自定义命令行」永远是最后一项，Windows 上是下标 2，POSIX 上是下标 1。 */
+    snprintf(g_chooser_items[g_chooser_item_count - 1].name,
+             sizeof(g_chooser_items[g_chooser_item_count - 1].name), "自定义命令行");
+    snprintf(g_chooser_items[g_chooser_item_count - 1].cmd,
+             sizeof(g_chooser_items[g_chooser_item_count - 1].cmd), ":custom");
+    g_chooser_items[g_chooser_item_count - 1].workdir[0] = 0;
+    g_chooser_items[g_chooser_item_count - 1].color = 0;
 }
 
 enum { SEC_COMPAT = 0, SEC_GENERAL, SEC_MENU, SEC_THEME, SEC_KEYS, SEC_IGNORE };
@@ -127,19 +169,19 @@ static int apply_general_key(const char *key, const char *val) {
 static void resolve_ini_path(WCHAR *out, int out_len, int for_write) {
     WCHAR exe_path[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, exe_path, MAX_PATH);
-    WCHAR *last_bs = wcsrchr(exe_path, L'\\');
+    WCHAR *last_bs = wcsrchr(exe_path, TERMUX_PATH_SEP);
     if (last_bs) {
         *last_bs = 0;
-        _snwprintf(out, out_len - 1, L"%s\\termux.ini", exe_path);
+        _snwprintf(out, out_len - 1, L"%s" TERMUX_PATH_SEP_S L"termux.ini", exe_path);
     } else {
         wcsncpy(out, L"termux.ini", out_len - 1);
     }
     if (for_write) return;
     if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return;
-    const WCHAR *prof = _wgetenv(L"USERPROFILE");
+    const WCHAR *prof = plat_user_home();
     if (prof) {
         WCHAR user_ini[MAX_PATH] = {0};
-        _snwprintf(user_ini, MAX_PATH - 1, L"%s\\.termux.ini", prof);
+        _snwprintf(user_ini, MAX_PATH - 1, L"%s" TERMUX_PATH_SEP_S L".termux.ini", prof);
         if (GetFileAttributesW(user_ini) != INVALID_FILE_ATTRIBUTES)
             wcsncpy(out, user_ini, out_len - 1);
     }
@@ -273,10 +315,10 @@ void save_config(void) {
 
     FILE *f = _wfopen(ini_path, L"wb");
     if (!f) {
-        const WCHAR *prof = _wgetenv(L"USERPROFILE");
+        const WCHAR *prof = plat_user_home();
         if (prof) {
             WCHAR user_ini[MAX_PATH] = {0};
-            _snwprintf(user_ini, MAX_PATH - 1, L"%s\\.termux.ini", prof);
+            _snwprintf(user_ini, MAX_PATH - 1, L"%s" TERMUX_PATH_SEP_S L".termux.ini", prof);
             f = _wfopen(user_ini, L"wb");
         }
     }

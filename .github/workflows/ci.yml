@@ -1,0 +1,177 @@
+name: CI
+
+# 三个系统各一个作业。分工是按「只有那个系统才能验的东西」切的：
+#   windows —— 用 MSYS2 里的【本机】 MinGW-w64 编 termux.exe（Linux 作业是交叉编译，
+#              两者不等价：本机编译走的是 Windows 的 crt/头文件）
+#   linux   —— 唯一能跑全套主机侧回归的作业（tests/stub 的 windows.h 替身 + 真 pty
+#              的 POSIX 套件），顺带交叉编译 Windows 版
+#   macos   —— 唯一真正经过 Apple clang / Apple SDK 的编译。forkpty 在 libSystem、
+#              _NSGetExecutablePath 在 <mach-o/dyld.h>、没有 -lutil，这三点在 Linux
+#              上一次都验不到
+#
+# 三个作业都跑 tests/verify_port.py：那是纯源码静态检查，跟平台无关，但钉的正是
+# 移植期踩过、编译期又看不出来的坑。
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支上新推一次就把还没跑完的旧运行取消掉
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==========================================================================
+  windows:
+    name: Windows (本机 MinGW-w64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 MSYS2 / MinGW-w64 工具链
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-python
+            make
+
+      - name: 构建 termux.exe
+        # Makefile 里 CC 默认是 x86_64-w64-mingw32-gcc（交叉编译器名）。在 Windows
+        # 上要用本机 MinGW 的 gcc，否则找不到编译器。
+        run: make CC=gcc CXX=g++ all 2>&1 | tee build-windows.log
+
+      - name: 断言 0 error / 0 warning 且产物存在
+        run: |
+          if grep -n "error:\|warning:" build-windows.log; then
+            echo "::error::构建产生了诊断信息，见上"; exit 1
+          fi
+          test -f termux.exe || { echo "::error::没产出 termux.exe"; exit 1; }
+          ls -l termux.exe
+
+      - name: 移植不变量静态检查
+        # MSYS2 的 python 包给的是 python 而不是 python3，所以不走 make verify-port
+        run: python tests/verify_port.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termux-windows
+          path: termux.exe
+
+  # ==========================================================================
+  linux:
+    name: Linux (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装依赖
+        run: |
+          sudo apt-get update
+          # mingw-w64 提供 x86_64-w64-mingw32-gcc，用来交叉编译 Windows 版
+          sudo apt-get install -y mingw-w64
+          gcc --version; python3 --version
+
+      - name: 交叉构建 Windows 版
+        run: make all 2>&1 | tee build-windows.log
+
+      - name: 构建 Linux 版
+        run: make -B linux 2>&1 | tee build-linux.log
+
+      - name: 断言 0 error / 0 warning 且两个产物都在
+        run: |
+          if grep -n "error:\|warning:" build-windows.log build-linux.log; then
+            echo "::error::构建产生了诊断信息，见上"; exit 1
+          fi
+          test -f termux.exe   || { echo "::error::没产出 termux.exe"; exit 1; }
+          test -f termux-linux || { echo "::error::没产出 termux-linux"; exit 1; }
+          file termux-linux | grep -q ELF || { echo "::error::termux-linux 不是 ELF"; exit 1; }
+
+      - name: darwin 目标在非 macOS 上必须拒绝
+        # Makefile 里有 uname -s 护栏。不拦的话它会【成功】编出一个改名叫
+        # termux-macos 的 Linux 二进制 —— 看起来像 macOS 构建过了，实际一次都没
+        # 经过 Apple 的编译器。这种假绿比编不过危险。
+        run: |
+          if make darwin >/dev/null 2>&1; then
+            echo "::error::darwin 目标在 Linux 上竟然成功了，护栏失效"; exit 1
+          fi
+          echo "[ok] darwin 目标被正确拒绝"
+
+      - name: 主机侧回归（tests/stub 的 windows.h 替身）
+        run: |
+          set -e
+          make unittest          # 主题/键位/配置，-Werror
+          make verify-loader     # conpty_loader 的决策逻辑
+          python3 verify_all.py
+          bash tests/verify_cascade.sh
+          bash tests/verify_clip_behavior.sh
+          bash tests/verify_sb_drag.sh
+          python3 verify_screen_state.py
+          python3 verify_split.py
+          python3 verify_search.py
+          python3 verify_palette_search.py
+          python3 verify_search_box.py
+          python3 verify_search_refresh.py
+
+      - name: POSIX 套件（真 pty）
+        run: make check-posix
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termux-linux
+          path: termux-linux
+
+  # ==========================================================================
+  macos:
+    name: macOS (Apple clang)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建 macOS 版
+        # 这是整个 CI 里唯一真正经过 Apple SDK 的一步。Linux 上验不到：
+        #   · forkpty 在 libSystem，链 -lutil 会直接失败
+        #   · _NSGetExecutablePath 声明在 <mach-o/dyld.h>（写成 <crt_externs.h>
+        #     会变成隐式声明，Xcode 15 起 clang 把它当错误）
+        #   · <util.h> vs <pty.h>
+        run: make darwin 2>&1 | tee build-macos.log
+
+      - name: 断言 0 error / 0 warning 且是 Mach-O
+        run: |
+          if grep -n "error:\|warning:" build-macos.log; then
+            echo "::error::构建产生了诊断信息，见上"; exit 1
+          fi
+          test -f termux-macos || { echo "::error::没产出 termux-macos"; exit 1; }
+          file termux-macos
+          file termux-macos | grep -q Mach-O || { echo "::error::termux-macos 不是 Mach-O"; exit 1; }
+
+      - name: POSIX 套件（macOS）
+        # check-posix -> posix-build 在 Darwin 上走 darwin 目标，四个单测用
+        # POSIX_TEST_LIBS（只有 -lpthread），两个真 pty 测试拿 TERMUX_SMOKE_EXE
+        # 指向 termux-macos。
+        run: make check-posix
+
+      - name: 主机侧回归（tests/stub 的 windows.h 替身）
+        run: |
+          set -e
+          make unittest
+          python3 verify_all.py
+          python3 verify_screen_state.py
+          python3 verify_split.py
+          python3 verify_search.py
+          python3 verify_palette_search.py
+          python3 verify_search_box.py
+          python3 verify_search_refresh.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termux-macos
+          path: termux-macos

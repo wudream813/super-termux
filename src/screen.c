@@ -30,6 +30,53 @@ static void screen_trace_row(FILE *f, ScreenBuffer *s, int rel) {
     fputc('|', f);
     fputc('\n', f);
 }
+/* 全量 wrap 图 + 最长连续续行段（2026-09-17，bug #16 诊断）。
+ *
+ * 上面那几行样本只覆盖「环首 3 行 + 历史末 3 行 + 第 0 行 + 末行」，中间整段省略。
+ * 而用户 2026-09-17 报的形态是【一整段】历史并成一条逻辑行：内容顺序完好、词被从
+ * 中间切开（Music -> Mu|sic、Saved Games20|26-07-25），说明这一段里每一行的
+ * line_wrap 都是 1，reflow 把它们并成一条后按新宽度重折。级联发生在历史【中间】，
+ * 样本行照不到，所以下一批日志即使发回来也定位不了 —— 这里补全量图。
+ *
+ * 纯诊断：只读 line_wrap / used，不写任何状态，不改渲染与 reflow 行为。
+ * 输出：
+ *   wrapmap  每行一个字符（'1'=该行是上一行的软换行续行），每 64 个换一段并标 rel
+ *   run      最长连续 '1' 段的长度、起始 rel，以及该段并成的逻辑行总字符数
+ *            （>> 单条记录宽度即为级联；正常折行的长行不会跨记录） */
+static void screen_trace_wrapmap(FILE *f, ScreenBuffer *s) {
+    if (!s->line_wrap) return;
+    int best_len = 0, best_rel = 0, run = 0, run_start = 0;
+    int best_glyphs = 0;
+    fprintf(f, "  wrapmap:\n");
+    int i = 0;
+    for (int rel = -s->hist_lines; rel < s->rows; rel++, i++) {
+        int pr = screen_phys_row(s, rel);
+        int w = (pr >= 0 && pr < s->total_lines && s->line_wrap[pr]) ? 1 : 0;
+        if (i % 64 == 0) fprintf(f, "    rel%+05d ", rel);
+        fputc(w ? '1' : '0', f);
+        if (i % 64 == 63 || rel == s->rows - 1) fputc('\n', f);
+        if (w) {
+            if (run == 0) run_start = rel;
+            run++;
+            if (run > best_len) { best_len = run; best_rel = run_start; }
+        } else run = 0;
+    }
+    /* 最长段并成的逻辑行有多少字符：段首的上一行（段起点）到段末，逐行取 used。 */
+    if (best_len > 0 && s->lines) {
+        int glyphs = 0;
+        for (int rel = best_rel - 1; rel < best_rel - 1 + best_len + 1; rel++) {
+            int pr = screen_phys_row(s, rel);
+            if (pr < 0 || pr >= s->total_lines || !s->lines[pr].cells) continue;
+            int u = s->lines[pr].used;
+            if (u > s->cols) u = s->cols;
+            if (u > 0) glyphs += u;
+        }
+        best_glyphs = glyphs;
+    }
+    fprintf(f, "  run: 最长连续续行段=%d 起于 rel%+05d 并成逻辑行约 %d 字符（cols=%d）\n",
+            best_len, best_rel, best_glyphs, s->cols);
+}
+
 static void screen_trace_ring(const char *tag, ScreenBuffer *s, int nc, int nr, int hist_pre) {
     if (!screen_trace_on()) return;
     FILE *f = fopen("screen_resize_trace.log", "a");
@@ -39,6 +86,7 @@ static void screen_trace_ring(const char *tag, ScreenBuffer *s, int nc, int nr, 
             hist_pre, s->hist_lines, s->scroll_top,
             s->in_alt_screen ? 0 : screen_scroll_limit(s),
             s->in_alt_screen ? 0 : screen_reflow_height(s, nc > 0 ? nc : s->cols));
+    screen_trace_wrapmap(f, s);
     int shown = 0;
     for (int j = 0; j < 3 && -s->hist_lines + j < 0; j++) { screen_trace_row(f, s, -s->hist_lines + j); shown++; }
     if (s->hist_lines - shown > 6) fprintf(f, "  ... (hist 中间 %d 行略) ...\n", s->hist_lines - shown - 3);
@@ -132,6 +180,7 @@ int screen_init(ScreenBuffer *s, int cols, int rows) {
     s->cols = cols;
     s->rows = rows;
     s->total_lines = rows + g_scrollback_lines;
+    s->cup_eol_row = -1;   /* 无待判定的「底行末列 CUP」；0 是合法行号 */
     s->current_attr = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
     s->fg_color = 7;
     s->bg_color = 0;
@@ -182,6 +231,9 @@ void screen_free(ScreenBuffer *s) {
     free(s->alt_fg_rgb); s->alt_fg_rgb = NULL;
     free(s->alt_bg_rgb); s->alt_bg_rgb = NULL;
     free(s->alt_rgb_valid); s->alt_rgb_valid = NULL;
+    screen_repaint_snapshot_free(s);
+    s->resize_repaint_pending = 0;
+    s->resize_repaint_pass = 0;
 }
 
 CHAR_INFO *screen_cell(ScreenBuffer *s, int row, int col) {
@@ -385,6 +437,225 @@ void screen_scroll_viewport_up(ScreenBuffer *s, int count) {
         line_fill_blank(&s->lines[pr], s->cols, s->current_attr);
         if (s->line_wrap) s->line_wrap[pr] = 0;
     }
+}
+
+/* 整行是否空白（未分配的槽也算空白）。 */
+static int screen_row_blank(ScreenBuffer *s, int rel) {
+    int pr = screen_phys_row(s, rel);
+    if (pr < 0 || pr >= s->total_lines || !s->lines || !s->lines[pr].cells) return 1;
+    ScreenLine *ln = &s->lines[pr];
+    int n = ln->len < s->cols ? ln->len : s->cols;
+    for (int x = 0; x < n; x++) {
+        WCHAR c = ln->cells[x].Char.UnicodeChar;
+        if (c != 0 && c != L' ') return 0;
+    }
+    return 1;
+}
+
+void screen_repaint_snapshot_free(ScreenBuffer *s) {
+    if (!s || !s->repaint_snap) return;
+    for (int i = 0; i < s->repaint_snap_rows; i++) line_free(&s->repaint_snap[i]);
+    free(s->repaint_snap);
+    free(s->repaint_snap_wrap);
+    s->repaint_snap = NULL; s->repaint_snap_wrap = NULL;
+    s->repaint_snap_rows = 0; s->repaint_snap_cols = 0;
+    s->repaint_snap_content = 0;
+}
+
+/* 整屏重绘开始前，把当前可见行存一份。 */
+void screen_repaint_snapshot(ScreenBuffer *s) {
+    if (!s || !s->lines) return;
+    screen_repaint_snapshot_free(s);
+    s->repaint_snap = (ScreenLine *)calloc((size_t)s->rows, sizeof(ScreenLine));
+    if (!s->repaint_snap) return;
+    /* wrap 标志必须和 cells 一起存：reanchor 要用它原样补回，否则补回的行会被当成
+     * 硬换行新行，拖宽后就并不回原来的逻辑行。分配失败则整份快照作废（宁可少补）。 */
+    s->repaint_snap_wrap = (unsigned char *)calloc((size_t)s->rows, 1);
+    if (!s->repaint_snap_wrap) { screen_repaint_snapshot_free(s); return; }
+    s->repaint_snap_rows = s->rows; s->repaint_snap_cols = s->cols;
+    /* 记住重绘前本地内容流有多少行。这是「该不该重新锚定」的判据，比「有没有滚动
+     * 历史」和「光标是否在底行」都准确：内容正好铺满窗格时 hist_lines == 0；而窗格刚
+     * 被拖高时 cursor_y 也不再等于 rows-1 —— 两种情况下 conhost 的重绘照样会把本地还
+     * 可见的顶部内容覆盖掉（真机日志：120x4 时 height=4，一次重绘后 height=1）。 */
+    {
+        int last = -1;
+        for (int y = s->rows - 1; y >= 0; y--)
+            if (!screen_row_blank(s, y)) { last = y; break; }
+        s->repaint_snap_content = s->hist_lines + last + 1;
+    }
+    WORD fill_attr = s->current_attr ? s->current_attr : 0x07;
+    for (int y = 0; y < s->rows; y++) {
+        int pr = screen_phys_row(s, y);
+        /* line_copy 要求 dst->cells 已分配，否则它会静默返回 —— 快照行必须先 alloc。 */
+        if (!line_alloc(&s->repaint_snap[y], s->cols, fill_attr)) {
+            s->repaint_snap_rows = y;      /* 截到已成功的那几行，宁可少补也不越界 */
+            return;
+        }
+        if (s->lines[pr].cells) line_copy(&s->repaint_snap[y], &s->lines[pr], s->cols);
+        s->repaint_snap_wrap[y] = (s->line_wrap && s->line_wrap[pr]) ? 1 : 0;
+    }
+}
+
+/* resize 之后的第一次 ConPTY 整屏重绘结束时重新锚定。
+ *
+ * 真机症状（termux_dump.log 实测）：拖大分隔条后提示符停在半屏、下面一大片空行，
+ * 而且滚动历史被一路吃掉（hist 26 → 0）。原因是 conhost 在窗口【增高】时不把滚动
+ * 历史拉回来、只在下方补空行，所以它回给我们的整屏重绘只有「h 行内容 + (rows-h) 行
+ * 空白」，末尾还把光标绝对定位在提示符那一行（真机是 ESC[11;26H，而窗格高 21 行）。
+ * 照实画 ⇒ 提示符停在第 h 行、下面 rows-h 行空白；更糟的是下一次 resize 的 reflow
+ * 只扫到光标行为止（scan_end），那 rows-h 行空白不算内容，于是 hist = tcount - nr
+ * 每拖一次就少 rows-h 行。
+ *
+ * 处理：重绘结束后，若光标以下全是空白，就把重绘写进来的内容整体下移 tail 行、让它
+ * 的底边（提示符）正好落在最后一行，上面空出来的 tail 行用【重绘前的可见行】补回 ——
+ * 那正是 conhost 没发给我们的、更老的那几行。hist_lines 不动：内容一行都没丢，
+ * 视图仍是连续的（等价于 Windows Terminal 长高时往上多显示历史）。 */
+/* Plan B 开关（见 analysis/拖动错乱-根因与三种可选行为.md §19.5 杠杆 B）：
+ * 关掉「重绘后把提示符顶回底行」的底部重锚定，让 conhost 的重绘照实落地。
+ * 这正是 Windows Terminal 的立场 —— 它不把内容钉在底部，而是让自己的 viewport
+ * 去对齐 conpty 认为的样子。microsoft/terminal PR #4354 明确指出「把内容钉在
+ * 底部 + conpty 整屏重发」正是滚动缓冲被覆盖的成因。
+ *
+ * TERMUX_REANCHOR=0 关 / =1 开；未设置时用编译期默认（Plan B 的二进制定义
+ * TERMUX_NO_REANCHOR，默认关）。做成运行时开关是为了在同一个二进制上交叉对比
+ * A / B，不必重编。 */
+static int screen_reanchor_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("TERMUX_REANCHOR");
+#ifdef TERMUX_NO_REANCHOR
+        cached = 0;
+#else
+        cached = 1;
+#endif
+        if (v && *v) cached = (atoi(v) != 0);
+    }
+    return cached;
+}
+
+/* big 的文本（去尾随空格后）是否以 sml 的文本结尾，且 big 严格更长。
+ *
+ * 用途：conhost 自己的 reflow【不跨它 scrollback / viewport 的边界合并逻辑行】，
+ * 所以它 resize 重绘的顶行往往只是本地那条完整记录的后半截。2026-09-20 真机
+ * （uploads/render_dump.log，左窗格 61→5→92）：
+ *     本地 reflow : 「2026-09-05  14:14             5,047 洛谷题解_未命名.md」
+ *     conhost 重绘: 「题解_未命名.md」
+ * 照实覆盖就会把前缀删掉。这种情况下保留本地那行。
+ *
+ * 宽字符在本地占 2 格、次格 UnicodeChar==0，两边都要跳过（口径必须一致，
+ * 否则含汉字的行永远比不上 —— 同一个坑在 screen_row_text_eq 里已经栽过一次）。 */
+static int line_ends_with_longer(const ScreenLine *big, const ScreenLine *sml) {
+    if (!big || !sml || !big->cells || !sml->cells) return 0;
+    int aw = big->used < big->len ? big->used : big->len;
+    int bw = sml->used < sml->len ? sml->used : sml->len;
+    int ai = aw - 1, bi = bw - 1;
+    while (ai >= 0 && big->cells[ai].Char.UnicodeChar == L' ') ai--;
+    while (bi >= 0 && sml->cells[bi].Char.UnicodeChar == L' ') bi--;
+    int matched = 0;
+    while (bi >= 0) {
+        WCHAR bc = sml->cells[bi].Char.UnicodeChar;
+        if (bc == 0) { bi--; continue; }
+        while (ai >= 0 && big->cells[ai].Char.UnicodeChar == 0) ai--;
+        if (ai < 0 || big->cells[ai].Char.UnicodeChar != bc) return 0;
+        ai--; bi--; matched++;
+    }
+    if (matched <= 0) return 0;
+    while (ai >= 0) {
+        WCHAR ac = big->cells[ai].Char.UnicodeChar;
+        if (ac != 0 && ac != L' ') return 1;      /* big 前面还有真内容 ⇒ 严格更长 */
+        ai--;
+    }
+    return 0;
+}
+
+static void screen_trace_reanchor(ScreenBuffer *s, const char *why) {
+    if (!screen_trace_on()) return;
+    FILE *f = fopen("screen_resize_trace.log", "a");
+    if (!f) return;
+    fprintf(f, "--- [REANCHOR] %s  cols=%d rows=%d cur=(%d,%d) snap_content=%d snap_rows=%d snap_cols=%d hist=%d\n",
+            why, s->cols, s->rows, s->cursor_x, s->cursor_y,
+            s->repaint_snap_content, s->repaint_snap_rows, s->repaint_snap_cols, s->hist_lines);
+    fclose(f);
+}
+
+int screen_repaint_reanchor(ScreenBuffer *s) {
+    if (!s || s->in_alt_screen || s->rows <= 0 || !s->lines) return 0;
+    /* Plan B：不做底部重锚定。快照仍要释放，否则内存一直挂着。 */
+    if (!screen_reanchor_enabled()) { screen_trace_reanchor(s, "off(Plan B)"); screen_repaint_snapshot_free(s); return 0; }
+    /* tail<=0 必须【最先】判，而且要连快照一起留住。
+     *
+     * conhost 的 resize 重绘在真机上是两趟（uploads/render_dump.log 2026-09-20，
+     * 左窗格 61→5→92，termux_dump.log pane0 偏移 5884 / 6076）：
+     *   趟 1: ESC[?25l ESC[H <5 行内容> ESC[29;1H ESC[?25h ESC[?25l
+     *   趟 2: ESC[H <同样 5 行 + ESC[K> <24 趟 ESC[K CR LF> ESC[5;26H ESC[?25h
+     * 趟 1 的光标停在最后一行 ⇒ tail==0、这趟本来就无事可做；但旧实现在这里
+     * 连同 resize_repaint_pending 一起消费掉了，趟 2 的 ESC[H 于是不再取快照，
+     * 重锚定拿不到「重绘前的可见行」，只能眼睁睁看着 24 行列表被 ESC[K 抹平。
+     * 所以这里返回 1：快照和 pending 都留着，交给下一趟。 */
+    if (s->rows - (s->cursor_y + 1) <= 0) { screen_trace_reanchor(s, "tail<=0 keep-for-next-pass"); return 1; }
+    /* 只有【重绘前内容一直铺满到最后一行】才需要重新锚定（area = 整个窗格）：
+     * 那种情形下 conhost 少发的那几行一定是更老的内容，重绘内容该贴窗格底边，上面
+     * 空出的行用重绘前的可见行补回。
+     *
+     * 内容不足一屏时（repaint_snap_content < rows，新开的 cmd / 内容被拖窄后折行仍
+     * 不满屏）【一律不动作】：此时内容是顶对齐的，conhost 少发几行只是它自己少画了，
+     * 照实覆盖即可。曾经在这里用 area = min(rows, content) 继续下移，结果把重绘内容
+     * 下移 (content-rep) 行、顶部又用快照补回同样的行 —— 同几行出现两遍、末尾几行被
+     * 挤掉。真机左右分屏实测：左窗格 39 列时 banner 在第 2、3、9 行重复出现三次，
+     * (c) 行和提示符整个消失（用户报的「渲染出现严重故障」）。
+     *
+     * 注意判据不能用 hist_lines>0：内容正好铺满窗格时 hist_lines == 0，而 conhost 把
+     * 更老的行滚进它自己的滚动缓冲后只回画「提示符在顶 + 下方空白」，照实画会把本地
+     * 还可见的顶部内容覆盖掉（真机日志：120x4 时 height=4，一次重绘后 height=1）。 */
+    if (s->repaint_snap_content < s->rows) { screen_trace_reanchor(s, "snap_content<rows"); screen_repaint_snapshot_free(s); return 0; }
+    int rep = s->cursor_y + 1;               /* conhost 这次画了几行内容 */
+    int tail = s->rows - rep;
+    if (tail <= 0) { screen_trace_reanchor(s, "tail<=0"); screen_repaint_snapshot_free(s); return 0; }
+    for (int y = s->cursor_y + 1; y < s->rows; y++)
+        if (!screen_row_blank(s, y)) { screen_trace_reanchor(s, "below-not-blank"); screen_repaint_snapshot_free(s); return 0; }  /* 下方有真实内容 */
+    if (!s->repaint_snap || s->repaint_snap_rows != s->rows || s->repaint_snap_cols != s->cols) {
+        screen_trace_reanchor(s, "no-snapshot"); screen_repaint_snapshot_free(s); return 0;
+    }
+    /* 可见内容整体下移 tail 行（倒序搬，源不会先被覆盖）；掉出底边的都是空白行。 */
+    for (int y = s->rows - 1; y >= tail; y--) {
+        int dp = screen_phys_row(s, y), sp = screen_phys_row(s, y - tail);
+        if (!screen_ensure_line(s, dp)) { screen_repaint_snapshot_free(s); return 0; }
+        /* 只有搬进来的是【重绘顶行】(y == tail) 时才可能被 conhost 截断：那是唯一
+         * 跨它 scrollback/viewport 边界的一行。本地那行更完整就整行保留（连
+         * line_wrap 一起），不要用后半截覆盖掉前缀。 */
+        if (y == tail && y < s->repaint_snap_rows && s->repaint_snap[y].cells &&
+            line_ends_with_longer(&s->repaint_snap[y], &s->lines[sp])) {
+            /* 注意这里必须【从快照拷回来】而不是 continue：此刻 dp 那行已经被
+             * conhost 的 ESC[K 抹成空白了，原地不动只会留一个空行。 */
+            line_copy(&s->lines[dp], &s->repaint_snap[y], s->cols);
+            if (s->line_wrap)
+                s->line_wrap[dp] = (s->repaint_snap_wrap && y < s->repaint_snap_rows)
+                                 ? s->repaint_snap_wrap[y] : 0;
+            screen_trace_reanchor(s, "keep-longer-local-row");
+            continue;
+        }
+        if (s->lines[sp].cells) line_copy(&s->lines[dp], &s->lines[sp], s->cols);
+        else line_fill_blank(&s->lines[dp], s->cols, s->current_attr);
+        if (s->line_wrap) s->line_wrap[dp] = s->line_wrap[sp];
+    }
+    /* 顶部空出的 tail 行 = 重绘前的最上面 tail 行（conhost 这次没发的那几行）。 */
+    for (int y = 0; y < tail; y++) {
+        int dp = screen_phys_row(s, y);
+        if (!screen_ensure_line(s, dp)) { screen_repaint_snapshot_free(s); return 0; }
+        if (s->repaint_snap[y].cells) line_copy(&s->lines[dp], &s->repaint_snap[y], s->cols);
+        else line_fill_blank(&s->lines[dp], s->cols, s->current_attr);
+        /* 原样恢复快照里的续行标志。这里曾经写死 0，理由是「补回的是重绘前的顶部行、
+         * 应当是硬换行新行」—— 错了：那几行完全可能是上一行软换行折下来的续行，
+         * 清 0 会让拖宽后的 reflow 把它们和上一行拆开（2026-09-17 真机复现）。 */
+        if (s->line_wrap)
+            s->line_wrap[dp] = (s->repaint_snap_wrap && y < s->repaint_snap_rows)
+                             ? s->repaint_snap_wrap[y] : 0;
+    }
+    s->cursor_y += tail;
+    if (s->cursor_y > s->rows - 1) s->cursor_y = s->rows - 1;
+    screen_trace_reanchor(s, "applied");
+    screen_repaint_snapshot_free(s);
+    return 2;
 }
 
 void screen_scroll_down(ScreenBuffer *s, int top, int bottom, int count) {
@@ -676,6 +947,22 @@ static int reflow_append_rows(const RGlyph *g, int n, int w,
     return 0;
 }
 
+/* 一条逻辑行的前 n 个 glyph 按宽度 w 折行会占到第几条显示行（1 起）。折行判据与
+ * reflow_append_rows 完全一致，用于 resize 后把光标映射到新的显示行。 */
+static int reflow_rows_for(const RGlyph *g, int n, int w) {
+    if (w < 1) w = 1;
+    int rows = 1, col = 0;
+    for (int k = 0; k < n; ) {
+        WCHAR ch = g[k].ci.Char.UnicodeChar;
+        int gw = reflow_glyph_w(ch);
+        int adv = (gw == 2 && k + 1 < n) ? 2 : 1;
+        if (gw > 0 && col > 0 && col + gw > w) { rows++; col = 0; }
+        if (gw > 0) col += gw;
+        k += adv;
+    }
+    return rows;
+}
+
 /* cb 上下文：把每条显示行追加到动态数组（行主序，每行 width 列）。 */
 typedef struct {
     RGlyph *buf;
@@ -948,18 +1235,29 @@ int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out
     return 1;
 }
 
-
-
 /* ---- ConPTY resize 后整屏重绘对齐 ---------------------------------------
  * ConPTY 在 resize 后（以及随后反复整屏重绘时）按【自身滚动缓冲】的顶部把可见屏
- * 重画给本进程；其顶行常比本地 reflow 环的可见顶行深若干行（拖动分隔条期间 ConPTY
- * 侧会自行累积漂移：实测同一 pane 只有首个块带 8;t，之后几十个纯重绘块顶行可从 4 漂
- * 到 5）。若把重绘直接逐行落下，顶行会落在本地 rel>0 处、把本地还显示着的顶部内容
- * 覆盖吞行（= resize 后历史缺行 / 整行消失——用户报的“空格没了”）。
- * 喂解析器前对每个输入块先调用本函数：若块内首个「光标归顶」后的首行文本与本地环
- * 可见区更深处某行（rel>=1）内容一致，说明只是 ConPTY 视口更深，就把环前滚 rel 行
- * 对齐（hist_lines +rel、scroll_top 前进 rel，内容零改动），随后重绘逐行覆盖的都是
- * 相同内容，不再吞行。顶行即本地 rel0 或非重绘块则不动。
+ * 重画给本进程；其顶行常比本地 reflow 环的可见顶行深若干行（真机 fixture 实测：
+ * 120→59 收窄后重绘顶行是 "4"，而本地 rel0 还是 "3"）。若把重绘直接逐行落下，
+ * 顶行会落在本地 rel>0 处、把本地还显示着的顶部内容覆盖吞行。
+ *
+ * 喂解析器前对每个输入块先调用本函数：若重绘的【所有非空行】与本地环从 rel=k
+ * (k>=1) 起的行逐行一致，说明只是 ConPTY 视口更深，就把环前滚 k 行对齐
+ * （hist_lines +k、scroll_top 前进 k，内容零改动），随后重绘逐行覆盖的都是相同
+ * 内容，不再吞行。顶行即本地 rel0 或非重绘块则不动。
+ *
+ * 两条硬约束（都是真机 bug 换来的）：
+ *  - 只接受【正向】偏移。旧实现取 |rel| 最小、允许 rel<0（重绘顶行落在本地历史
+ *    里时也转环），那会把 hist_lines 削短、把较新的可见行整批覆盖掉——用户报的
+ *    「每拖宽一列历史就短一截」。ConPTY 只会把行滚【出】视口，不会把历史拉回来，
+ *    所以负向匹配一定是误判，不动作。
+ *  - 必须【整块逐行】吻合，不能只比首行。旧实现只比重绘首行、取 |rel| 最小者；
+ *    dir 式输出里同名行反复出现（真机 termux_dump.log 在可见区出现多次），单行
+ *    匹配必然认错位置，把重绘写到错误偏移、生成新的重复行，下一次 align 又去匹配
+ *    这条新重复行——自我放大。用户报的「历史重复」：真机重放内容流 40 行变 56 行、
+ *    同一文件名出现 13 次。
+ * 还有一条：重绘最后一行是空白（conhost 增高时下方补空行的「短重绘」）时不动作，
+ * 那种情形由 screen_repaint_reanchor 按底边对齐，转环只会把内容重复写一遍。
  * 返回：0=非重绘块（无 ESC[H）；1=已滚动对齐；2=归顶重绘但无需对齐。 */
 /* screen.c 保持无跨模块依赖：此处内联一个最小 UTF-8 解码器供 repaint 对齐比较用。 */
 static unsigned int screen_utf8_cp(const char *s, int n, int *adv) {
@@ -978,6 +1276,89 @@ static unsigned int screen_utf8_cp(const char *s, int n, int *adv) {
     }
     *adv = 1 + need;
     return cp;
+}
+
+/* 取重绘里从 p 起的下一行文本：剥掉 CSI/OSC，制表符当空格，去首尾空白后写进 out。
+ * 返回下一行的起点；数据到尾返回 -1。*n = 0 表示这是 conhost 补的空白行。
+ * ConPTY 重绘逐行写「行文本 ESC[K CRLF」，最后一行可能只有 ESC[K 没有 CRLF。 */
+static int repaint_next_row(const char *data, int len, int p, WCHAR *out, int cap, int *n) {
+    unsigned char seg[4096];
+    int segn = 0;
+    int k = p;
+    while (k < len && segn < 4090) {
+        unsigned char c = (unsigned char)data[k];
+        if (c == '\r') {                       /* CRLF：吃掉后面的 LF */
+            k++;
+            if (k < len && data[k] == '\n') k++;
+            break;
+        }
+        if (c == '\n') { k++; break; }
+        if (c == 0x1b) {
+            if (k + 1 < len && data[k + 1] == '[') {
+                int j = k + 2;
+                while (j < len && !((unsigned char)data[j] >= 0x40 && (unsigned char)data[j] <= 0x7E)) j++;
+                if (j >= len) { k = len; break; }
+                k = j + 1;
+                continue;                      /* 剥掉 CSI（含 ESC[K / SGR） */
+            }
+            if (k + 1 < len && data[k + 1] == ']') {
+                k += 2;
+                while (k < len && data[k] != 0x07) k++;
+                if (k < len) k++;
+                continue;                      /* 剥掉 OSC */
+            }
+            k += 2;
+            continue;
+        }
+        seg[segn++] = (c == '\t') ? ' ' : c;
+        k++;
+    }
+    int a = 0;
+    while (a < segn && (seg[a] == ' ' || seg[a] == '\t')) a++;
+    int b = segn;
+    while (b > a && (seg[b - 1] == ' ' || seg[b - 1] == '\t')) b--;
+    int wn = 0;
+    int q = a;
+    while (q < b && wn < cap) {
+        int adv = 0;
+        unsigned int cp = screen_utf8_cp((const char *)seg + q, b - q, &adv);
+        if (adv <= 0) break;
+        q += adv;
+        if (cp < 0x10000) out[wn++] = (WCHAR)cp;
+        else {
+            out[wn++] = (WCHAR)(0xD800 + ((cp - 0x10000) >> 10));
+            if (wn < cap) out[wn++] = (WCHAR)(0xDC00 + ((cp - 0x10000) & 0x3FF));
+        }
+    }
+    *n = wn;
+    if (k >= len && segn == 0) return -1;      /* 数据到尾且这行没内容 */
+    return k;
+}
+
+/* 本地 rel 行的文本（去首尾空白）是否与 w[0..wn) 逐字相同。 */
+static int screen_row_text_eq(ScreenBuffer *s, int rel, const WCHAR *w, int wn) {
+    int pr = screen_phys_row(s, rel);
+    if (pr < 0 || pr >= s->total_lines || !s->lines || !s->lines[pr].cells) return 0;
+    ScreenLine *ln = &s->lines[pr];
+    int nl = ln->len;
+    int a = 0;
+    while (a < nl && ln->cells[a].Char.UnicodeChar == L' ') a++;
+    int b = nl;
+    while (b > a && ln->cells[b - 1].Char.UnicodeChar == L' ') b--;
+    /* 宽字符在本地占 2 格、次格 UnicodeChar==0；而 repaint_next_row 给出的 wn 是
+     * 【码点数】。旧实现直接拿 (b-a) 比 wn、再逐格比 w[x]，于是任何含宽字符的行都
+     * 必然不等，差值正好等于该行的宽字符个数（本地实测：v3 最后一次重绘 k=19 时
+     * rel=23「523,582 洛谷题解_未命名.html」本地 56 格 vs wn 49，差 7 = 7 个汉字，
+     * 两边打印出的文本逐字相同）。后果是 screen_repaint_align 的 k 循环在真机
+     * dir 输出上永远匹配不到，短重绘只能一路交给 reanchor 兜底。 */
+    int x = a, i = 0;
+    while (x < b) {
+        WCHAR ch = ln->cells[x].Char.UnicodeChar;
+        if (ch == 0) { x++; continue; }        /* 跳过宽字符次格 */
+        if (i >= wn || ch != w[i]) return 0;
+        i++; x++;
+    }
+    return i == wn;
 }
 
 int screen_repaint_align(ScreenBuffer *s, const char *data, int len) {
@@ -1011,86 +1392,69 @@ int screen_repaint_align(ScreenBuffer *s, const char *data, int len) {
         i += 2;
     }
     if (homed < 0) return 0;
-    /* 2) 取归顶之后的首行原始段（到 CR / LF 为止）。ConPTY 整屏重绘逐行写
-     *    「行文本 ESC[K CRLF」。段内可能夹 SGR 着色，统一剥除再比对。 */
-    unsigned char seg[4096]; int segn = 0;
+    /* 2) 先看重绘的最后一行有没有内容。conhost 在窗口【增高】时不把滚动历史拉回来、
+     *    只在下方补空行，这种「短重绘」的底部对齐由 screen_repaint_reanchor 负责
+     *    （把内容整体下移、顶部用重绘前的可见行补回），此时转环只会把内容重复写一遍。
+     *    只有重绘一直写到最后一行（conhost 视口是满的）时，它的顶行才可能比本地
+     *    可见顶行深，需要下面的正向对齐。 */
     {
-        int k = homed;
-        while (k < len && segn < 4090) {
-            unsigned char c = (unsigned char)data[k];
-            if (c == '\r' || c == '\n') break;
-            if (c == 0x1b) {
-                if (k + 1 < len && data[k + 1] == '[') {
-                    int j = k + 2;
-                    while (j < len && !((data[j] >= 0x40 && data[j] <= 0x7E))) j++;
-                    if (j >= len) break;
-                    k = j + 1; continue;   /* 剥掉 CSI */
-                }
-                if (k + 1 < len && data[k + 1] == ']') {
-                    k += 2; while (k < len && data[k] != 0x07) k++; if (k < len) k++;
-                    continue;               /* 剥掉 OSC */
-                }
-                k += 2; continue;
-            }
-            if (c == '\t') c = ' ';
-            seg[segn++] = c;
-            k++;
+        int p = homed, last_blank = 1, any = 0;
+        while (p >= 0 && p < len) {
+            WCHAR rl[8];
+            int rn = 0;
+            int np = repaint_next_row(data, len, p, rl, 8, &rn);
+            last_blank = (rn == 0);
+            any = 1;
+            p = np;
         }
+        if (!any) return 2;
+        /* 「短重绘」（conhost 这次没写到最后一行）以前一律 return 2 撒手，交给
+         * screen_repaint_reanchor 做底部对齐。这在 reanchor 开着时是对的：两边都
+         * 动手会把同一批内容搬两遍。
+         *
+         * 但 reanchor 关掉时（Plan B，TERMUX_REANCHOR=0）两边就都不管了 —— conhost
+         * 的短重绘从本地第 0 行写起，而它那一屏对应的时间流位置比本地第 0 行晚得多，
+         * 于是本地可见区被整片覆盖。真机症状就是用户报的「历史被截断」；本地可复现：
+         * tests/fixtures_pane0_stream_v3.bin，STEPS=212:59,1153:19,7589:80,8238:103，
+         * ALIGN=1 TERMUX_REANCHOR=0 末态少 38 条内容行（整份 C:\ 列表尾部 +
+         * 整份 Downloads 列表）。
+         *
+         * 所以只在 reanchor 真的会接手时才撒手；否则继续走下面的正向对齐 —— 那才是
+         * Windows Terminal 的做法：不钉底部，而是把本地视口挪到 conpty 认为的位置，
+         * 被挤掉的行进历史而不是被覆盖。 */
+        if (last_blank && screen_reanchor_enabled()) return 2;
     }
-    if (segn == 0) return 2;   /* 归顶后首行空白：重绘已见、无内容可对齐 */
-    /* 3) 去掉首尾空白并解码成 WCHAR（宽字符按屏内代理对存储）。 */
-    int a0 = 0; while (a0 < segn && (seg[a0] == ' ' || seg[a0] == '\t')) a0++;
-    int b0 = segn; while (b0 > a0 && (seg[b0 - 1] == ' ' || seg[b0 - 1] == '\t')) b0--;
-    if (b0 - a0 == 0) return 2;
-    WCHAR wl[512]; int wn = 0;
-    {
-        int k = a0;
-        while (k < b0 && wn < 510) {
-            int adv = 0;
-            unsigned int cp = screen_utf8_cp((const char *)seg + k, b0 - k, &adv);
-            if (adv <= 0) break;
-            k += adv;
-            if (cp < 0x10000) wl[wn++] = (WCHAR)cp;
-            else {
-                wl[wn++] = (WCHAR)(0xD800 + ((cp - 0x10000) >> 10));
-                if (wn < 511) wl[wn++] = (WCHAR)(0xDC00 + ((cp - 0x10000) & 0x3FF));
+    /* 3) 从最小的正向偏移 k 起试：要求重绘的【每一条非空行】都与本地 rel=k+j 一致
+     *    （rel 超出本地最新行的那些行不比——conhost 的行数可能比本地多）。取第一个
+     *    全吻合的 k。k 只到 rows-1：再大就等于把整个可见区推成历史，没有意义。 */
+    int best = 0;
+    for (int k = 1; k <= s->rows - 1 && !best; k++) {
+        int p = homed, j = 0, matched = 0, ok = 1;
+        while (p >= 0 && p < len) {
+            WCHAR rl[256];
+            int rn = 0;
+            int np = repaint_next_row(data, len, p, rl, 256, &rn);
+            if (rn > 0) {
+                if (k + j <= s->rows - 1) {
+                    if (!screen_row_text_eq(s, k + j, rl, rn)) { ok = 0; break; }
+                    matched++;
+                }
             }
+            j++;
+            p = np;
+            if (j > 4096) break;
         }
+        if (ok && matched > 0) best = k;
     }
-    if (wn == 0) return 2;
-    /* 4) 在整个历史+可见区寻找重绘首行。ConPTY 的重绘顶行不只可能比本地可见
-     *    顶部更深（rel>0），加宽 reflow 后也常落在本地历史里（rel<0）。旧代码只
-     *    搜 rel>=1；真实日志里 `.out` 位于历史约 -9，重绘却从它开始，于是它被写
-     *    到 rel0，后续 29 行覆盖掉较新的可见内容，每拖宽一列历史就短一截。
-     *    这里取绝对偏移最小的匹配，随后按有符号 rel 调整 scroll_top/hist_lines，
-     *    让重绘覆盖原有同一批行。 */
-    int best_rel = 0;
-    for (int rel = -s->hist_lines; rel < s->rows; rel++) {
-        if (rel == 0) continue;
-        int pr = screen_phys_row(s, rel);
-        if (pr < 0 || pr >= s->total_lines || !s->lines || !s->lines[pr].cells) continue;
-        ScreenLine *ln = &s->lines[pr];
-        int nl = ln->len;
-        int a = 0; while (a < nl && ln->cells[a].Char.UnicodeChar == L' ') a++;
-        int b = nl; while (b > a && ln->cells[b - 1].Char.UnicodeChar == L' ') b--;
-        if (b - a != wn) continue;
-        int eq = 1;
-        for (int x = 0; x < wn; x++)
-            if (ln->cells[a + x].Char.UnicodeChar != wl[x]) { eq = 0; break; }
-        if (!eq) continue;
-        if (best_rel == 0 || abs(rel) < abs(best_rel)) best_rel = rel;
-    }
-    if (best_rel != 0) {
-        s->hist_lines += best_rel;
-        if (s->hist_lines < 0) s->hist_lines = 0;
+    if (best > 0) {
+        s->hist_lines += best;
         if (s->hist_lines > s->total_lines - s->rows) s->hist_lines = s->total_lines - s->rows;
-        s->scroll_top = (s->scroll_top + best_rel) % s->total_lines;
+        s->scroll_top = (s->scroll_top + best) % s->total_lines;
         if (s->scroll_top < 0) s->scroll_top += s->total_lines;
         return 1;
     }
-    return 2;   /* 归顶重绘已见，但没有其它位置的同内容行：无需对齐 */
+    return 2;   /* 归顶重绘已见，但没有整块吻合的正向偏移：不动作 */
 }
-
 
 /* ---- reflow-on-resize 实现 ----------------------------------------------- */
 
@@ -1178,7 +1542,6 @@ static void line_store_rglyph(ScreenLine *ln, const RGlyph *row, int w, int used
 
 static int screen_resize_reflow(ScreenBuffer *s, int nc, int nr) {
     int nt = nr + g_scrollback_lines;
-    int old_scroll_top = s->scroll_top;
     WORD fill_attr = s->current_attr ? s->current_attr : 0x07;
 
     ScreenLine *nl = (ScreenLine *)calloc(nt, sizeof(ScreenLine));
@@ -1242,28 +1605,23 @@ static int screen_resize_reflow(ScreenBuffer *s, int nc, int nr) {
     if (scan_end > s->rows) scan_end = s->rows;
     (void)span_top;
 
+    /* 光标必须跟着内容一起 reflow：记下「老光标行之前已折出的显示行数」
+     * （cursor_rows）与「光标在自己那条逻辑行内的显示行偏移」（cursor_intra）。
+     * 不重算的话 resize 后光标停在旧行号上（内容已按新宽度整体移位），下一条
+     * 输出就会写进已有内容行、把它覆盖掉（放大窗格后最明显）。 */
+    int cursor_rows = -1, cursor_intra = 0;
     for (int rel = -old_hist; rel < scan_end && !oom; rel++) {
         int pr = screen_phys_row(s, rel);
         if (pr < 0 || pr >= s->total_lines || !s->lines || !s->lines[pr].cells) continue;
         ScreenLine *ln = &s->lines[pr];
         int len = screen_row_reflow_len(s, rel);
         int wr = (s->line_wrap && s->line_wrap[pr]) ? 1 : 0;
-        /* 纯增高时不要把历史行“提取”到可见区后从历史所有权中删除。
-         * ConPTY 随后的整屏重绘会覆盖可见区；若这里先减少 hist，那批旧行就永久
-         * 消失。历史与旧可见区之间插入新增的屏幕空位，使 old_hist 保持不变；
-         * 重绘只更新 viewport。纯宽变化仍走正常逻辑 reflow。 */
-        if (rel == 0 && nc == s->cols && nr > s->rows && old_hist > 0) {
-            if (line_open) {
-                sk.first_done = 0;
-                reflow_append_rows(log, logn, nc, reflow_sink_cb, &sk);
-                logn = 0;
-                line_open = 0;
-            }
-            for (int z = 0; z < nr - s->rows; z++) {
-                sk.first_done = 0;
-                reflow_append_rows(NULL, 0, nc, reflow_sink_cb, &sk);
-            }
-        }
+        /* 纯增高（nc==cols && nr>rows）不做特殊处理：内容是一条时间流，屏幕变高
+         * 就是「最新 nr 条显示行可见、其余留在历史」，hist 自然缩小 nr-rows 行
+         * （= v1.8.51 的 pull 语义）。旧实现在历史与旧可见区之间插入 nr-rows 个
+         * 空逻辑行来「保住 old_hist」，代价是这些空行落在内容跨度【内部】：被
+         * screen_reflow_height 计成内容行，每把窗格拖高 k 行就往滚动历史里永久塞
+         * k 个空行，同时抬高 scroll_limit（翻到顶还有一片空白）。 */
         if (len == 0 && wr == 0 && empty_top && !saw_content) continue; /* 顶部空区 */
         if (len > 0 || wr) saw_content = 1;
         if (wr == 0) {
@@ -1275,6 +1633,13 @@ static int screen_resize_reflow(ScreenBuffer *s, int nc, int nr) {
             line_open = 1;             /* 本行是新逻辑行首行（空白行也是） */
         } else if (!line_open) {
             line_open = 1;             /* 历史最老一段即续行（被淘汰丢头）的兜底 */
+        }
+        /* 此处 ring.count = 光标所在逻辑行【之前】的显示行数（上一条逻辑行刚折完
+         * 落位），log[0..logn-1] = 光标所在逻辑行在本物理行之前已累积的 glyph。 */
+        if (cursor_rows < 0 && rel == s->cursor_y) {
+            int upto = logn + (s->cursor_x < len ? s->cursor_x : len);
+            cursor_rows = ring.count;
+            cursor_intra = (log && upto > 0) ? reflow_rows_for(log, upto, nc) - 1 : 0;
         }
         if (len > 0) {
             if (logn + len > logcap) {
@@ -1312,6 +1677,18 @@ static int screen_resize_reflow(ScreenBuffer *s, int nc, int nr) {
      *    内容槽 j（0..ring.count-1，老→新）。 */
     int tcount = ring.count;
     int hist = tcount > nr ? tcount - nr : 0;
+    /* 光标在内容流里的显示行下标（相对内容首行）。扫描中途 OOM 时兜底到内容末尾。 */
+    if (cursor_rows < 0) cursor_rows = tcount;
+    int cur_off = cursor_rows + cursor_intra;
+    /* 内容不足一屏时的起始 rel：顶对齐（base = 0）。
+     * 这一支只在 tcount < nr 时走到，而 tcount < nr 就意味着这次 resize 之后
+     * hist 归 0（内容整屏放得下）——此时 ConPTY 的整屏重绘也是顶对齐的（conhost
+     * 增高时把内容留在原处、只在下方补空行），两边必须一致，否则每次拖动都会看到
+     * 内容在「底对齐的一帧」和「顶对齐的重绘」之间跳。
+     * 「有历史时提示符必须贴底」由 screen_repaint_reanchor() 保证：有历史 ⇒ 内容
+     * 一定超过一屏 ⇒ 走下面 tcount >= nr 那支（可见区 = 最新 nr 行，天然底对齐），
+     * 重绘结束后再把 conhost 少发的那几行补回顶部。 */
+    int base = 0;
     if (tcount >= nr) {
         for (int j = 0; j < tcount; j++) {
             int slot = (ring.head + j) % ring.cap;
@@ -1324,9 +1701,6 @@ static int screen_resize_reflow(ScreenBuffer *s, int nc, int nr) {
             if (ring.first[slot]) nwrap[phys] = 0; else nwrap[phys] = 1;
         }
     } else {
-        /* 无历史的普通屏幕缩放保持内容顶部位置，避免首次上下分屏时 banner/提示符
-         * 在 ConPTY 重绘到达前瞬间跳到窗格底部；已有历史时仍按最新内容底部锚定。 */
-        int base = old_hist == 0 ? 0 : nr - tcount;
         for (int j = 0; j < tcount; j++) {
             int slot = (ring.head + j) % ring.cap;
             int phys = base + j;
@@ -1340,6 +1714,14 @@ static int screen_resize_reflow(ScreenBuffer *s, int nc, int nr) {
     /* 可见区其余槽也分配成空白（渲染前可能被直接读取）。 */
     for (int y = 0; y < nr; y++)
         if (!nl[y].cells) line_alloc(&nl[y], nc, fill_attr);
+    /* 光标落到新布局里同一条内容行上：内容首行 rel = (tcount>=nr ? -hist : base)，
+     * 再加上光标在内容流里的显示行下标。 */
+    {
+        int ncur = (tcount >= nr ? -hist : base) + cur_off;
+        if (ncur < 0) ncur = 0;
+        if (ncur > nr - 1) ncur = nr - 1;
+        s->cursor_y = ncur;
+    }
     rfring_free(&ring);
 
     /* 3) 换旧为新。 */
@@ -1359,14 +1741,15 @@ static int screen_resize_reflow(ScreenBuffer *s, int nc, int nr) {
     s->rows = nr;
     s->total_lines = nt;
     s->hist_lines = hist;
-    /* 拖动分隔线不能把正在回看的视图强制跳回底部。旧代码每次 resize 都置 0，
-     * 因而用户刚滚到 LINE-80/空行/提示符附近，下一次尺寸事件就立即丢失位置。 */
-    s->scroll_top = old_scroll_top;
-    {
-        int lim = screen_scroll_limit(s);
-        if (s->scroll_top > lim) s->scroll_top = lim;
-        if (s->scroll_top < 0) s->scroll_top = 0;
-    }
+    /* 环头必须归零。上面的落位是【绝对布局】：可见区 = 物理槽 0..nr-1、历史 =
+     * 物理槽 nt-hist..nt-1，而 screen_phys_row() 是 (scroll_top+rel)%total_lines，
+     * 渲染 / 复制 / 搜索 / reflow_view 全部经它取行。保留旧的 scroll_top（v1.8.52
+     * 曾这么做，想「不把回看视图跳回底部」）等于让环头与布局错位 scroll_top 行：
+     * 历史与可见屏整体平移、最上面几行从历史里消失、底部多一行空白，且后续输出
+     * 写进错误的物理槽覆盖已有内容。回看位置不在 scroll_top 上——它在
+     * g_mux.panes[i].scroll_offset（pane_resize_to 已用 screen_scroll_limit 夹过），
+     * 这里复位环头不影响用户的回看位置。 */
+    s->scroll_top = 0;
     if (s->alt_hist_lines > nt - nr) s->alt_hist_lines = nt - nr;
     if (s->cursor_x >= nc) s->cursor_x = nc - 1;
     if (s->cursor_y >= nr) s->cursor_y = nr - 1;
@@ -1589,6 +1972,11 @@ int screen_resize(ScreenBuffer *s, int nc, int nr) {
     if (nr < 1) nr = 1;
     int hist_pre = s->hist_lines;
     int trace = !s->in_alt_screen && screen_trace_on();
+    /* resize 后 conhost 会回一次整屏重绘；那次重绘结束时要把提示符重新顶到底行。
+     * 旧快照是按旧尺寸存的，作废。 */
+    screen_repaint_snapshot_free(s);
+    s->resize_repaint_pass = 0;
+    if (!s->in_alt_screen) s->resize_repaint_pending = 1;
     if (trace) screen_trace_ring("PRE ", s, nc, nr, hist_pre);
     int r = 0;
     if (s->in_alt_screen) r = screen_resize_legacy(s, nc, nr);

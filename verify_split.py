@@ -227,6 +227,249 @@ int main(void) {
         ck("空间足够 -> 左右切分成功", split_split_active(SPLIT_V, 1) == 1);
     }
 
+    /* ---- bug #25（2026-09-20）：「太矮的时候，不应该可以拆分」。
+     *      SPLIT_MIN_ROWS 从 2 抬到 3，上下切分的门槛从 2*2+1=5 行变成 2*3+1=7 行。
+     *      原来 5 行的终端就能上下切，切完每格 2 行，基本没法用。 ---- */
+    {
+        split_reset();
+        g_mux.pane_count = 8;
+        for (int i = 0; i < 8; i++) { g_mux.panes[i].active = 1; g_mux.panes[i].is_split_child = 0; }
+        g_mux.active_pane = 0;
+        split_init_tab(0);
+        g_mux.host_cols = 80;
+        g_mux.host_rows = 5;
+        ck("5 行：旧门槛(5)会放行，新门槛(7)必须拒绝", split_split_active(SPLIT_H, 1) == 0);
+        ck("拒绝后 1 不是子窗格", g_mux.panes[1].is_split_child == 0);
+        g_mux.host_rows = 6;
+        ck("6 行：仍然拒绝", split_split_active(SPLIT_H, 1) == 0);
+        ck("6 行拒绝后 1 仍不是子窗格", g_mux.panes[1].is_split_child == 0);
+        g_mux.host_rows = 7;
+        ck("7 行：正好够（3+1+3）-> 允许", split_split_active(SPLIT_H, 1) == 1);
+        ck("切出来的确是子窗格", g_mux.panes[1].is_split_child == 1);
+    }
+    /* 常量本身也钉住：以后改 include/split.h 必须同步改这里，免得门槛被无声改回去。 */
+    ck("SPLIT_MIN_ROWS == 3", SPLIT_MIN_ROWS == 3);
+    ck("SPLIT_MIN_COLS == 4（本次未动）", SPLIT_MIN_COLS == 4);
+
+
+    /* ---- bug #27（2026-09-20）：「这种情况下时，调整正中间窗格的右边栏有bug」。
+     *      用户澄清：现象 = 动的是另一条分隔条；布局 = 「先左右分，左窗格上下分
+     *      3格，在左窗格的中间格再左右分」；中间格【左】侧那条分隔线正常，只有
+     *      【右】侧坏。
+     *
+     *      根因（两个叠在一起）：
+     *       1) 改错节点 —— 拖动路径把锚点 pane 交给 split_resize_set_frac()，它取
+     *          锚点向上【第一个】方向匹配的祖先。中间格右半 pane 的第一个 V 祖先
+     *          是【里层】的 2|4 节点，而用户抓的那条线属于【外层】祖先。
+     *       2) 分母对不上 —— 百分比按「锚点宽 + 1 + 屏幕上右邻宽」算，frac 却按
+     *          被改节点的整棵子树宽度解释。 ---- */
+    {
+        split_reset();
+        g_mux.pane_count = 8;
+        for (int i = 0; i < 8; i++) { g_mux.panes[i].active = 1; g_mux.panes[i].is_split_child = 0; }
+        g_mux.active_pane = 0;
+        g_mux.host_cols = 120; g_mux.host_rows = 30;
+        split_init_tab(0);
+        ck("#27 第1刀 左右分 0|1", split_split_active(SPLIT_V, 1) == 1);
+        g_mux.active_pane = 0;
+        ck("#27 第2刀 左窗格上下分 0/2", split_split_active(SPLIT_H, 2) == 1);
+        g_mux.active_pane = 2;
+        ck("#27 第3刀 下半再上下分 2/3", split_split_active(SPLIT_H, 3) == 1);
+        g_mux.active_pane = 2;
+        ck("#27 第4刀 中间格再左右分 2|4", split_split_active(SPLIT_V, 4) == 1);
+
+        int rt = split_root_for_tab(0);
+        ck("#27 树里 5 个叶子", split_count_leaves(rt) == 5);
+        PaneRect rs[MAX_PANES]; memset(rs, 0, sizeof(rs));
+        split_layout(rt, 0, 0, 120, 30, split_nodes(), rs);
+
+        ck("#27 pane2 与 pane4 同一行（中间行）",
+           rs[2].valid && rs[4].valid && rs[2].or0 == rs[4].or0 && rs[2].orows == rs[4].orows);
+        ck("#27 pane2|pane4 相邻", rs[2].oc0 + rs[2].ocols + 1 == rs[4].oc0);
+        int grab = rs[4].oc0 + rs[4].ocols;
+        ck("#27 pane4 右沿就是外层分隔线（pane1 左沿-1）", grab + 1 == rs[1].oc0);
+        ck("#27 上/中/下三格的右沿都压在这条线上",
+           rs[0].oc0 + rs[0].ocols == grab && rs[3].oc0 + rs[3].ocols == grab);
+
+        /* 里层 V 节点 = pane2 那个叶子的【父】节点。注意 split_find_leaf() 返回的
+         * 是叶子本身，不是父节点。 */
+        int leaf2 = split_find_leaf(rt, 2);
+        int leaf24 = split_nodes()[leaf2].parent;
+        ck("#27 里层 V 节点存在且不是根", leaf24 >= 0 && leaf24 != rt);
+        ck("#27 里层节点确实是左右分且孩子就是 2|4",
+           split_nodes()[leaf24].leaf == 0 && split_nodes()[leaf24].dir == SPLIT_V);
+
+        /* 左侧那条（pane2 的右沿）：改动前后都该挑中里层节点 —— 对应用户说的
+         * 「左边正常」。 */
+        ck("#27 抓里层(pane2 右沿) -> 里层节点",
+           split_drag_pick_node(rs, rt, 2, 'V', rs[2].oc0 + rs[2].ocols) == leaf24);
+        /* 右侧那条（pane4 的右沿）：必须挑中根节点。旧行为挑中 leaf24，于是里层
+         * 分隔线动、外层不动 = 用户看到的「动的是另一条分隔条」。 */
+        int node = split_drag_pick_node(rs, rt, 4, 'V', grab);
+        ck("#27 抓 pane4 右沿 -> 根节点（不是里层 2|4）", node == rt && node != leaf24);
+        ck("#27 抓 pane0 右沿 -> 根节点", split_drag_pick_node(rs, rt, 0, 'V', grab) == rt);
+        ck("#27 抓 pane3 右沿 -> 根节点", split_drag_pick_node(rs, rt, 3, 'V', grab) == rt);
+
+        /* 端到端：把外层分隔线拖到右窗格中点，看它是不是真的动、且里层没被碰。 */
+        int target = rs[1].oc0 + rs[1].ocols / 2;
+        int pct = -1;
+        ck("#27 外层 pct 可算", split_drag_pct(rs, node, 'V', target, &pct) == 1);
+        /* 分母必须是【被改节点自己的子树跨度】。这棵树里根节点 = 左列 + 1 分隔 +
+         * 右窗格 = 整个 120 列；旧的「锚点宽 + 1 + 屏幕上右邻宽」在这里是
+         * 29 + 1 + 60 = 90，会把 pct 从 75 顶到 95（夹死），分隔线一下冲到最右。 */
+        int span = rs[1].oc0 + rs[1].ocols;    /* 根子树总宽 */
+        ck("#27 分母=节点子树跨度（不是锚点+右邻）", pct == (target * 100) / (span - 1));
+        int f24 = split_nodes()[leaf24].frac_pct;
+        split_set_frac_node(node, 4, pct);
+        ck("#27 里层 2|4 的 frac 没被碰（用户没抓它）", split_nodes()[leaf24].frac_pct == f24);
+        memset(rs, 0, sizeof(rs));
+        split_layout(rt, 0, 0, 120, 30, split_nodes(), rs);
+        int moved = rs[4].oc0 + rs[4].ocols;
+        ck("#27 分隔线真的跟到鼠标位置(±1 量化)", moved >= target - 1 && moved <= target);
+        ck("#27 pane1 左沿紧跟新分隔线", rs[1].oc0 == moved + 1);
+
+        /* 反面对照：split_resize_set_frac() 语义【故意保持不变】（取最内层方向匹配
+         * 祖先，别处还在用）。它改的确实是里层节点 —— 这就是当初的 bug，也说明
+         * 拖动路径为什么必须改道走 split_drag_pick_node()。 */
+        split_nodes()[rt].frac_pct = 50; split_nodes()[leaf24].frac_pct = 50;
+        split_resize_set_frac(rt, 4, 'V', 63);
+        ck("#27 对照：旧路径改的是里层节点", split_nodes()[leaf24].frac_pct != 50);
+        ck("#27 对照：旧路径下根节点没动", split_nodes()[rt].frac_pct == 50);
+    }
+
+    /* ---- bug #27 的横方向同一个坑：先上下分 -> 上半左右分三格 -> 中间格再上下分。
+     *      抓中间格下半 pane 的【底沿】= 外层横线。 ---- */
+    {
+        split_reset();
+        g_mux.pane_count = 8;
+        for (int i = 0; i < 8; i++) { g_mux.panes[i].active = 1; g_mux.panes[i].is_split_child = 0; }
+        g_mux.active_pane = 0;
+        g_mux.host_cols = 120; g_mux.host_rows = 60;
+        split_init_tab(0);
+        ck("#27H 第1刀 上下分 0/1", split_split_active(SPLIT_H, 1) == 1);
+        g_mux.active_pane = 0;
+        ck("#27H 第2刀 上半左右分 0|2", split_split_active(SPLIT_V, 2) == 1);
+        g_mux.active_pane = 2;
+        ck("#27H 第3刀 右半再左右分 2|3", split_split_active(SPLIT_V, 3) == 1);
+        g_mux.active_pane = 2;
+        ck("#27H 第4刀 中间格再上下分 2/4", split_split_active(SPLIT_H, 4) == 1);
+
+        int rt = split_root_for_tab(0);
+        PaneRect rs[MAX_PANES]; memset(rs, 0, sizeof(rs));
+        split_layout(rt, 0, 0, 120, 60, split_nodes(), rs);
+        int grabh = rs[4].or0 + rs[4].orows;
+        ck("#27H pane4 底沿就是外层横线（pane1 顶沿-1）", grabh + 1 == rs[1].or0);
+        int leafh = split_nodes()[split_find_leaf(rt, 2)].parent;
+        ck("#27H 里层节点是上下分", split_nodes()[leafh].dir == SPLIT_H);
+        int nodeh = split_drag_pick_node(rs, rt, 4, 'H', grabh);
+        ck("#27H 抓 pane4 底沿 -> 根节点（不是里层 2/4）", nodeh == rt && nodeh != leafh);
+        int tpct = -1;
+        ck("#27H 外层 pct 可算", split_drag_pct(rs, nodeh, 'H', rs[1].or0 + rs[1].orows / 2, &tpct) == 1);
+        int fh = split_nodes()[leafh].frac_pct;
+        split_set_frac_node(nodeh, 4, tpct);
+        ck("#27H 里层 2/4 的 frac 没被碰", split_nodes()[leafh].frac_pct == fh);
+    }
+
+
+    /* ---- bug #29（2026-09-20）：「纵向压缩可以把一个终端压缩到 <3 行/列」。
+     *      frac 只夹 5..95。窗格小的时候 5% 就是 0 行 —— 一路拖到底能把一个终端
+     *      压没。两道防线：split_drag_pct() 夹百分比（拖动跟手），layout_rec 里
+     *      的 clamp_side() 兜底（覆盖键盘 resize 和窗口拖窄后的旧 frac）。 ---- */
+    {
+        split_reset();
+        g_mux.pane_count = 8;
+        for (int i = 0; i < 8; i++) { g_mux.panes[i].active = 1; g_mux.panes[i].is_split_child = 0; }
+        g_mux.active_pane = 0;
+        g_mux.host_cols = 80; g_mux.host_rows = 12;
+        split_init_tab(0);
+        ck("#29 上下分成功", split_split_active(SPLIT_H, 1) == 1);
+        int rt = split_root_for_tab(0);
+        PaneRect rs[MAX_PANES]; memset(rs, 0, sizeof(rs));
+        split_layout(rt, 0, 0, 80, 12, split_nodes(), rs);
+        ck("#29 初始两格都 >= 3 行",
+           rs[0].orows >= SPLIT_MIN_ROWS && rs[1].orows >= SPLIT_MIN_ROWS);
+
+        /* 一路拖到最上面（鼠标压在第 0 行）。12 行 -> span=11。 */
+        int node = split_drag_pick_node(rs, rt, 0, 'H', rs[0].or0 + rs[0].orows);
+        ck("#29 挑中根节点", node == rt);
+        int pct = -1;
+        ck("#29 pct 可算", split_drag_pct(rs, node, 'H', 0, &pct) == 1);
+        /* pct 自己就要夹住：不夹的话会写成 5（对应 11*5/100 = 0 行），全靠
+         * layout_rec 兜底，表现为「拖回来一大段分隔线都不动」。
+         * 期望值 = ceil(3*100/11) = 28。 */
+        ck("#29 pct 被夹到 28（=ceil(3*100/11)），不是 5", pct == 28);
+        split_set_frac_node(node, 0, pct);
+        memset(rs, 0, sizeof(rs));
+        split_layout(rt, 0, 0, 80, 12, split_nodes(), rs);
+        ck("#29 拖到最上后上格仍 >= 3 行", rs[0].orows >= SPLIT_MIN_ROWS);
+        ck("#29 拖到最上后下格仍 >= 3 行", rs[1].orows >= SPLIT_MIN_ROWS);
+
+        /* 反方向：一路拖到最下面。 */
+        memset(rs, 0, sizeof(rs)); split_layout(rt, 0, 0, 80, 12, split_nodes(), rs);
+        node = split_drag_pick_node(rs, rt, 0, 'H', rs[0].or0 + rs[0].orows);
+        pct = -1;
+        ck("#29 反向 pct 可算", split_drag_pct(rs, node, 'H', 11, &pct) == 1);
+        ck("#29 反向 pct 被夹到 72（=floor(8*100/11)）", pct == 72);
+        split_set_frac_node(node, 0, pct);
+        memset(rs, 0, sizeof(rs)); split_layout(rt, 0, 0, 80, 12, split_nodes(), rs);
+        ck("#29 拖到最下后上格仍 >= 3 行", rs[0].orows >= SPLIT_MIN_ROWS);
+        ck("#29 拖到最下后下格仍 >= 3 行", rs[1].orows >= SPLIT_MIN_ROWS);
+
+        /* 直接写极端 frac —— 模拟键盘 prefix+方向键（split_resize_pane 只按百分比
+         * 加减、手里没有像素尺寸）和「窗口拖窄后旧 frac 变得太极端」。这时只有
+         * layout_rec 里的 clamp_side() 能兜住。 */
+        split_nodes()[rt].frac_pct = 5;
+        memset(rs, 0, sizeof(rs)); split_layout(rt, 0, 0, 80, 12, split_nodes(), rs);
+        ck("#29 frac=5 时上格仍 >= 3 行（layout 兜底）", rs[0].orows >= SPLIT_MIN_ROWS);
+        ck("#29 frac=5 时下格没被撑爆", rs[1].orows >= SPLIT_MIN_ROWS);
+        split_nodes()[rt].frac_pct = 95;
+        memset(rs, 0, sizeof(rs)); split_layout(rt, 0, 0, 80, 12, split_nodes(), rs);
+        ck("#29 frac=95 时下格仍 >= 3 行（layout 兜底）", rs[1].orows >= SPLIT_MIN_ROWS);
+        ck("#29 frac=95 时上格没被压没", rs[0].orows >= SPLIT_MIN_ROWS);
+    }
+
+    /* ---- bug #29 的左右方向（SPLIT_MIN_COLS = 4） ---- */
+    {
+        split_reset();
+        g_mux.pane_count = 8;
+        for (int i = 0; i < 8; i++) { g_mux.panes[i].active = 1; g_mux.panes[i].is_split_child = 0; }
+        g_mux.active_pane = 0;
+        g_mux.host_cols = 20; g_mux.host_rows = 20;
+        split_init_tab(0);
+        ck("#29V 左右分成功", split_split_active(SPLIT_V, 1) == 1);
+        int rv = split_root_for_tab(0);
+        PaneRect rs[MAX_PANES]; memset(rs, 0, sizeof(rs));
+        split_layout(rv, 0, 0, 20, 20, split_nodes(), rs);
+        ck("#29V 初始两格都 >= 4 列",
+           rs[0].ocols >= SPLIT_MIN_COLS && rs[1].ocols >= SPLIT_MIN_COLS);
+
+        split_nodes()[rv].frac_pct = 5;
+        memset(rs, 0, sizeof(rs)); split_layout(rv, 0, 0, 20, 20, split_nodes(), rs);
+        ck("#29V frac=5 时左格仍 >= 4 列（layout 兜底）", rs[0].ocols >= SPLIT_MIN_COLS);
+        split_nodes()[rv].frac_pct = 95;
+        memset(rs, 0, sizeof(rs)); split_layout(rv, 0, 0, 20, 20, split_nodes(), rs);
+        ck("#29V frac=95 时右格仍 >= 4 列（layout 兜底）", rs[1].ocols >= SPLIT_MIN_COLS);
+
+        memset(rs, 0, sizeof(rs)); split_layout(rv, 0, 0, 20, 20, split_nodes(), rs);
+        int nv = split_drag_pick_node(rs, rv, 0, 'V', rs[0].oc0 + rs[0].ocols);
+        int pv = -1;
+        ck("#29V 一路拖到最左 pct 可算", split_drag_pct(rs, nv, 'V', 0, &pv) == 1);
+        ck("#29V pct 被夹到 22（=ceil(4*100/19)）", pv == 22);
+        split_set_frac_node(nv, 0, pv);
+        memset(rs, 0, sizeof(rs)); split_layout(rv, 0, 0, 20, 20, split_nodes(), rs);
+        ck("#29V 拖到最左后两格都 >= 4 列",
+           rs[0].ocols >= SPLIT_MIN_COLS && rs[1].ocols >= SPLIT_MIN_COLS);
+
+        memset(rs, 0, sizeof(rs)); split_layout(rv, 0, 0, 20, 20, split_nodes(), rs);
+        nv = split_drag_pick_node(rs, rv, 0, 'V', rs[0].oc0 + rs[0].ocols);
+        pv = -1;
+        split_drag_pct(rs, nv, 'V', 19, &pv);
+        split_set_frac_node(nv, 0, pv);
+        memset(rs, 0, sizeof(rs)); split_layout(rv, 0, 0, 20, 20, split_nodes(), rs);
+        ck("#29V 拖到最右后两格都 >= 4 列",
+           rs[0].ocols >= SPLIT_MIN_COLS && rs[1].ocols >= SPLIT_MIN_COLS);
+    }
+
     if (failures) { printf("\n%d FAILURE(S)\n", failures); return 1; }
     printf("\nSPLIT TESTS PASSED\n");
     return 0;
@@ -282,20 +525,122 @@ def main() -> int:
                 "/* v1.8.43：split_split_active 空间不足时调用 toast_show，harness 提供空实现。 */\n"
                 "void toast_show(const char *msg, unsigned int ms){(void)msg;(void)ms;}\n")
         open(h, "w", encoding="utf-8").write(HARNESS)
-        cp = subprocess.run(
-            ["gcc", "-O1", "-Wall", "-Wextra", "-Werror",
-             "-I" + td, "-I" + INC, h, globs, os.path.join(SRC, "split.c"),
-             "-o", exe, "-lm"],
-            capture_output=True, text=True)
-        if cp.returncode != 0:
-            print(cp.stderr, file=sys.stderr)
+
+        builds = [0]
+
+        def build_run(split_c_path):
+            builds[0] += 1
+            out = os.path.join(td, "h%d.bin" % builds[0])
+            cp = subprocess.run(
+                ["gcc", "-O1", "-Wall", "-Wextra", "-Werror",
+                 "-I" + td, "-I" + INC, h, globs, split_c_path, "-o", out, "-lm"],
+                capture_output=True, text=True)
+            if cp.returncode != 0:
+                print(cp.stderr, file=sys.stderr)
+                return None, cp.stderr
+            r = subprocess.run([out], capture_output=True, text=True)
+            return r.returncode, r.stdout + r.stderr
+
+        rc, out = build_run(os.path.join(SRC, "split.c"))
+        if rc is None:
             print("FAIL: split harness 编译失败", file=sys.stderr)
             return 1
-        run = subprocess.run([exe], capture_output=True, text=True)
-        print(run.stdout)
-        if run.returncode != 0:
-            print(run.stderr, file=sys.stderr)
+        print(out)
+        if rc != 0:
             return 1
+
+        # ---- 自证（验红）：把「按分界线位置挑节点」退回旧行为（取最内层方向匹配
+        #      祖先，即 bug #27 的病因），新增断言必须失败。 ----
+        with open(os.path.join(SRC, "split.c"), encoding="utf-8") as f:
+            split_src = f.read()
+        needle = "        if (ahi == grab_pos && blo == grab_pos + 1) return anc[k];"
+        assert split_src.count(needle) == 1, "自证锚点没找到，改 split.c 时要同步这里"
+        mutant = os.path.join(td, "split_mutant.c")
+        with open(mutant, "w", encoding="utf-8") as f:
+            f.write(split_src.replace(
+                needle,
+                "        (void)grab_pos;  /* MUTANT: 退回旧行为 —— 不看抓的是哪条线，"
+                "直接取最内层方向匹配祖先 */\n        if (k == 0) return anc[k];"))
+        rc2, out2 = build_run(mutant)
+        if rc2 == 0:
+            print("FAIL: 自证失败 —— 退回旧行为后测试仍然全绿，说明判据没抓住 bug #27",
+                  file=sys.stderr)
+            return 1
+        caught = [ln for ln in (out2 or "").splitlines() if ln.startswith("[FAIL]")]
+        if not caught:
+            print("自证编译/运行输出（应为 0 条 FAIL 时才打印）：\n" + (out2 or "")[-2000:],
+                  file=sys.stderr)
+        print("自证：退回旧行为后被抓住 %d 条，例如：" % len(caught))
+        for ln in caught[:4]:
+            print("      " + ln)
+        if not any("#27" in ln for ln in caught):
+            print("FAIL: 自证失败 —— 失败的都不是 #27 的断言", file=sys.stderr)
+            return 1
+        print("自证通过：#27 的判据确实钉住了「挑对节点」这件事。")
+
+        # ---- 自证 2：bug #27 的另一半病因是【分母】。把分母里的 b 子树跨度丢掉，
+        #      「分母=节点子树跨度」这条断言必须失败。 ----
+        needle2 = "    int total = (ahi - alo) + 1 + (bhi - blo);"
+        assert split_src.count(needle2) == 1, "自证 2 锚点没找到，改 split.c 时要同步这里"
+        mutant2 = os.path.join(td, "split_mutant2.c")
+        with open(mutant2, "w", encoding="utf-8") as f:
+            f.write(split_src.replace(
+                needle2,
+                "    (void)bhi; (void)blo;\n"
+                "    int total = (ahi - alo) + 1;  /* MUTANT: 分母丢掉 b 子树 */"))
+        rc3, out3 = build_run(mutant2)
+        if rc3 == 0:
+            print("FAIL: 自证 2 失败 —— 分母改坏后测试仍然全绿", file=sys.stderr)
+            return 1
+        caught2 = [ln for ln in (out3 or "").splitlines() if ln.startswith("[FAIL]")]
+        print("自证 2：分母改坏后被抓住 %d 条，例如：" % len(caught2))
+        for ln in caught2[:3]:
+            print("      " + ln)
+        if not any("分母" in ln for ln in caught2):
+            print("FAIL: 自证 2 失败 —— 没抓住「分母」那条断言", file=sys.stderr)
+            return 1
+        print("自证 2 通过：#27 的判据也钉住了「分母用节点自己的跨度」。")
+
+        # ---- 自证 3：拆掉 layout_rec 里的最小尺寸兜底闸（clamp_side 失效）。 ----
+        n3a = "    if (*side < min_side) *side = min_side;"
+        n3b = "    if (total - *side < min_side) *side = total - min_side;"
+        assert split_src.count(n3a) == 1 and split_src.count(n3b) == 1, \
+            "自证 3 锚点没找到，改 split.c 时要同步这里"
+        mutant3 = os.path.join(td, "split_mutant3.c")
+        with open(mutant3, "w", encoding="utf-8") as f:
+            f.write(split_src.replace(n3a, "    if (*side < -1) *side = min_side;  /* MUTANT */")
+                             .replace(n3b, "    if (total - *side < -1) *side = total - min_side;  /* MUTANT */"))
+        rc4, out4 = build_run(mutant3)
+        if rc4 == 0:
+            print("FAIL: 自证 3 失败 —— 拆掉 layout 兜底闸后测试仍然全绿", file=sys.stderr)
+            return 1
+        caught3 = [ln for ln in (out4 or "").splitlines() if ln.startswith("[FAIL]")]
+        print("自证 3：拆掉 layout 兜底闸后被抓住 %d 条，例如：" % len(caught3))
+        for ln in caught3[:3]:
+            print("      " + ln)
+        if not any("兜底" in ln for ln in caught3):
+            print("FAIL: 自证 3 失败 —— 没抓住「layout 兜底」那几条断言", file=sys.stderr)
+            return 1
+        print("自证 3 通过：最小尺寸的最后一道闸确实被钉住了。")
+
+        # ---- 自证 4：拆掉 split_drag_pct 的百分比夹取（只留 5..95）。 ----
+        n4 = "    if (span >= min_side * 2) {"
+        assert split_src.count(n4) == 1, "自证 4 锚点没找到，改 split.c 时要同步这里"
+        mutant4 = os.path.join(td, "split_mutant4.c")
+        with open(mutant4, "w", encoding="utf-8") as f:
+            f.write(split_src.replace(n4, "    if (0 && span >= min_side * 2) {  /* MUTANT */"))
+        rc5, out5 = build_run(mutant4)
+        if rc5 == 0:
+            print("FAIL: 自证 4 失败 —— 拆掉百分比夹取后测试仍然全绿", file=sys.stderr)
+            return 1
+        caught4 = [ln for ln in (out5 or "").splitlines() if ln.startswith("[FAIL]")]
+        print("自证 4：拆掉百分比夹取后被抓住 %d 条，例如：" % len(caught4))
+        for ln in caught4[:3]:
+            print("      " + ln)
+        if not any("pct 被夹到" in ln for ln in caught4):
+            print("FAIL: 自证 4 失败 —— 没抓住「pct 被夹到」那几条断言", file=sys.stderr)
+            return 1
+        print("自证 4 通过：拖动路径的百分比夹取也被钉住了。")
     return 0
 
 

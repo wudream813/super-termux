@@ -27,6 +27,14 @@ void screen_erase_range(ScreenBuffer *s, int row, int sx, int ex, WORD attr);
 void screen_scroll_up(ScreenBuffer *s, int top, int bottom, int count);
 /* ConPTY viewport repaint 用：移动可见行但绝不写入/删除 scrollback。 */
 void screen_scroll_viewport_up(ScreenBuffer *s, int count);
+void screen_repaint_snapshot(ScreenBuffer *s);      /* 整屏重绘前存一份可见行 */
+void screen_repaint_snapshot_free(ScreenBuffer *s);
+/* 重绘后把提示符重新顶到底行。返回值：
+ *   2 = 已重锚定（快照已释放，本次 resize 的重绘算处理完了）
+ *   1 = 没动作，但【快照与 pending 都保留】：这趟重绘一直写到最后一行（tail<=0），
+ *       是 conhost 两趟重绘的第一趟，真正要处理的是下一趟
+ *   0 = 没动作，快照已释放（条件不成立 / 重锚定被关掉） */
+int screen_repaint_reanchor(ScreenBuffer *s);
 void screen_scroll_down(ScreenBuffer *s, int top, int bottom, int count);
 void screen_newline(ScreenBuffer *s);
 void screen_mark_softwrap(ScreenBuffer *s);  /* 标记当前行=软换行续行（v1.8.47 reflow） */
@@ -44,9 +52,9 @@ typedef struct {
  * 折行，返回向上回看 vo 个显示行时、视口 rows×width 的内容到 out（行主序）。
  * 返回有效行数；alt 屏/无 wrap 标志时返回 0（调用方回退到物理行直取）。 */
 int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out);
-/* 本地 reflow resize 后 ConPTY 会整屏重绘（重绘顶行按其自身滚动缓冲对齐）。若该块是
- * 重绘且其首行内容落在本地环更深处（可见区 rel>0），把环滚动对齐使 ConPTY 视口与本地
- * 一致（内容不变、历史行数增长），避免重绘覆盖吞行。命中并调整返回 1，否则 0。 */
+/* 本地 reflow resize 后 ConPTY 会整屏重绘（重绘顶行按其自身滚动缓冲对齐）。若重绘的
+ * 所有非空行与本地环从 rel=k(k>=1) 起逐行一致，把环前滚 k 行使 ConPTY 视口与本地对齐
+ * （内容不变、历史行数增长），避免重绘覆盖吞行。命中并调整返回 1，否则 0/2。 */
 int screen_repaint_align(ScreenBuffer *s, const char *data, int len);
 void detect_conpty_width(ScreenBuffer *s, int written_len);
 WORD build_attr(ScreenBuffer *s);

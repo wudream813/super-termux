@@ -200,6 +200,29 @@ static void test_keymap_defaults(void) {
     check(keymap_lookup(0, 0, '+', &arg) == ACT_NEW_PANE_MENU, "+ -> new-pane-menu");
     check(keymap_lookup(VK_ADD, 0, 0, &arg) == ACT_NEW_PANE_MENU, "小键盘 + -> new-pane-menu");
 
+    /* ---- 中文输入法（全角标点）：2026-09-20 用户报「ctrl+b 加中文时的 _ 没反应」。
+     * 输入法把 Shift+标点 变成 VK_PACKET + 全角字符，只按虚拟键码匹配的绑定会漏。
+     * 判据必须覆盖【VK_PACKET + 全角字符】这个真实形态，不能只喂 vk=0。 ---- */
+    check(keymap_lookup(VK_OEM_MINUS, SHIFT_PRESSED, '_', &arg) == ACT_SPLIT_HORIZONTAL,
+          "_ (VK_OEM_MINUS+Shift) -> split-horizontal");
+    check(keymap_lookup(0, 0, '_', &arg) == ACT_SPLIT_HORIZONTAL, "_ (纯字符) -> split-horizontal");
+    check(keymap_lookup(VK_PACKET, 0, 0xFF3F, &arg) == ACT_SPLIT_HORIZONTAL,
+          "中文输入法 VK_PACKET + 全角下划线 ＿ -> split-horizontal");
+    check(keymap_lookup(VK_PACKET, SHIFT_PRESSED, 0xFF3F, &arg) == ACT_SPLIT_HORIZONTAL,
+          "同上，带 Shift 状态也要命中");
+    check(keymap_lookup(VK_PACKET, 0, 0xFF0D, &arg) == ACT_SPLIT_VERTICAL,
+          "全角减号 － -> split-vertical（前缀 - 左右分屏）");
+    check(keymap_lookup(VK_PACKET, 0, 0xFF5C, &arg) == ACT_SPLIT_VERTICAL,
+          "全角竖线 ｜ -> split-vertical");
+    check(keymap_lookup(VK_PACKET, 0, 0xFF0F, &arg) == ACT_SEARCH, "全角斜杠 ／ -> search");
+    check(keymap_lookup(VK_PACKET, 0, 0xFF1F, &arg) == ACT_HELP, "全角问号 ？ -> help");
+    check(keymap_lookup(VK_PACKET, 0, 0xFF3B, &arg) == ACT_COPY_MODE, "全角方括号 ［ -> copy-mode");
+    check(keymap_lookup(VK_PACKET, 0, 0xFF0B, &arg) == ACT_NEW_PANE_MENU, "全角加号 ＋ -> new-pane-menu");
+    check(keymap_lookup(0, 0, 0xFF1A, &arg) == ACT_COMMAND_PALETTE,
+          "全角冒号 ：-> command-palette（折叠后与 CHR(':') 同一条）");
+    /* 折叠只影响键位匹配：未绑定的全角字符仍然返回 ACT_NONE，不会被误吞。 */
+    check(keymap_lookup(VK_PACKET, 0, 0xFF21, &arg) == ACT_NONE, "全角 Ａ 未绑定 -> ACT_NONE");
+
     /* v1.8.45：按编号跳转 pane（主键盘/小键盘数字）已整体移除，统一走 w 打开
      * 「切换 panel」可视化面板。 */
     check(keymap_lookup('W', 0, 'w', &arg) == ACT_SWITCH_PANEL_PALETTE, "w -> switch-panel 面板");

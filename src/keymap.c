@@ -89,6 +89,11 @@ static const KeyBinding g_default_bindings[] = {
     /* pane 跳转：小键盘数字「按编号跳转」已移除，统一走前缀 w 的可视化「切换 panel」。 */
     /* ---- 分屏（前缀键之后） ---- */
     {VKEY_SHIFT(VK_OEM_MINUS),     ACT_SPLIT_HORIZONTAL, 0},  /* 前缀 _ ：上下分屏 */
+    /* 同一条再挂一个【纯字符】绑定：中文输入法把 Shift+- 变成 VK_PACKET + 全角
+     * ＿(U+FF3F)，上面那条按虚拟键码匹配的抓不到。CHR() 不看 vk、也不要求
+     * shift 状态，配合 spec_match 的全角折叠，半角 _ 和全角 ＿ 都能命中。
+     * （2026-09-20 用户报「ctrl+b 加中文时的 _ 没反应」。） */
+    {CHR('_'),                     ACT_SPLIT_HORIZONTAL, 0},
     {CHR('-'),                     ACT_SPLIT_VERTICAL,   0},  /* 前缀 - ：左右分屏 */
     {CHR('|'),                     ACT_SPLIT_VERTICAL,   0},  /* 前缀 | 兜底 */
     {CHR('\t'),                    ACT_SPLIT_NEXT,       0},  /* 前缀 Tab */
@@ -290,6 +295,20 @@ char keymap_prefix_char(void) {
     return 0;
 }
 
+/* 全角 ASCII（U+FF01..U+FF5E）折成对应半角（U+0021..U+007E）。
+ *
+ * 中文输入法开全角标点时，Shift+- 送上来的是全角下划线 U+FF3F，而且往往是
+ * VK_PACKET(0xE7) + 只有 UnicodeChar 有值 —— 走虚拟键码的绑定（VKEY_SHIFT
+ * (VK_OEM_MINUS)）根本匹配不到，于是「Ctrl+B 然后 _」上下分屏在中文输入法下
+ * 没反应（2026-09-20 用户报）。命令面板那条早就为同一件事单独加过 CHR(0xFF1A)
+ * 全角冒号；这里改成统一折叠，所有 CHR() 绑定一次性都认全角孪生字符。
+ *
+ * 只影响【键位匹配】，不影响发给 pane 的字节。 */
+static WCHAR keymap_fold_wide(WCHAR uc) {
+    if (uc >= 0xFF01 && uc <= 0xFF5E) return (WCHAR)(uc - 0xFF01 + 0x21);
+    return uc;
+}
+
 static int spec_match(const KeySpec *s, WORD vk, DWORD ctrl, WCHAR uc) {
     int is_ctrl = (ctrl & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
     int is_alt = (ctrl & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
@@ -298,7 +317,7 @@ static int spec_match(const KeySpec *s, WORD vk, DWORD ctrl, WCHAR uc) {
     if (s->alt != (unsigned char)is_alt) return 0;
     if (!s->shift_any && s->shift != (unsigned char)is_shift) return 0;
     if (s->vk) return s->vk == vk;
-    if (s->ch) return uc != 0 && s->ch == uc;
+    if (s->ch) return uc != 0 && s->ch == keymap_fold_wide(uc);
     return 0;
 }
 

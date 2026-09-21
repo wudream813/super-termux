@@ -172,6 +172,20 @@ int palette_item_count(int page);
 int palette_filter_cmds(int page, int *out_indices, int max_out, const char *query);
 int palette_item_info(int page, int item_index, PaletteItemInfo *out);
 void palette_editor_geom(int host_rows, int host_cols, int *top, int *left, int *w, int *h, int *input_w);
+/* 滚动条可见性门槛（列数）。渲染（整屏路径 + 分屏窗格路径）与鼠标命中测试
+ * 【必须共用这一个判据】，否则会出现「窗格窄到不画滚动条、却仍能拖它」——
+ * 用户看到的就是「滚动条没了」（2026-09-20 报：窗格 <=6 列时消失）。
+ * cols 传该窗格用来画滚动条的那一列所属的宽度（分屏 = pane 的 cols，
+ * 单窗格 = host_cols）；in_alt_screen 传 s->in_alt_screen。 */
+int render_sb_cols_ok(int cols, int in_alt_screen);
+
+/* 滚动条要【让开】的那一行（0 基 pane 行号），-1 = 不用让。
+ * 滚动条是覆盖 pane 右缘内列画的；VT 的自动换行是延迟的（在最后一列写完一个字，
+ * 光标要等下一个字才换行），所以光标停在最后一列时正好压在滚动条那一格上 ——
+ * 刚敲的字被滚动条的空格盖掉，光标看着像卡住不动（2026-09-20 用户报）。
+ * 光标正落在右缘列时那一行不画滚动条，让刚敲的字始终可见。 */
+int render_sb_spare_row(int cursor_visible, int cursor_x, int cursor_y, int cols);
+
 void render_cleanup(void);
 
 #endif // WIN_TERMUX_RENDER_H

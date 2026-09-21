@@ -47,6 +47,12 @@ f_prev = extract_func(src, "void search_jump_prev(void)")
 if not f_prev:
     sys.exit("FAIL: search_jump_prev not found in src/input.c")
 
+# run_search 用 is_wide_cp 识别宽字符的次格（UnicodeChar==0），所以把真身也抽进来。
+utf8_src = (ROOT / "src" / "utf8.c").read_text(encoding="utf-8")
+f_wide = extract_func(utf8_src, "int is_wide_cp(unsigned int cp)")
+if not f_wide:
+    sys.exit("FAIL: is_wide_cp not found in src/utf8.c")
+
 PRELUDE = r"""
 #include <stdio.h>
 #include <stdlib.h>
@@ -152,12 +158,36 @@ int g_search_case_sensitive = 0;
 static inline void EnterCriticalSection(void *cs) { (void)cs; }
 static inline void LeaveCriticalSection(void *cs) { (void)cs; }
 
+/* 真正的 UTF-8 -> UTF-16。ASCII 与旧的 Latin-1 stub 逐字节等价，另外让 CJK /
+ * emoji 查询串能被正确解码，从而测到宽字符相关的搜索路径。 */
 static inline int MultiByteToWideChar(unsigned int cp, unsigned long flags, const char *src, int src_len, WCHAR *dst, int dst_len) {
     (void)cp; (void)flags;
     if (src_len < 0) src_len = (int)strlen(src);
-    int count = 0;
-    for (int i = 0; i < src_len && count < dst_len; i++) {
-        dst[count++] = (unsigned char)src[i];
+    int count = 0, i = 0;
+    while (i < src_len && count < dst_len) {
+        unsigned char c = (unsigned char)src[i];
+        unsigned int v; int extra;
+        if (c < 0x80)               { v = c;          extra = 0; }
+        else if ((c & 0xE0) == 0xC0){ v = c & 0x1Fu;  extra = 1; }
+        else if ((c & 0xF0) == 0xE0){ v = c & 0x0Fu;  extra = 2; }
+        else if ((c & 0xF8) == 0xF0){ v = c & 0x07u;  extra = 3; }
+        else { dst[count++] = 0xFFFD; i++; continue; }
+        if (i + extra >= src_len + 0 && extra > src_len - i - 1 + 1) { dst[count++] = 0xFFFD; break; }
+        int ok = 1;
+        for (int k = 1; k <= extra; k++) {
+            if (i + k >= src_len || ((unsigned char)src[i + k] & 0xC0) != 0x80) { ok = 0; break; }
+            v = (v << 6) | ((unsigned char)src[i + k] & 0x3Fu);
+        }
+        if (!ok) { dst[count++] = 0xFFFD; i++; continue; }
+        i += extra + 1;
+        if (v > 0xFFFF) {                       /* 补充平面：拆成代理对，与 Windows 一致 */
+            unsigned int t = v - 0x10000u;
+            if (count + 2 > dst_len) break;
+            dst[count++] = (WCHAR)(0xD800u + (t >> 10));
+            dst[count++] = (WCHAR)(0xDC00u + (t & 0x3FFu));
+        } else {
+            dst[count++] = (WCHAR)v;
+        }
     }
     return count;
 }
@@ -284,6 +314,70 @@ int main(void) {
         execute_search();
     }
 
+    // ---- 宽字符（次格 UnicodeChar==0）回归 -------------------------------
+    // 引擎里宽字占两格：主格存码点、次格存 0。旧版按物理列逐格比较，查询串的
+    // 第二个字符会撞上次格的 0，于是「中文」这类跨宽字的多字词永远匹配不上
+    // （单字「中」却能中）。这里把两种排布都钉死。
+    {
+        // 行 60: X a 中(占2格) b Y
+        int ar60 = 60;
+        int pr60 = (s->scroll_top - s->hist_lines + ar60 + s->total_lines * 2) % s->total_lines;
+        s->lines[pr60].cells = (CHAR_INFO *)calloc(s->cols, sizeof(CHAR_INFO));
+        assert(s->lines[pr60].cells);
+        unsigned short row60[] = { 'X', 'a', 0x4E2D, 0, 'b', 'Y' };
+        for (int i = 0; i < 6; i++) s->lines[pr60].cells[i].Char.UnicodeChar = (WCHAR)row60[i];
+
+        // 行 70: 中 文 测 试（各占 2 格，次格为 0）
+        int ar70 = 70;
+        int pr70 = (s->scroll_top - s->hist_lines + ar70 + s->total_lines * 2) % s->total_lines;
+        s->lines[pr70].cells = (CHAR_INFO *)calloc(s->cols, sizeof(CHAR_INFO));
+        assert(s->lines[pr70].cells);
+        unsigned short row70[] = { 0x4E2D,0, 0x6587,0, 0x6D4B,0, 0x8BD5,0 };
+        for (int i = 0; i < 8; i++) s->lines[pr70].cells[i].Char.UnicodeChar = (WCHAR)row70[i];
+
+        g_search_case_sensitive = 0;
+
+        strcpy(g_search_buf, "\xe4\xb8\xad\xe6\x96\x87");   // "中文"
+        g_search_len = (int)strlen(g_search_buf);
+        execute_search();
+        assert(g_search_match_count == 1);                      // 旧版这里是 0
+        assert(g_search_matches[0].abs_y == 70);
+        assert(g_search_matches[0].start_x == 0);
+        assert(g_search_matches[0].end_x == 3);                 // 含「文」的次格
+
+        strcpy(g_search_buf, "\xe6\x96\x87\xe6\xb5\x8b");   // "文测"（跨两个宽字）
+        g_search_len = (int)strlen(g_search_buf);
+        execute_search();
+        assert(g_search_match_count == 1);
+        assert(g_search_matches[0].start_x == 2);
+        assert(g_search_matches[0].end_x == 5);
+
+        /* C 的 \x 转义是贪婪的："\xe4\xb8\xadb" 会把 b 当十六进制位吃掉（0xADB），
+         必须用字符串拼接断开。 */
+        strcpy(g_search_buf, "\xe4\xb8\xad" "b");          // "中b"（宽字在词首）
+        g_search_len = (int)strlen(g_search_buf);
+        execute_search();
+        assert(g_search_match_count == 1);                      // 旧版这里是 0
+        assert(g_search_matches[0].abs_y == 60);
+        assert(g_search_matches[0].start_x == 2);
+        assert(g_search_matches[0].end_x == 4);
+
+        strcpy(g_search_buf, "a\xe4\xb8\xad");                  // "a中"（宽字在词尾）
+        g_search_len = (int)strlen(g_search_buf);
+        execute_search();
+        assert(g_search_match_count == 1);
+        assert(g_search_matches[0].start_x == 1);
+        assert(g_search_matches[0].end_x == 3);
+
+        strcpy(g_search_buf, "\xf0\x9f\x8e\x89");             // "🎉"：屏幕上没有，必须 0 命中
+        g_search_len = (int)strlen(g_search_buf);
+        execute_search();
+        assert(g_search_match_count == 0);
+
+        free(s->lines[pr60].cells);
+        free(s->lines[pr70].cells);
+    }
+
     free(s->lines[pr10].cells);
     free(s->lines[pr50].cells);
     free(s->lines[pr95].cells);
@@ -293,7 +387,7 @@ int main(void) {
 }
 """
 
-C_SEARCH_TEST_CODE = PRELUDE + "\n" + f_search + "\n" + f_next + "\n" + f_prev + "\n" + DRIVER
+C_SEARCH_TEST_CODE = PRELUDE + "\n" + f_wide + "\n" + f_search + "\n" + f_next + "\n" + f_prev + "\n" + DRIVER
 
 def main():
     print("=== Scrollback History Search Test (verify_search.py) ===")

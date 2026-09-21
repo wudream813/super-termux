@@ -41,6 +41,9 @@ CHECKS = (
     "verify_wide_wrap.py",
     "verify_framediff_oom.py",
     "verify_split.py",
+    "verify_resize_history.py",
+    "verify_scrollbar.py",
+    "verify_search_refresh.py",
 )
 
 
