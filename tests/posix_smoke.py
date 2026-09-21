@@ -115,22 +115,57 @@ def main():
 
     prev_total = [0]
 
-    def step(label, keys, wait=1.0):
+    # ★ 原来这里是固定 sleep(wait) 然后读一帧。快机器上没问题，但 CI 的 macOS
+    #   runner（虚拟化共享核，起一个 bash + 渲染一帧都慢一截）上会【采样太早】：
+    #   操作其实成功了、只是还没渲染出来，于是断言全红，而下一步又能看到上一步
+    #   的结果 —— 帧数永远滞后一拍。第三轮 CI 就是这个形态。
+    #   改成【等到本步的断言真的满足】为止，超时才判失败：测试不再依赖机器速度。
+    #   注意不能只等「帧数增加」—— 启动阶段本来就在出帧，那样第一步会立刻返回、
+    #   还没等到命令回显（我自己先踩了这一次）。
+    FRAME_TIMEOUT = float(os.environ.get("TERMUX_SMOKE_FRAME_TIMEOUT", "10"))
+
+    def step(label, keys, wait=1.0, checks=()):
         drain(0.05)
+        _, base = decode(dump, COLS)          # 发键之前的帧数
         if keys:
             os.write(master, keys)
-        drain(wait)
+
+        def pending(g):
+            """还没满足的正向断言。None 是「必须消失」类，交给后面单独判。"""
+            out = []
+            for name, needle in checks:
+                if needle is None:
+                    # 「必须消失」类断言也要等：否则 Esc 之后立刻采样，徽章还在。
+                    # 这个剧本里唯一的一条是复制模式徽章。
+                    if "消失" in name and "[复制模式 " in g:
+                        out.append(name)
+                    continue
+                if name.startswith("标签栏变成两个标签"):
+                    if g.count("\u00d7") < 2:
+                        out.append(name)
+                elif needle not in g:
+                    out.append(name)
+            return out
+
+        # ★ 除了等断言满足，还要等【至少出一个新帧】。否则那些只有「必须消失」
+        #   类断言（或压根没断言）的步骤会立刻采样 —— 断言碰巧被上一帧满足就
+        #   蒙过去了，下一步才看到这一步的结果，帧数永远滞后一拍。
+        deadline = time.time() + max(wait, FRAME_TIMEOUT)
         grid, total = decode(dump, COLS)
+        while (pending(grid) or total <= base) and time.time() < deadline and p.poll() is None:
+            drain(0.1)
+            grid, total = decode(dump, COLS)
         print("\n[%s] 帧数=%d" % (label, total))
-        # ★ 诊断：帧数没涨 = 应用【停止渲染】了（卡死或崩溃）。CI 的 macOS 作业
-        #   就是从这里开始一路红到底，但日志里只有「帧里没有 XXX」，看不出是
-        #   渲染停了还是内容不对。把进程状态和帧数变化直接打出来。
-        if total <= prev_total[0]:
+        # ★ 诊断：帧数没涨 = 应用停止渲染了（卡死或崩溃）。日志里只有「帧里没有
+        #   XXX」时看不出是渲染停了还是内容不对，把进程状态直接打出来。
+        if total <= base:
             rc = p.poll()
-            print("  [警告] 帧数没增加（%d -> %d）：应用已停止渲染。进程状态=%s"
-                  % (prev_total[0], total,
-                     "还活着（卡死）" if rc is None else "已退出，退出码=%s" % rc))
-        prev_total[0] = total
+            # 措辞要留余地：帧数没涨【可能】是卡死，也可能只是这一步没触发重绘。
+            # 第三轮 CI 上它就是「慢」而不是「死」—— 下一步又能看到上一步的结果。
+            print("  [警告] 等了 %.1fs 帧数仍没增加（%d -> %d）。进程状态=%s"
+                  "（可能卡死，也可能这一步没触发重绘）"
+                  % (max(wait, FRAME_TIMEOUT), base, total,
+                     "还活着" if rc is None else "已退出，退出码=%s" % rc))
         return grid, total
 
     # 剧本：(标签, 发送的字节, 等待秒, [(断言名, 必须出现的子串)])
@@ -171,7 +206,7 @@ def main():
     drain(1.5)                      # 等 shell 起来
     prev_grid = None
     for label, keys, wait, checks in script:
-        grid, total = step(label, keys, wait)
+        grid, total = step(label, keys, wait, checks)
         if grid is None:
             ck("%s：能解码渲染帧" % label, False)
             continue
@@ -204,14 +239,16 @@ def main():
     #   g_mux.running 那个检查 —— 表现成「SIGTERM 杀不掉」，其实是测试自己不读。
     p.send_signal(15)
     try:
-        deadline = time.time() + 5
+        # ★ 5 秒在慢机器上不够：退出要对每个 pane 调 plat_thread_join(2000ms)，
+        #   这个剧本跑完已经有 3 个 pane + 2 个标签页。给 25 秒。
+        deadline = time.time() + 25
         while p.poll() is None and time.time() < deadline:
             drain(0.05)
         if p.poll() is not None:
             ck("SIGTERM 后正常退出（不是被 kill -9）",
                p.returncode in (0, -15, 143), "rc=%s" % p.returncode)
         else:
-            raise subprocess.TimeoutExpired(EXE, 5)
+            raise subprocess.TimeoutExpired(EXE, 25)
     except subprocess.TimeoutExpired:
         if os.environ.get("TERMUX_SMOKE_GDB"):
             print("  卡住了，gdb 抓栈：")
@@ -224,7 +261,7 @@ def main():
                 print("  gdb 失败：%s" % e)
         p.kill()
         p.wait(timeout=5)
-        ck("SIGTERM 后正常退出（不是被 kill -9）", False, "5 秒没退，只能 kill -9")
+        ck("SIGTERM 后正常退出（不是被 kill -9）", False, "25 秒没退，只能 kill -9")
     os.close(master)
 
     # 退出后宿主终端的状态：进程结束时写过 restore 序列，最后一个非空帧之后
