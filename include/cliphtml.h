@@ -31,7 +31,13 @@ typedef struct {
 void cliphtml_init(ClipHtmlBuf *b);
 void cliphtml_free(ClipHtmlBuf *b);
 
-/* 片段构建：begin 一次，每行先 frag_break 再 frag_row（首行除外），最后 finalize。 */
+/* 片段构建：begin 一次，每行先 frag_break 再 frag_row（首行除外），最后 finalize。
+ *
+ * ★ 契约：调用 cliphtml_frag_begin() 之前【必须】先 cliphtml_init()。
+ *   frag_begin 直接就往缓冲区里写，它不负责初始化；漏了 init 的话 b->data 是
+ *   调用方栈上的垃圾值，buf_reserve 会去 realloc 那个指针 —— Linux 上新栈页
+ *   恰好是 0（realloc(NULL,..) 等价 malloc）所以看不出来，换个平台就是
+ *   "attempting free on address which was not malloc()-ed"。 */
 void cliphtml_frag_begin(ClipHtmlBuf *b);
 void cliphtml_frag_break(ClipHtmlBuf *b);   /* 行间换行（<pre> 内即换行） */
 /* 追加一行；cells[x0..x1] 为有效区间，x1 < x0 表示空行。同色相邻 cell 自动

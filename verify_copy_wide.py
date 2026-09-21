@@ -75,7 +75,14 @@ int main(void) {
 
     int pr = screen_phys_row(&s, 0);
     ClipHtmlCell cells[64];
-    ClipHtmlBuf h; cliphtml_frag_begin(&h);
+    /* ★ 必须先 cliphtml_init。cliphtml_frag_begin() 直接往 b 里 buf_puts，
+     * 它【不】负责初始化 —— b->data / b->cap 是调用方的责任（生产代码
+     * src/input.c:1504 就是先 cliphtml_init 再 frag_begin）。这里原来漏了，
+     * b 是未初始化的栈变量，buf_reserve 就去 realloc 一个栈上的垃圾指针：
+     * Linux 上新栈页恰好是 0（realloc(NULL,..) == malloc）所以侥幸过，
+     * macOS 栈上是垃圾，ASan 直接报 "attempting free on address which was
+     * not malloc()-ed"。CI 的 macOS 作业抓出来的。 */
+    ClipHtmlBuf h; cliphtml_init(&h); cliphtml_frag_begin(&h);
     /* 纯文本收集：与 input.c 一致，宽占位格 continue，CJK 用 '?' 占位计数 */
     char text[256]; int tl=0;
     int x0=0, x1=39, valid=x0-1;
