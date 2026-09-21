@@ -41,6 +41,24 @@ FAILS = []
 PREFIX = b"\x02"          # Ctrl+B
 
 
+def expected_shell():
+    """和 src/platform_posix.c:plat_default_shell() 同一套解析：
+    $SHELL -> passwd 里的登录 shell -> /bin/sh。
+
+    ★ 不能硬编码 "bash"。GNU make 会把 SHELL 强制设成 /bin/sh 传给 recipe，
+      所以「经 make smoke-posix 跑」和「直接在交互 shell 里跑」拿到的默认 shell
+      是不一样的 —— 这条断言在本地绿、在 CI 上红，就是这个原因。这条断言真正
+      要钉的是「没写死 cmd.exe」，不是「必须叫 bash」。"""
+    sh = os.environ.get("SHELL") or ""
+    if not sh:
+        try:
+            import pwd
+            sh = pwd.getpwuid(os.getuid()).pw_shell or ""
+        except Exception:
+            sh = ""
+    return os.path.basename(sh or "/bin/sh")
+
+
 def ck(name, cond, extra=""):
     if cond:
         print("  [ok]   %s" % name)
@@ -112,7 +130,7 @@ def main():
     script = [
         ("启动 + 命令回显", b"echo TERMUX_POSIX_OK\r", 1.0,
          [("命令回显出现", "TERMUX_POSIX_OK"),
-          ("标签栏显示 shell 名（不是 cmd）", "bash")]),
+          ("标签栏显示 shell 名（%s，不是 cmd）" % expected_shell(), expected_shell())]),
         ("复制模式 Ctrl+B [", PREFIX + b"[", 0.8,
          [("出现复制模式提示", "[复制模式 ")]),
         ("退出复制模式 Esc", b"\x1b", 0.6,

@@ -45,7 +45,11 @@ static double now_sec(void) {
 int plat_write_fd(HANDLE h, const char *buf, int len);
 
 #define NBYTES 20000
-#define STALL  "1"          /* 子进程不排空的秒数，必须 < WRITE_WAIT_MS(1000) */
+/* 子进程不排空的秒数。★ 必须【明显小于】WRITE_WAIT_MS，否则判据变成赛跑：
+ * 以前这里是 "1" 而预算是 1000ms —— 正好相等，Linux 侥幸赢、macOS 输
+ * （它的 pty 缓冲只有 ~1KB，必须实打实等满那 1 秒）。现在预算 5000ms，
+ * 停顿 2 秒，留出 2.5 倍余量。 */
+#define STALL  "2"
 
 int main(void) {
     const char *out = "/tmp/termux_wb_test.out";
@@ -140,8 +144,9 @@ int main(void) {
     } else {
         printf("  [ok]   子进程收到全部 %d 字节，一个没丢\n", NBYTES);
     }
-    if (el < 0.8) {
-        printf("  [FAIL] 只用了 %.2fs —— 说明根本没等子进程排空（判据失效）\n", el);
+    if (el < atof(STALL) * 0.8) {
+        printf("  [FAIL] 只用了 %.2fs（停顿是 %ss）—— 说明根本没等子进程排空（判据失效）\n",
+               el, STALL);
         fails++;
     } else {
         printf("  [ok]   确实等待了子进程的 %.2fs 停顿（%.2fs）\n", atof(STALL), el);

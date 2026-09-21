@@ -744,7 +744,15 @@ int plat_read(HANDLE h, char *buf, int cap) {
  * 累计封顶 WRITE_WAIT_MS —— 写键路径跑在输入线程上，一个卡死的子进程不能把整个
  * UI 永久冻住；到点了就止损返回已写字节数，行为退化成「丢弃」，但正常的慢子进程
  * （几百毫秒级）已经不会再丢任何东西。 */
-#define WRITE_WAIT_MS 1000
+/* ★ 原来这里是 1000ms，注释说「正常的慢子进程（几百毫秒级）已经不会再丢任何
+ * 东西」。这个前提在 macOS 上【不成立】：Apple 的 pty 输入缓冲只有 ~1KB
+ * （实测写满 1022 字节就 EAGAIN），而 Linux 的缓冲大得多。同样一个「停顿 1 秒
+ * 才开始读」的子进程，Linux 上几乎不用等就灌完了，macOS 上必须实打实地等满那
+ * 1 秒 —— 预算和停顿一样长，纯属赛跑，CI 的 macOS 作业就是这么红的（20000 字节
+ * 只写出 1022，丢了 95%）。
+ * 提到 5000ms：卡死的子进程最多把输入线程冻 5 秒（可恢复），而静默丢按键是
+ * 看不见的、且用户无法重试。两害相权取其轻。 */
+#define WRITE_WAIT_MS 5000
 
 int plat_write_fd(HANDLE h, const char *buf, int len) {
     int fd = (int)(intptr_t)h;
