@@ -513,7 +513,10 @@ void close_pane(int idx) {
 #endif
     plat_thread_join(&pane->read_thread, 2000);
     plat_proc_close(&pane->process, &pane->pipe_in, &pane->pipe_out);
-    pane->hpc = NULL_HANDLE;
+    /* hpc 是 HPCON（void*），必须用 NULL。写 NULL_HANDLE（= (HANDLE)0，整数 0）
+     * 在 clang 下会触发 -Wnon-literal-null-conversion；gcc 不报，所以这个警告
+     * 只有 macOS 作业能抓到。 */
+    pane->hpc = NULL;
     pane->thread = NULL_HANDLE;
 
     EnterCriticalSection(&g_mux.cs);

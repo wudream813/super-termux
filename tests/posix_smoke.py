@@ -34,7 +34,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 可用环境变量换二进制（比如带 -g -O0 的调试版）；卡住时设 TERMUX_SMOKE_GDB=1
 # 会在 kill 之前先 gdb 抓一份全线程栈 —— 死锁这类问题只能这么看。
 EXE = os.environ.get("TERMUX_SMOKE_EXE", os.path.join(ROOT, "termux-linux"))
-FRAME2TXT = os.path.join(os.path.dirname(ROOT), "tools", "frame2txt.py")
+FRAME2TXT = os.path.join(ROOT, "tools", "frame2txt.py")
 
 COLS, ROWS = 100, 24
 FAILS = []

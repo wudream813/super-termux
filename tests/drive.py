@@ -20,7 +20,7 @@ import termios
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FRAME2TXT = os.path.join(os.path.dirname(ROOT), "tools", "frame2txt.py")
+FRAME2TXT = os.path.join(ROOT, "tools", "frame2txt.py")
 EXE = os.environ.get("TERMUX_SMOKE_EXE", os.path.join(ROOT, "termux-linux"))
 
 

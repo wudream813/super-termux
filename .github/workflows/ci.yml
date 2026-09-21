@@ -31,6 +31,11 @@ jobs:
     defaults:
       run:
         shell: msys2 {0}
+    env:
+      # verify_port.py 的断言标签是中文。Windows 上 Python 默认用控制台代码页
+      # (cp437/cp936) 编码 stdout，会抛 UnicodeEncodeError 把整个检查搞挂。
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -94,6 +99,18 @@ jobs:
           test -f termux.exe   || { echo "::error::没产出 termux.exe"; exit 1; }
           test -f termux-linux || { echo "::error::没产出 termux-linux"; exit 1; }
           file termux-linux | grep -q ELF || { echo "::error::termux-linux 不是 ELF"; exit 1; }
+
+      - name: 用 clang 再编一遍（Linux 版）
+        # clang 比 gcc 严格：-Wself-assign、-Wnon-literal-null-conversion 这些
+        # gcc 一声不吭。macOS 作业用的就是 clang，在这里先跑一遍，Linux 上的
+        # 改动不用等 macOS 作业才知道会不会挂。
+        run: |
+          sudo apt-get install -y clang
+          make -B POSIX_CC=clang linux 2>&1 | tee build-clang.log
+          if grep -n "error:\|warning:" build-clang.log; then
+            echo "::error::clang 构建产生了诊断信息，见上"; exit 1
+          fi
+          echo "[ok] clang 0 error / 0 warning"
 
       - name: darwin 目标在非 macOS 上必须拒绝
         # Makefile 里有 uname -s 护栏。不拦的话它会【成功】编出一个改名叫

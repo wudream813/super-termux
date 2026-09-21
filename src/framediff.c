@@ -213,7 +213,6 @@ void framediff_scan(FrameDiff *fd, const char *buf, size_t len) {
 
 size_t framediff_emit(FrameDiff *fd, char *out, size_t out_cap) {
     size_t pos = 0;
-    if (out) out_cap = out_cap;  /* 调用方保证 out 足够 */
 
     /* 第一次调用（out == NULL）：规划脏行并更新影子；第二次（out != NULL）：
      * 按已标记的脏行输出，不再比对。 */

@@ -81,7 +81,7 @@ done
 # （拆开后每行最多一个日期），必须直接看末态逐行 —— 见 tools/check_dir_records.py。
 echo "=== 3b) dir 记录不得被拆开（末态逐行判据）==="
 for k in 771 776 780; do
-    if python3 ../tools/check_dir_records.py "$BIN" "$V2" 59 29 \
+    if python3 tools/check_dir_records.py "$BIN" "$V2" 59 29 \
             SPLIT=$k MID=24 SEQ=82 > /tmp/dircheck.txt 2>&1; then
         sed 's/^/  /' /tmp/dircheck.txt; echo "  [ok] SPLIT=$k"
     else
@@ -95,7 +95,7 @@ done
 # 晚上报的「还是有多余空格」），修复后 0 处。
 echo "=== 3c) v1 忠实切点：dir 记录不得被拆开 ==="
 for k in 1247 1260 1280 1300; do
-    if python3 ../tools/check_dir_records.py "$BIN" "$V1" 59 32 \
+    if python3 tools/check_dir_records.py "$BIN" "$V1" 59 32 \
             SPLIT=$k MID=19 SEQ=70 > /tmp/dircheck.txt 2>&1; then
         sed 's/^/  /' /tmp/dircheck.txt; echo "  [ok] SPLIT=$k"
     else
@@ -112,7 +112,7 @@ done
 echo "=== 3d) v3 多步交错回放（真机链 120->59->19->80->103）==="
 for st in "212:59,1153:19,7589:80,8238:103" "212:59,1146:19,7589:80,8238:103" \
           "0:59,1153:19,7589:80,8238:103"; do
-    if python3 ../tools/check_dir_records.py "$BIN" "$V3" 120 29 \
+    if python3 tools/check_dir_records.py "$BIN" "$V3" 120 29 \
             STEPS="$st" > /tmp/dircheck.txt 2>&1; then
         sed 's/^/  /' /tmp/dircheck.txt; echo "  [ok] STEPS=$st"
     else
@@ -122,7 +122,7 @@ done
 
 echo "=== 4) 探测器自检（对已知坏代码必须报 FAIL，否则上面的 PASS 不可信）==="
 TMPVT=/tmp/vt_cup_regress.c
-python3 ../tools/make_cup_regress_vt.py src/vt.c "$TMPVT"
+python3 tools/make_cup_regress_vt.py src/vt.c "$TMPVT"
 BADBIN=/tmp/verify_cascade_probe_bad
 gcc -O1 -Itests/stub -Iinclude tests/cascade_probe.c \
     src/screen.c "$TMPVT" src/utf8.c src/theme.c -o "$BADBIN"
@@ -134,7 +134,7 @@ esac
 
 echo "=== 5) reanchor 自检（快照丢 wrap 标志的坏变体必须报 FAIL）==="
 TMPSC=/tmp/screen_reanchor_regress.c
-python3 ../tools/make_reanchor_regress_screen.py src/screen.c "$TMPSC"
+python3 tools/make_reanchor_regress_screen.py src/screen.c "$TMPSC"
 BADBIN2=/tmp/verify_cascade_probe_bad2
 gcc -O1 -Itests/stub -Iinclude tests/cascade_probe.c \
     "$TMPSC" src/vt.c src/utf8.c src/theme.c -o "$BADBIN2"
@@ -147,11 +147,11 @@ rm -f "$TMPSC" "$BADBIN2"
 
 echo "=== 6) bug#18 自检（去掉新底行续行规则后，末态判据必须报 FAIL）==="
 TMPVT2=/tmp/vt_eolcont_regress.c
-python3 ../tools/make_eolcont_regress_vt.py src/vt.c "$TMPVT2"
+python3 tools/make_eolcont_regress_vt.py src/vt.c "$TMPVT2"
 BADBIN3=/tmp/verify_cascade_probe_bad3
 gcc -O1 -Itests/stub -Iinclude tests/cascade_probe.c \
     src/screen.c "$TMPVT2" src/utf8.c src/theme.c -o "$BADBIN3"
-if python3 ../tools/check_dir_records.py "$BADBIN3" "$V2" 59 29 \
+if python3 tools/check_dir_records.py "$BADBIN3" "$V2" 59 29 \
         SPLIT=771 MID=24 SEQ=82 > /tmp/eolcont_selfcheck.txt 2>&1; then
     echo "  [FAIL] 去掉修复后判据仍然 PASS —— 判据无效"
     cat /tmp/eolcont_selfcheck.txt
@@ -163,11 +163,11 @@ rm -f "$TMPVT2" "$BADBIN3" /tmp/eolcont_selfcheck.txt /tmp/dircheck.txt
 
 echo "=== 7) CSI 自检（把「CSI 一律作废判定窗口」改回去后，v3 必须报 FAIL）==="
 TMPVT3=/tmp/vt_csi_regress.c
-python3 ../tools/make_csi_regress_vt.py src/vt.c "$TMPVT3"
+python3 tools/make_csi_regress_vt.py src/vt.c "$TMPVT3"
 BADBIN4=/tmp/verify_cascade_probe_bad4
 gcc -O1 -Itests/stub -Iinclude tests/cascade_probe.c \
     src/screen.c "$TMPVT3" src/utf8.c src/theme.c -o "$BADBIN4"
-if python3 ../tools/check_dir_records.py "$BADBIN4" "$V3" 120 29 \
+if python3 tools/check_dir_records.py "$BADBIN4" "$V3" 120 29 \
         STEPS="212:59,1153:19,7589:80,8238:103" > /tmp/csicheck.txt 2>&1; then
     echo "  [FAIL] 改回无条件作废后判据仍然 PASS —— 判据无效"
     cat /tmp/csicheck.txt
@@ -186,7 +186,7 @@ rm -f "$TMPVT3" "$BADBIN4" /tmp/csicheck.txt
 V6STEPS="206:59,2644:67,4179:36,4993:61,5884:5,5884:92"
 V6NDL="better_explorer.exe,conpty_source.log,dwm-topmost-x64.zip,EXPR.exe,liquidbounce b100.jar,luogu-markdown-editor-1.2.19.vsix,OpenArk64.exe,release_v18.zip,typst-latex-studio.html"
 echo "=== 8) v6 两趟 resize 重绘（真机链 120->59->67->36->61->5->92）==="
-if python3 ../tools/check_prompt_bottom.py "$BIN" "$V6" 120 29 \
+if python3 tools/check_prompt_bottom.py "$BIN" "$V6" 120 29 \
         STEPS="$V6STEPS" NEEDLES="$V6NDL" > /tmp/v6check.txt 2>&1; then
     sed 's/^/  /' /tmp/v6check.txt; echo "  [ok] STEPS=$V6STEPS"
 else
@@ -195,11 +195,11 @@ fi
 
 echo "=== 9) 两趟重绘自检（把修复撤回后，v6 必须报 FAIL）==="
 TMPVT4=/tmp/vt_repass_regress.c
-python3 ../tools/make_repass_regress_vt.py src/vt.c "$TMPVT4"
+python3 tools/make_repass_regress_vt.py src/vt.c "$TMPVT4"
 BADBIN5=/tmp/verify_cascade_probe_bad5
 gcc -O1 -Itests/stub -Iinclude tests/cascade_probe.c \
     src/screen.c "$TMPVT4" src/utf8.c src/theme.c -o "$BADBIN5"
-if python3 ../tools/check_prompt_bottom.py "$BADBIN5" "$V6" 120 29 \
+if python3 tools/check_prompt_bottom.py "$BADBIN5" "$V6" 120 29 \
         STEPS="$V6STEPS" NEEDLES="$V6NDL" > /tmp/v6self.txt 2>&1; then
     echo "  [FAIL] 撤回修复后判据仍然 PASS —— 判据无效"
     cat /tmp/v6self.txt
