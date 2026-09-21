@@ -67,9 +67,17 @@ jobs:
           sha256sum "termux-${V}-windows-x64.exe" > "termux-${V}-windows-x64.exe.sha256"
           cat "termux-${V}-windows-x64.exe.sha256"
 
+      - name: 生成发布说明（从 README 的「版本历史」抽，避免和 README 脱钩）
+        run: |
+          V=$(sed -n 's/.*#define TERMUX_VERSION "\([^"]*\)".*/\1/p' include/common.h)
+          # 抽不到会【非零退出】，宁可发布失败也不发空正文的 Release
+          python tools/release_notes.py "$V" > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.REL_TAG }}
+          body_path: RELEASE_NOTES.md
           files: |
             termux-*-windows-x64.exe
             termux-*-windows-x64.exe.sha256
@@ -123,9 +131,17 @@ jobs:
           sha256sum "termux-${V}-linux-x64" > "termux-${V}-linux-x64.sha256"
           cat "termux-${V}-linux-x64.sha256"
 
+      - name: 生成发布说明（从 README 的「版本历史」抽，避免和 README 脱钩）
+        run: |
+          V=$(sed -n 's/.*#define TERMUX_VERSION "\([^"]*\)".*/\1/p' include/common.h)
+          # 抽不到会【非零退出】，宁可发布失败也不发空正文的 Release
+          python3 tools/release_notes.py "$V" > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.REL_TAG }}
+          body_path: RELEASE_NOTES.md
           files: |
             termux-*-linux-x64
             termux-*-linux-x64.sha256
@@ -174,9 +190,17 @@ jobs:
           shasum -a 256 "termux-${V}-macos-${ARCH}" > "termux-${V}-macos-${ARCH}.sha256"
           cat "termux-${V}-macos-${ARCH}.sha256"
 
+      - name: 生成发布说明（从 README 的「版本历史」抽，避免和 README 脱钩）
+        run: |
+          V=$(sed -n 's/.*#define TERMUX_VERSION "\([^"]*\)".*/\1/p' include/common.h)
+          # 抽不到会【非零退出】，宁可发布失败也不发空正文的 Release
+          python3 tools/release_notes.py "$V" > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.REL_TAG }}
+          body_path: RELEASE_NOTES.md
           files: |
             termux-*-macos-*
           fail_on_unmatched_files: true

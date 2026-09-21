@@ -319,6 +319,31 @@ if _ver:
     ck("README 的当前版本和源码一致", _m is not None and _m.group(1) == _v,
        "README 写的是 v%s，源码是 v%s" % (_m.group(1) if _m else "?", _v))
 
+# --- Release 正文必须抽得到（否则发出来是空正文的 Release）------------------
+# release.yml 的 body 由 tools/release_notes.py 从 README 的「版本历史」里抽。
+# 这里静态验三件事：脚本在、当前版本抽得到、抽不到的时候确实返回 None。
+print()
+print("=== 8b) Release 发布说明 ===")
+_rn_path = ROOT / "tools" / "release_notes.py"
+ck("tools/release_notes.py 存在", _rn_path.is_file())
+if _rn_path.is_file() and _ver:
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_relnotes", str(_rn_path))
+    _rn = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_rn)
+
+    _body = _rn.extract(_rd, _v)
+    ck("README 里抽得到 v%s 的发布说明" % _v, bool(_body))
+    # 反向：版本历史里不存在的版本号必须抽不到。
+    # 这一条钉住的是「不能把开头的『当前版本：**vX**』当成版本说明抓走」——
+    # release_notes.py 第一版如果全文搜 **vX** 就会在这里露馅。
+    ck("不存在的版本号抽不到（没被「当前版本」那行骗到）",
+       _rn.extract(_rd, "99.99.99") is None)
+
+    _rw = _re.findall(r"body_path:\s*(\S+)", read(".", ".github", "workflows", "release.yml"))
+    ck("release.yml 三个作业都设了 body_path（%d 处）" % len(_rw), len(_rw) == 3,
+       "找到 %d 处" % len(_rw))
+
 # ===========================================================================
 # 自证：故意把一条断言的条件取反，必须失败。
 print("=== 9) 自证 ===")

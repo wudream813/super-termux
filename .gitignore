@@ -32,3 +32,4 @@ third_party/OpenConsole.exe
 
 # 运行时生成的用户配置
 termux.ini
+RELEASE_NOTES.md
