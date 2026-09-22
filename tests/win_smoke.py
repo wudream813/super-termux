@@ -24,6 +24,7 @@
 """
 import io
 import os
+import subprocess
 import re
 import sys
 
@@ -74,6 +75,22 @@ def main():
     if not os.path.exists(cd.EXE):
         print("[FAIL] 找不到 %s，先 make CC=gcc CXX=g++ all" % cd.EXE)
         return 1
+
+    # ★★★ 裸跑一次 exe（不经 ConPTY），把 stdout/stderr/退出码都抓下来。
+    #   目的：区分「exe 本身有问题」和「exe 没问题但挂到 ConPTY 上就挂」。
+    #   GitHub Actions 的 Windows runner 没有交互控制台，所以 main.c:166 那条
+    #   "termux: no console attached" 正是【期望】结果 —— 如果这里能拿到这句话，
+    #   就证明二进制能加载、能跑到 main，失败点在 ConPTY 挂载那一层。
+    try:
+        pr = subprocess.run([cd.EXE], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            timeout=10, cwd=os.path.dirname(cd.EXE) or ".")
+        print("  裸跑: exit=%s  stdout=%r  stderr=%r"
+              % (pr.returncode, pr.stdout[:120], pr.stderr[:120]))
+    except subprocess.TimeoutExpired as ex:
+        print("  裸跑: 超时10s（说明它进了 TUI 在等输入）stdout=%r stderr=%r"
+              % ((ex.stdout or b"")[:120], (ex.stderr or b"")[:120]))
+    except OSError as ex:
+        print("  裸跑: OSError %s" % ex)
 
     t = cd.Term(cols=100, rows=30)
     box["t"] = t

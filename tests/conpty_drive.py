@@ -284,11 +284,23 @@ class Term(drive.Term):
         #   exit_code=1」，而 main() 里 return 1 的两处（"no console attached" /
         #   "cannot query console buffer"）都写 stderr —— 不看字节根本没法区分
         #   是启动就失败、还是渲染了一半崩掉。
-        head = self.raw[:200]
+        # ★ mouse_dump.log 由 src/main.c:197-203 写出，位置正好在【那两个 return 1 之后】
+        #   （main.c:168 "no console attached" / :174 "cannot query console buffer"）。
+        #   所以它存不存在能直接二分出"死在哪一段"，而且内容里带 host=%dx%d，
+        #   能看到应用在 ConPTY 下【自以为】拿到的终端尺寸。
+        md = os.path.join(self.tmp, "mouse_dump.log")
+        md_txt = ""
+        if os.path.exists(md):
+            try:
+                md_txt = io.open(md, "r", encoding="utf-8", errors="replace").read()[-200:]
+            except OSError:
+                md_txt = "<读不了>"
         return ("alive=%s exit_code=%s 已读到输出=%d 字节  render_dump.log存在=%s 大小=%s  帧数=%s"
-                "\n         已读字节(前200)=%r"
+                "\n         mouse_dump.log存在=%s 内容=%r"
+                "\n         已读字节(全部)=%r"
                 % (self.alive(), self.exit_code(), len(self.raw),
-                   exists, size, self.nframes(), head))
+                   exists, size, self.nframes(),
+                   os.path.exists(md), md_txt, self.raw[:500]))
 
     def quit(self, timeout=5):
         _k32.TerminateProcess(self._hproc, 0)
