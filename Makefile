@@ -106,6 +106,25 @@ test:
 # 2026-09-22 就是这么发现 plat_user_home 被错误地放在 #ifndef _WIN32 里的。
 HARNESS_SRC = src/render.c src/split.c src/framediff.c src/theme.c src/screen.c \
               src/vt.c src/utf8.c src/keymap.c src/input.c src/config.c src/cliphtml.c
+# 用 tools/mingw_dualcheck_gcc 垫片跑全部 verify_*.py：每个脚本编内嵌 C 时
+# 【先用 mingw 交叉编译一遍】抓 Windows 上的编译错，再用真 gcc 产出要在本机
+# 执行的文件。一次跑完 37 个脚本，不用一轮一轮等 CI（每轮 3~4 分钟）。
+# 2026-09-22 就是这样一次找出 5 个 MinGW 编不过的脚本。
+# 注意：垫片会跳过【纯链接】步骤，因为那些 .o 是真 gcc 带 -fsanitize 编的，
+# 交叉链接必然报 undefined reference __asan_report_* —— 那是垫片的假阳性。
+crosscheck-embedded-c:
+	@mkdir -p /tmp/dualshim && cp tools/mingw_dualcheck_gcc /tmp/dualshim/gcc && chmod +x /tmp/dualshim/gcc
+	@ok=0; bad=0; for f in verify_*.py; do \
+	   case "$$f" in verify_all.py) continue ;; esac; \
+	   if PATH=/tmp/dualshim:$$PATH python3 "$$f" >/tmp/dual.log 2>&1; then ok=$$((ok+1)); \
+	   elif grep -q "MINGW 交叉编译失败" /tmp/dual.log; then \
+	     bad=$$((bad+1)); echo "  [MINGW 编不过] $$f"; \
+	     grep -m3 "error:" /tmp/dual.log | sed 's/^/        /'; \
+	   else echo "  [本机就挂，与 Windows 无关] $$f"; bad=$$((bad+1)); fi; \
+	 done; \
+	 echo "  内嵌 C 交叉编译：通过 $$ok / 失败 $$bad"; \
+	 [ $$bad -eq 0 ]
+
 crosscheck-win-harness:
 	@for h in tests/render_harness.c tests/sb_drag_harness.c tests/cascade_probe.c; do \
 	  case $$h in \

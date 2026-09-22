@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""mingw_dualcheck_gcc —— 双编译器垫片：先用 mingw 交叉编译抓 Windows 上的编译错，再用真 gcc 产出可执行文件。
+
+为什么要两个都编：脚本编出来的二进制【要在本机跑】，所以最终产物必须是真 gcc 的；
+但我们想知道同一份内嵌 C 在 MinGW 上编不编得过。一次跑两个，就不用等 CI。
+-fsanitize 在交叉编译那一遍要过滤掉（MinGW 不支持，hbuild 在 Windows 上本来也会去掉）。
+"""
+import os, subprocess, sys
+args = sys.argv[1:]
+cross = [a for a in args if not a.startswith("-fsanitize")]
+out, i = [], 0
+while i < len(cross):
+    if cross[i] == "-o" and i + 1 < len(cross):
+        out += ["-o", "/tmp/mshim_probe.exe"]; i += 2
+    else:
+        out.append(cross[i]); i += 1
+# ★ 纯链接步骤（参数里有 .o）要跳过交叉编译：那些 .o 是真 gcc 带 -fsanitize
+#   编出来的，里面引用 __asan_report_* / __ubsan_handle_*；而交叉编译这一遍
+#   把 -fsanitize 过滤掉了，链接必然报 undefined reference —— 那是垫片的假阳性，
+#   不是 Windows 上的真问题（真 Windows 上 hbuild 会整体去掉 sanitizer）。
+#   编译错误在 -c 那一步就能抓到；Windows 特有的链接问题是符号撞名，
+#   由 tools/check_win32_symbol_clash.py 做符号级检查。
+if any(a.endswith(".o") for a in args):
+    os.execv("/usr/bin/gcc", ["/usr/bin/gcc"] + args)
+r = subprocess.run(["x86_64-w64-mingw32-gcc"] + out, capture_output=True, text=True)
+if r.returncode != 0:
+    sys.stderr.write("\n[MINGW 交叉编译失败 —— 这份内嵌 C 在 Windows 上编不过]\n")
+    sys.stderr.write((r.stderr or r.stdout or "")[:2500])
+    sys.exit(r.returncode)
+os.execv("/usr/bin/gcc", ["/usr/bin/gcc"] + args)

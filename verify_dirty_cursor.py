@@ -220,7 +220,13 @@ static int run(int reset_mode,int cursor_split,unsigned long seed,int*first){
         term_feed(&diff,dlt,n);
         (void)scan_len;
 
-        int pr,pc; const char*what=NULL;
+        /* ★ pr/pc 必须初始化。逻辑上这里其实【读不到】未初始化值 ——
+         * term_equal() 每条 return 0（找到差异）的路径都写了那两个出参，
+         * 而下面只在 cell_bad 为真时才读它们。但 gcc 跨调用边界证不出来，
+         * MinGW 带 -Werror 就直接编译失败（CI windows 作业第四轮就是这么挂的）。
+         * 这个项目已经栽过一次未初始化栈变量（verify_copy_wide.py 的
+         * ClipHtmlBuf），所以宁可多初始化，也不留这种"靠人脑证明安全"的代码。 */
+        int pr=0,pc=0; const char*what=NULL;
         int cell_bad=!term_equal(&full,&diff,&pr,&pc,&what);
         int cur_bad=(full.cur_vis!=diff.cur_vis)||
                     (full.cur_vis&&diff.cur_vis&&(full.crow!=diff.crow||full.ccol!=diff.ccol));

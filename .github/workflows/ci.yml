@@ -116,6 +116,12 @@ jobs:
         # 2026-09-22 就是这样发现 plat_user_home 被错误地放在 #ifndef _WIN32 里。
         run: make crosscheck-win-harness
 
+      - name: 内嵌 C 交叉编译（37 个 verify 脚本）
+        # 每个 verify_*.py 都会把一段内嵌 C 编出来跑。用双编译器垫片让它们在
+        # 本机执行的同时，也被 mingw 交叉编译一遍 —— 一次跑完，不用一轮一轮
+        # 等 windows 作业（每轮 3~4 分钟）。2026-09-22 就是这样一次找出 5 个。
+        run: make crosscheck-embedded-c
+
       - name: 构建 Linux 版
         run: make -B linux 2>&1 | tee build-linux.log
 
