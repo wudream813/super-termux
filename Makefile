@@ -112,6 +112,14 @@ HARNESS_SRC = src/render.c src/split.c src/framediff.c src/theme.c src/screen.c 
 # 2026-09-22 就是这样一次找出 5 个 MinGW 编不过的脚本。
 # 注意：垫片会跳过【纯链接】步骤，因为那些 .o 是真 gcc 带 -fsanitize 编的，
 # 交叉链接必然报 undefined reference __asan_report_* —— 那是垫片的假阳性。
+# -O1 门禁：GCC 的 -Wformat-truncation 等诊断在 -O2 与 -O1 下【集合不同】——
+# 2026-09-22 审计（BUG-12）指出 config.c:121 的 "%s" 写 32 字节 name 只有 -O1 报。
+# 生产仍是 -O2，这里只 -c 不链接、-Werror，Windows 源码走 mingw 交叉、POSIX 源码
+# 走本机 cc，两个集合的 .c 都过一遍。几秒钟。
+lint-o1:
+	@set -e; for f in $(SRC); do $(CC) -O1 -Wall -Wextra -Werror -Iinclude -c $$f -o /dev/null; done; echo "lint-o1: Windows 源码 $(words $(SRC)) 个文件 0 警告"
+	@set -e; for f in $(POSIX_SRC); do $(POSIX_CC) -O1 -std=gnu11 -Wall -Wextra -Werror -Iinclude -c $$f -o /dev/null; done; echo "lint-o1: POSIX 源码 $(words $(POSIX_SRC)) 个文件 0 警告"
+
 crosscheck-embedded-c:
 	@mkdir -p /tmp/dualshim && cp tools/mingw_dualcheck_gcc /tmp/dualshim/gcc && chmod +x /tmp/dualshim/gcc
 	@ok=0; bad=0; for f in verify_*.py; do \
@@ -275,4 +283,4 @@ check-posix: posix-build verify-port unittest-posix-input unittest-posix-write u
 clean:
 	rm -f $(TARGET) $(TARGET_CPP) termux-linux termux-macos *.o
 
-.PHONY: all cpp test unittest posix-build clean planA planB plans v19 v20 v21 v22 v23 v24 linux darwin posix verify-loader unittest-posix-input unittest-posix-write unittest-posix-cmdline unittest-posix-env smoke-posix clip-posix check-posix verify-port
+.PHONY: all cpp test unittest lint-o1 posix-build clean planA planB plans v19 v20 v21 v22 v23 v24 linux darwin posix verify-loader unittest-posix-input unittest-posix-write unittest-posix-cmdline unittest-posix-env smoke-posix clip-posix check-posix verify-port

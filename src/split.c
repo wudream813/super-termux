@@ -168,7 +168,9 @@ static void layout_rec(SplitNode *nodes, int n, int c0, int r0, int cols, int ro
     if (nodes[n].dir == SPLIT_V) {
         /* 左右分：中间留 1 列边框。 */
         int total = cols - 1;               /* 扣掉 1 列边框 */
-        if (total < 2) total = 2;
+        /* 空间不足时【收缩】而不是撑到 2：原来 W=1 会算出 c0+2 的子矩形，越出父
+         * 矩形（verify_split.py #30 穷举验红）。契约：子矩形 ⊆ 父矩形，恒成立。 */
+        if (total < 0) total = 0;
         int left = total * frac / 100;
         int right = total - left;
         /* 保证两边都不小于最小宽；空间不够时均分。 */
@@ -180,7 +182,7 @@ static void layout_rec(SplitNode *nodes, int n, int c0, int r0, int cols, int ro
     } else {
         /* 上下分：中间留 1 行边框。 */
         int total = rows - 1;
-        if (total < 2) total = 2;
+        if (total < 0) total = 0;           /* 同上：收缩，不撑大 */
         int top = total * frac / 100;
         int bot = total - top;
         if (rows < SPLIT_MIN_ROWS * 2 + 1) { top = total / 2; bot = total - top; }

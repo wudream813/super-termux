@@ -5,7 +5,7 @@
 终端复用器（Terminal Multiplexer）—— 模块化 C 架构，单文件可执行。
 在一个终端窗口里管理多个 shell 会话，像 tmux 一样分标签页、分屏、搜历史。
 
-当前版本：**v2.0.3**（正式支持 Windows / Linux / macOS 三个系统）
+当前版本：**v2.0.4**（正式支持 Windows / Linux / macOS 三个系统）
 
 ## 平台支持
 
@@ -300,6 +300,18 @@ python3 verify_config_theme.py     # 配置体系：主题参考色板完整性 
 
 
 ## 版本历史
+
+**v2.0.4** —— 第六轮外部审计（Linux 真机 + ASan）：修 **BUG-12** 键名截断，加固 `split_layout` 契约，新增 `-O1` 编译门禁。
+
+审计结论先说：ASan 版二进制跑 5 窗格 + 30 次随机 resize + 灌 2000 行 + 搜索 / 复制 / 设置页 / 逐个关窗格，**零报错**；`make check-posix`、`verify_all.py` 全绿。本版修的是审计找出的唯一真问题和两条加固建议。
+
+| # | 问题 | 修法 | 判据 |
+|---|---|---|---|
+| BUG-12 | `spec_text` 最长产出 `Ctrl+Alt+Shift+backspace` = 24 字节，`keymap_describe` 内部 `prefix[24]`/`key[24]` 差 1 字节装不下 NUL，帮助页 / 命令面板显示成不存在的 `…backspac`。设置页录键走不到（不追加 `S-`），但手写 `termux.ini` 的 `prefix = C-M-S-backspace` 直通，且 ini 注释就教了这个语法 | `keymap.c` 缓冲 24→40；`render.c` 帮助页 `combo`/`prefix`/`key` 统一 64、`keycol` 80；`g_split_shortcut_buf` 24→64；`pane.c` `close_key` 48→64 | `make unittest` 新增 3 条：改前 `got "…backspac …backspac"` 验红，改后 325 checks 0 failed |
+| 契约 | `split_layout` 的 `layout_rec` 在空间不足时 `if (total < 2) total = 2;` 把总量**撑大**而不是收缩，W=1 的父矩形算出右界 3 的子矩形。下游渲染有裁剪所以用户看不见（真 PTY 4 窗格缩到 1×1 再恢复全程存活），但纯函数违反「子矩形 ⊆ 父矩形」 | 改成 `if (total < 0) total = 0;`（收缩） | `verify_split.py` 新增 #30 穷举 23040 个子矩形（越界=0 / 负尺寸=0）+ 自证 5（退回旧写法必须重新变红） |
+| 门禁 | GCC 的 `-Wformat-truncation` 在 `-O1` 与 `-O2` 下诊断集合不同，生产/CI 都是 `-O2` 所以从没见过 | 新增 `make lint-o1`（Windows 源码 mingw 交叉 + POSIX 源码本机 cc，只 `-c`、`-Werror`）并接进 Linux CI 作业 | 门禁刚建起来就抓到 `config.c:121`（basename 255 → name 32）和 `pane.c:413`（命令行 512 → 标题 256）两处隐式截断，均改成显式 `%.*s`；退回 `config.c` 修复门禁必须变红 |
+
+**没做的**：审计中期建议 4（极窄时自动只显示活动窗格）、5（清掉 4 个纯镜像测试）、6（会话恢复）留待后续版本。
 
 **v2.0.3** —— 修 **bug #30**：标准输出句柄只写时 termux 直接拒绝启动。
 

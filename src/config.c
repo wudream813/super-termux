@@ -118,7 +118,10 @@ void init_default_config(void) {
                             sh_u8, (int)sizeof(sh_u8) - 1, NULL, NULL);
         base = strrchr(sh_u8, '/');
         base = (base && base[1]) ? base + 1 : sh_u8;
-        snprintf(g_chooser_items[0].name, sizeof(g_chooser_items[0].name), "%s", base);
+        /* name 只有 32 字节而 basename 可达 255：显式按容量截，-O1 的
+         * -Wformat-truncation 才认（`make lint-o1` 门禁要求零警告）。 */
+        snprintf(g_chooser_items[0].name, sizeof(g_chooser_items[0].name), "%.*s",
+                 (int)sizeof(g_chooser_items[0].name) - 1, base);
         snprintf(g_chooser_items[0].cmd, sizeof(g_chooser_items[0].cmd), "%s", sh_u8);
         g_chooser_items[0].workdir[0] = 0;
         g_chooser_items[0].color = 0;

@@ -1549,7 +1549,7 @@ static int palette_match_score(const PaletteItemInfo *item, const char *query, i
 
 /* 分屏项的快捷键：把静态占位「前缀 x」替换成真实组合（随用户配置的前缀键而变，
  * 例如默认 Ctrl+B 时显示 "Ctrl+B -"），从键位表动态生成，不写死。 */
-static char g_split_shortcut_buf[24];
+static char g_split_shortcut_buf[64];   /* "前缀 键" 两段各最长 24 字节 */
 static const char *palette_split_shortcut(PaletteAction a) {
     int act = ACT_NONE;
     switch (a) {
@@ -2116,7 +2116,7 @@ static const int g_help_tail_count = (int)(sizeof(g_help_tail) / sizeof(g_help_t
 /* 把 "Ctrl+B c" 拆成前缀段与按键段分别着色 */
 static const char *help_shortcut_line(int idx, char *buf, int buf_size) {
     const HelpShortcut *hs = &g_help_shortcuts[idx];
-    char combo[48] = {0};
+    char combo[64] = {0};
     keymap_describe(hs->action, combo, sizeof(combo));
     if (!combo[0]) {
         char pfx[32];
@@ -2124,7 +2124,9 @@ static const char *help_shortcut_line(int idx, char *buf, int buf_size) {
         snprintf(combo, sizeof(combo), "%s -", pfx);
     }
 
-    char prefix[32] = {0}, key[32] = {0};
+    /* 与 combo 同容量：直接键路径把整个 combo 拷进 key，不再让编译器算「单段
+     * 最长 24 所以装得下」这种跨函数推理（-O1 门禁会报 format-truncation）。 */
+    char prefix[64] = {0}, key[64] = {0};
     const char *sp = strrchr(combo, ' ');
     /* v1.8.7: 被设为「直接键」的动作 combo 里没有前缀段，左列改标注「直接」。 */
     if (!keymap_action_uses_prefix(hs->action)) {
@@ -2141,7 +2143,7 @@ static const char *help_shortcut_line(int idx, char *buf, int buf_size) {
 
     int kw = (int)strlen(key);
     int pad = kw < 9 ? 9 - kw : 1;
-    char keycol[64];
+    char keycol[80];                        /* key[64] + 最多 9 列补白 */
     snprintf(keycol, sizeof(keycol), "%s%*s", key, pad, "");
 
     if (hs->extra) {

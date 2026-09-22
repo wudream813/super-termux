@@ -213,7 +213,7 @@ int create_about_pane(void) {
     char sys_ver[128] = {0};
     get_system_version_string(sys_ver, sizeof(sys_ver));
     /* v1.8.7: 关闭键跟随实际键位配置，不再写死 Ctrl+B x。 */
-    char close_key[48] = {0};
+    char close_key[64] = {0};
     keymap_describe(ACT_CLOSE_PANE, close_key, sizeof(close_key));
     if (!close_key[0]) snprintf(close_key, sizeof(close_key), "%s", "关闭标签页快捷键");
 
@@ -410,7 +410,9 @@ create_fail:
     pane->active = 1;
 
     /* 标题：POSIX 上没有 cmd / powershell 的特例，统一取命令名。 */
-    snprintf(pane->full_title, sizeof(pane->full_title), "%s", cmd_utf8);
+    /* 命令行缓冲 512、标题 256：有意截断，显式写出容量让 -O1 门禁认得。 */
+    snprintf(pane->full_title, sizeof(pane->full_title), "%.*s",
+             (int)sizeof(pane->full_title) - 1, cmd_utf8);
     char *sp = strchr(cmd_utf8, ' ');
     if (sp) *sp = 0;
     sanitize_title(cmd_utf8, (int)strlen(cmd_utf8), pane->title, sizeof(pane->title));

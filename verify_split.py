@@ -470,6 +470,46 @@ int main(void) {
            rs[0].ocols >= SPLIT_MIN_COLS && rs[1].ocols >= SPLIT_MIN_COLS);
     }
 
+    /* #30 (v2.0.4, 审计 §三)：split_layout 的契约 —— 子矩形恒在父矩形内。
+     * 原来 layout_rec 里 `if (total < 2) total = 2;` 在空间不足时把总量【撑大】
+     * 而不是收缩，W=1 的父矩形算出 c0=2 的子矩形（右界 3 > 1）。下游渲染有裁剪
+     * 所以用户看不见，但纯函数违反契约，新消费者忘了裁剪就会越界。
+     * 穷举：单次 V/H 切分 × W 1..24 × H 1..16 × frac 5..95 步 10；再套一层四窗格。 */
+    {
+        int oob = 0, neg = 0, checked = 0;
+        for (int dir = 0; dir < 2; dir++)
+        for (int W = 1; W <= 24; W++)
+        for (int H = 1; H <= 16; H++)
+        for (int fr = 5; fr <= 95; fr += 10) {
+            split_reset();
+            int rt = split_new_leaf(0);
+            split_do(rt, dir ? SPLIT_H : SPLIT_V, 1);
+            split_nodes()[rt].frac_pct = fr;
+            /* 再把 pane1 切一刀，覆盖嵌套时父矩形已经很小的情况 */
+            int l1 = split_find_leaf(rt, 1);
+            split_do(l1, dir ? SPLIT_V : SPLIT_H, 2);
+            PaneRect rs[16]; memset(rs, 0, sizeof(rs));
+            split_layout(rt, 3, 2, W, H, split_nodes(), rs);
+            for (int i = 0; i < 3; i++) {
+                if (!rs[i].valid) continue;
+                checked++;
+                if (rs[i].ocols < 0 || rs[i].orows < 0) neg++;
+                if (rs[i].oc0 < 3 || rs[i].or0 < 2 ||
+                    rs[i].oc0 + rs[i].ocols > 3 + W ||
+                    rs[i].or0 + rs[i].orows > 2 + H) {
+                    if (oob < 3) printf("      [OOB] %s W=%d H=%d fr=%d pane%d c0=%d r0=%d %dx%d\n",
+                        dir ? "H" : "V", W, H, fr, i, rs[i].oc0, rs[i].or0, rs[i].ocols, rs[i].orows);
+                    oob++;
+                }
+            }
+        }
+        printf("      #30 穷举 %d 个子矩形\n", checked);
+        ck("#30 穷举里有矩形被检查到（判据非空）", checked > 3000);
+        ck("#30 契约：子矩形恒在父矩形内（越界=0）", oob == 0);
+        ck("#30 契约：无负尺寸", neg == 0);
+        split_reset();
+    }
+
     if (failures) { printf("\n%d FAILURE(S)\n", failures); return 1; }
     printf("\nSPLIT TESTS PASSED\n");
     return 0;
@@ -641,6 +681,25 @@ def main() -> int:
             print("FAIL: 自证 4 失败 —— 没抓住「pct 被夹到」那几条断言", file=sys.stderr)
             return 1
         print("自证 4 通过：拖动路径的百分比夹取也被钉住了。")
+
+        # ---- 自证 5：把 #30 的收缩改回旧的「撑到 2」，穷举必须重新变红。 ----
+        n5a = "        if (total < 0) total = 0;\n        int left = total * frac / 100;"
+        n5b = "        if (total < 0) total = 0;           /* 同上：收缩，不撑大 */"
+        assert split_src.count(n5a) == 1 and split_src.count(n5b) == 1, \
+            "自证 5 锚点没找到，改 split.c 时要同步这里"
+        mutant5 = os.path.join(td, "split_mutant5.c")
+        with open(mutant5, "w", encoding="utf-8") as f:
+            f.write(split_src.replace(n5a, "        if (total < 2) total = 2;  /* MUTANT */\n        int left = total * frac / 100;")
+                             .replace(n5b, "        if (total < 2) total = 2;  /* MUTANT */"))
+        rc6, out6 = build_run(mutant5)
+        if rc6 == 0:
+            print("FAIL: 自证 5 失败 —— 退回「撑到 2」后穷举仍然全绿", file=sys.stderr)
+            return 1
+        caught5 = [ln for ln in (out6 or "").splitlines() if ln.startswith("[FAIL]")]
+        if not any("#30" in ln and "父矩形" in ln for ln in caught5):
+            print("FAIL: 自证 5 失败 —— 没抓住 #30 的越界断言", file=sys.stderr)
+            return 1
+        print("自证 5 通过：split_layout「子矩形 ⊆ 父矩形」的契约被钉住了。")
     return 0
 
 

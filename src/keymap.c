@@ -475,7 +475,9 @@ void keymap_describe(int action, char *out, int out_size) {
         if (g_default_bindings[i].action == action && !g_action_overridden[action])
             found = &g_default_bindings[i].key;
 
-    char prefix[24], key[24];
+    /* spec_text 最长产出 "Ctrl+Alt+Shift+backspace" = 24 字节 + NUL；原来的 [24]
+     * 差 1 字节，帮助页显示成 "…backspac"（审计 BUG-12，unittest 有验红用例）。 */
+    char prefix[40], key[40];
     spec_text(&g_prefix, prefix, sizeof(prefix));
     if (!found) {
         if (action != ACT_SEND_PREFIX) return;

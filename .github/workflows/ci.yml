@@ -122,6 +122,11 @@ jobs:
         # 等 windows 作业（每轮 3~4 分钟）。2026-09-22 就是这样一次找出 5 个。
         run: make crosscheck-embedded-c
 
+      - name: -O1 编译门禁（-O2 看不到的 -Wformat-truncation）
+        # GCC 在 -O1 与 -O2 下的诊断集合不同：v2.0.4 审计的 BUG-12 相关警告只有
+        # -O1 报。Windows 源码交叉编译、POSIX 源码本机编译，只 -c、-Werror。
+        run: make lint-o1
+
       - name: 构建 Linux 版
         run: make -B linux 2>&1 | tee build-linux.log
 

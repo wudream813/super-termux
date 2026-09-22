@@ -328,6 +328,25 @@ static void test_keymap_describe(void) {
     keymap_describe(ACT_NEW_PANE, buf, sizeof(buf));
     check_str(buf, "Ctrl+A F2", "改了 prefix 与键位后描述同步");
     keymap_init();
+
+    /* v2.0.4 (审计 BUG-12)：spec_text 最长能产出 "Ctrl+Alt+Shift+backspace"
+     * = 24 字节，而 keymap_describe 内部原来用 prefix[24]/key[24]，差 1 字节
+     * 装不下 NUL，帮助页显示成不存在的键名 "Ctrl+Alt+Shift+backspac"。
+     * 设置页录键不追加 S-（走不到），但手写 termux.ini `prefix = C-M-S-backspace`
+     * 直通 keymap_set_prefix，用户照 ini 注释就能写出来。 */
+    check(keymap_set_prefix("C-M-S-backspace") != 0, "C-M-S-backspace 是合法前缀");
+    keymap_bind("send-prefix", "C-M-S-backspace");
+    char big[128];
+    keymap_prefix_describe(big, sizeof(big));
+    check_str(big, "Ctrl+Alt+Shift+backspace", "最长前缀名 24 字节完整");
+    keymap_describe(ACT_SEND_PREFIX, big, sizeof(big));
+    check_str(big, "Ctrl+Alt+Shift+backspace Ctrl+Alt+Shift+backspace",
+              "describe 内部缓冲不能截断最长前缀 / 最长键名");
+    keymap_unbind("send-prefix");
+    keymap_describe(ACT_SEND_PREFIX, big, sizeof(big));
+    check_str(big, "Ctrl+Alt+Shift+backspace Ctrl+Alt+Shift+backspace",
+              "未绑定时的前缀两连同样不截断");
+    keymap_init();
 }
 
 static void test_keymap_capture(void) {
