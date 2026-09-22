@@ -160,6 +160,7 @@ static BOOL WINAPI ctrl_handler(DWORD type) {
 static HANDLE g_hout_owned = NULL;
 static HANDLE g_hin_owned  = NULL;
 static DWORD  g_hout_err = 0;          /* 第一次 GetConsoleScreenBufferInfo 的 GetLastError */
+static DWORD  g_hin_err  = 0;          /* GetConsoleMode(hIn) 的 GetLastError */
 static BOOL   g_setmode_in_ok = FALSE;
 static BOOL   g_setmode_out_ok = FALSE;
 
@@ -246,10 +247,23 @@ int main(void) {
     GetConsoleMode(g_mux.hIn, &g_mux.orig_in_mode);
     GetConsoleMode(g_mux.hOut, &g_mux.orig_out_mode);
     GetConsoleTitleW(g_orig_title, 255);
-    /* 输入侧同理：STD_INPUT_HANDLE 在 ConPTY 下是通用 "Input" 句柄，
-     * SetConsoleMode 一旦失败，程序会【看起来正常运行但收不到任何按键】，
-     * 比启动就报错更难查。所以这里也补一个 CONIN$ 兜底。 */
-    if (!SetConsoleMode(g_mux.hIn, g_mux.orig_in_mode) && g_mux.orig_in_mode) {
+    /* ★ bug #30（输入侧）：和输出侧同一个病根。
+     * ConPTY 下 STD_INPUT_HANDLE 是 ConDrv 上通用的 "Input" 句柄，
+     * GetConsoleMode / SetConsoleMode 在它上面都会失败。
+     *
+     * 我第一版写的兜底用 `!SetConsoleMode(hIn, orig_in_mode)` 当探针，
+     * 这是错的：orig_in_mode 本身就是刚才 GetConsoleMode 失败后留下的 0，
+     * 拿 0 去 SetConsoleMode 只会再失败一次，兜底根本触发不了。
+     * CI 第十轮的打点把这件事钉死了：
+     *     [boot] setmode in=0 out=1 in_mode=0x98
+     *     [boot] input-loop-exited          ← 输入循环当场退出，进程 exit 0
+     * 也就是「渲染全对、4132 字节输出都收到了，但一个按键都进不去」。
+     *
+     * 正确做法和输出侧对称：GetConsoleMode 失败就改开 CONIN$。 */
+    if (!GetConsoleMode(g_mux.hIn, &g_mux.orig_in_mode)) {
+        g_hin_err = GetLastError();
+        dump_mark("[boot] in-mode-failed err=%lu -> 尝试 CONIN$",
+                  (unsigned long)g_hin_err);
         HANDLE hCi = CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                                  OPEN_EXISTING, 0, NULL);
