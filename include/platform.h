@@ -34,7 +34,7 @@
 #define TERMUX_PATH_SEP          L'\\'
 #define TERMUX_PATH_SEP_S        "\\"
 #define TERMUX_ABOUT_TITLE_U8    "Windows 终端复用器 (Terminal Multiplexer)"
-#define TERMUX_ABOUT_SUB_U8      "基于 Windows ConPTY 的高性能单文件 C 终端复用多标签环境"
+#define TERMUX_ABOUT_SUB_U8      "基于 Windows ConPTY 的高性能终端复用多标签环境"
 #else
 #define TERMUX_DEFAULT_SHELL_W   L"/bin/sh"
 #define TERMUX_DEFAULT_SHELL_U8  "/bin/sh"
@@ -43,7 +43,7 @@
 /* 关于页文案。原来写死「Windows 终端复用器 / 基于 Windows ConPTY」，在同一页的
  * 「系统版本」已经正确显示 Linux/macOS 的情况下自相矛盾。 */
 #define TERMUX_ABOUT_TITLE_U8    "终端复用器 (Terminal Multiplexer)"
-#define TERMUX_ABOUT_SUB_U8      "基于 POSIX pty (forkpty) 的高性能单文件 C 终端复用多标签环境"
+#define TERMUX_ABOUT_SUB_U8      "基于 POSIX pty (forkpty) 的高性能终端复用多标签环境"
 #endif
 
 /* ---- 子进程后端 ----
