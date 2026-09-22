@@ -5,7 +5,7 @@
 终端复用器（Terminal Multiplexer）—— 模块化 C 架构，单文件可执行。
 在一个终端窗口里管理多个 shell 会话，像 tmux 一样分标签页、分屏、搜历史。
 
-当前版本：**v2.0.2**（正式支持 Windows / Linux / macOS 三个系统）
+当前版本：**v2.0.3**（正式支持 Windows / Linux / macOS 三个系统）
 
 ## 平台支持
 
@@ -300,6 +300,48 @@ python3 verify_config_theme.py     # 配置体系：主题参考色板完整性 
 
 
 ## 版本历史
+
+**v2.0.3** —— 修 **bug #30**：标准输出句柄只写时 termux 直接拒绝启动。
+
+`GetConsoleScreenBufferInfo` 要求句柄带 `GENERIC_READ`，而 `GetStdHandle(STD_OUTPUT_HANDLE)`
+拿到的常常是【只写】句柄 —— 这时它返回 0、`GetLastError() = ERROR_INVALID_HANDLE (6)`，
+termux 就在启动第一步打印 `cannot query console buffer` 然后 `return 1`。
+
+在 ConPTY 下这是**必然**发生的：子进程拿到的标准 I/O 是 ConDrv 上通用的
+`Input`/`Output` 句柄，而不是 `CONIN$`/`CONOUT$`。所以任何把 termux 挂在伪控制台下的
+宿主（终端复用器、CI、远程会话）都会看到它一闪就退。
+
+修法是启动时查询失败就另开一个 `CONOUT$`（读写都有）并改用它；输入侧对称补 `CONIN$`
+兜底 —— 否则 `SetConsoleMode` 会**静默**失败，表现是「程序在跑但收不到任何按键」，
+比启动就报错更难查。两个自己开的句柄在退出时关掉，`GetStdHandle` 拿来的不关。
+在源头换掉 `g_mux.hOut` / `g_mux.hIn`，一次覆盖全部三个调用点：
+
+| 位置 | 原来的后果 |
+|---|---|
+| `src/main.c:43` | resize 时静默 `return` —— 等于 resize 检测失效 |
+| `src/main.c:171` | 启动失败（本次暴露的那条） |
+| `src/platform_win.c:96` | `plat_console_size` 直接返回 -1 |
+
+普通控制台窗口下标准输出句柄本来就可读，这段分支**不会进入**，现有 Windows 行为不变。
+
+这一版还把 Windows 侧的诊断能力补上了 —— 此前 termux.exe 在真 Windows 上的运行期行为
+**完全没有观测手段**，每猜一次要等 CI 3~4 分钟：
+
+- `dump_mark()`（`src/globals.c`，只在设置了 `TERMUX_DUMP` 时生效，正式使用零影响）
+  记录启动每一步、ConPTY 送来的每个 `KEY_EVENT`、子 shell 的 spawn 结果与退出码。
+- `tests/win_smoke.py` 增加**对照实验**：用同一个驱动直接起裸 `cmd.exe`，
+  用来一刀切开「termux 有问题」和「环境有问题」。
+
+**★ 已知限制（不藏着）**：GitHub Actions 的 Windows runner 上 ConPTY 子进程绑不到
+伪控制台 —— 裸 `cmd.exe` 结果完全一样（85 字节全是 conhost 自己的初始化，
+cmd 本体零输出，横幅跑到了宿主控制台），所以这是**环境限制而非本项目的 bug**。
+后果是子 shell 立刻退出、窗格被回收、termux 跟着退出，于是关于页 / 分屏 / resize
+这 9 项在该环境下记为 `[SKIP]` 并打印原因，**不是**悄悄算通过。判据是活的：
+换到有真交互控制台的机器，对照通过后这 9 项会自动变回硬断言，不需要改代码。
+
+该环境下确实拿到了运行期证据的部分：进程能启动（bug #30 修复后）、渲染出帧、
+帮助页出现、帮助页平台串是 Windows 的（**bug #9 首次拿到运行期证据**，
+此前只有 `gcc -E` 预处理级证据）、没有串成 Linux / macOS。
 
 **v2.0.2** —— 仓库改名 `win-termux` → **`super-termux`**（已经支持三个系统，
 名字里的 `win-` 不再合适）。关于页的仓库链接、生成的 `termux.ini` 头部注释、

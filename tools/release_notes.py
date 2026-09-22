@@ -36,8 +36,12 @@ def extract(readme_text, version):
         return None
 
     rest = section[hit.end():]
-    # 段落结束于下一个空行（段落之间用空行隔开），或者「更早的版本详见…」那行。
-    stop = re.search(r"\n\s*\n|更早的版本详见", rest)
+    # 段落结束于【下一个版本条目】（或「更早的版本详见…」那行）。
+    # ★ 原来这里的边界是「下一个空行」，等于要求每条版本说明必须写成【一整段】——
+    #   多段落 / 列表 / 表格会被截断，只剩第一段。v2.0.3 的说明带了表格和列表，
+    #   第一次跑只抽出 3 行。用下一个 **vX** 锚点当边界才符合直觉，
+    #   也让 README 的版本历史可以正常排版。
+    stop = re.search(r"^\*\*v\d+(?:\.\d+)*\*\*|更早的版本详见", rest, re.M)
     body = rest[:stop.start()] if stop else rest
     body = body.strip()
     return body or None
