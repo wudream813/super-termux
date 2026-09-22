@@ -92,6 +92,27 @@ def main():
     except OSError as ex:
         print("  裸跑: OSError %s" % ex)
 
+    # ★★★ 对照实验：用【同一个驱动】直接起 cmd.exe（不经过 termux）。
+    #   CI 第十五轮查明：termux 的窗格读线程总共只收到过 16 字节
+    #   （termux_dump.log 只有 "[pane 0 len 16]"，就是 ConPTY 自己的初始化序列），
+    #   cmd.exe 的横幅【从来没进过 termux】，却出现在了 runner 的真实控制台上。
+    #   也就是说子 shell 绑到了宿主控制台而不是嵌套伪控制台。
+    #   但 src/pane.c:252-303 的 ConPTY 接线逐项对照微软 echocon 都是对的，
+    #   所以必须先分清是 termux 的问题还是这个环境/驱动模式的问题。
+    #   这个对照能一刀切开：cmd.exe 自己也回不来 ⇒ 环境/驱动；能回来 ⇒ termux。
+    try:
+        cp = cd.Term(cols=100, rows=30, dump=False, exe="cmd.exe")
+        cp.drain(2.5)
+        print("  对照(裸 cmd.exe 走同一个 ConPTY 驱动): alive=%s exit_code=%s 收到=%d 字节"
+              % (cp.alive(), cp.exit_code(), len(cp.raw)))
+        print("         前 160 字节=%r" % (cp.raw[:160],))
+        try:
+            cp.close()
+        except Exception:
+            pass
+    except Exception as ex:
+        print("  对照(裸 cmd.exe): 起不来 —— %s" % ex)
+
     t = cd.Term(cols=100, rows=30)
     box["t"] = t
     print("  启动后: %s" % t.diagnostics())

@@ -141,11 +141,15 @@ class Term(drive.Term):
     不调用基类的（基类那个是 pty 的）。
     """
 
-    def __init__(self, cols=100, rows=24, dump=True, env=None):
+    def __init__(self, cols=100, rows=24, dump=True, env=None, exe=None):
         if not IS_WINDOWS:
             _fail("conpty_drive 只能在 Windows 上用（当前 os.name=%r）。"
                   "POSIX 请用 tests/drive.py。" % os.name)
         self.cols, self.rows = cols, rows
+        # exe 可以换成别的程序 —— win_smoke.py 用它做【对照实验】：拿同一个驱动
+        # 直接起 cmd.exe，看子进程的输出能不能回到管道。这能一刀切开
+        # 「termux 的嵌套 ConPTY 有 bug」和「这个环境下 ConPTY 驱动模式本身不行」。
+        self.exe = exe or EXE
         self.tmp = tempfile.mkdtemp(prefix="termux_conpty_")
 
         e = dict(os.environ)
@@ -201,14 +205,14 @@ class Term(drive.Term):
 
         pi = PROCESS_INFORMATION()
         # ★ lpCommandLine 必须是【可写】缓冲，CreateProcessW 会就地改写它
-        cmdline = ctypes.create_unicode_buffer('"%s"' % EXE)
+        cmdline = ctypes.create_unicode_buffer('"%s"' % self.exe)
         ok = _k32.CreateProcessW(
-            EXE, cmdline, None, None, False,
+            self.exe, cmdline, None, None, False,
             EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
             _env_block(e), self.tmp,
             ctypes.byref(si), ctypes.byref(pi))
         if not ok:
-            _fail("CreateProcessW 失败: %d（EXE=%s）" % (ctypes.get_last_error(), EXE))
+            _fail("CreateProcessW 失败: %d（EXE=%s）" % (ctypes.get_last_error(), self.exe))
         self._hproc = pi.hProcess
         self._hthread = pi.hThread
         self.pid = pi.dwProcessId
