@@ -55,12 +55,17 @@ def main():
         return 1
 
     fails = []
+    box = {}
 
     def ck(name, cond, detail=""):
         if cond:
             print("  [ok]   %s" % name)
         else:
+            # ★ 失败时把驱动的诊断信息一起打出来。这里没有 Windows，改一轮要等
+            #   CI 3~4 分钟，光看「FAIL 帮助页出现」根本不知道该往哪查。
             print("  [FAIL] %s %s" % (name, detail))
+            if box.get("t") is not None:
+                print("         诊断: %s" % box["t"].diagnostics())
             fails.append(name)
 
     print("=== Windows / ConPTY 冒烟测试（termux.exe，版本 %s）===" % ver)
@@ -70,6 +75,8 @@ def main():
         return 1
 
     t = cd.Term(cols=100, rows=30)
+    box["t"] = t
+    print("  启动后: %s" % t.diagnostics())
 
     def wait(pred, n=40, step=0.15):
         for _ in range(n):

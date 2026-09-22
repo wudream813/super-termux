@@ -50,6 +50,8 @@ if IS_WINDOWS:
     #   轻则环境变量全乱，重则 CreateProcessW 直接 ERROR_INVALID_PARAMETER。
     CREATE_UNICODE_ENVIRONMENT = 0x00000400
     INFINITE = 0xFFFFFFFF
+    WAIT_TIMEOUT = 0x00000102        # 258：对象仍活跃
+    STILL_ACTIVE = 259               # GetExitCodeProcess 用它表示"还在跑"
 
     class COORD(ctypes.Structure):
         _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
@@ -111,6 +113,8 @@ if IS_WINDOWS:
     _k32.WaitForSingleObject.restype = wintypes.DWORD
     _k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
     _k32.TerminateProcess.restype = wintypes.BOOL
+    _k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _k32.GetExitCodeProcess.restype = wintypes.BOOL
     _k32.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR,
                                     ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL,
                                     wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR,
@@ -258,7 +262,27 @@ class Term(drive.Term):
         self.drain(wait)
 
     def alive(self):
-        return _k32.WaitForSingleObject(self._hproc, 0) == 259   # STILL_ACTIVE
+        # ★ 原来写成 == 259 是错的：259 是 STILL_ACTIVE，那是 GetExitCodeProcess
+        #   的返回值；WaitForSingleObject 在对象【仍活跃】时返回的是
+        #   WAIT_TIMEOUT = 0x102 = 258。写 259 的话这个函数【永远返回 False】，
+        #   于是「进程起来了」这条断言必然失败（CI 第六轮就是这么挂的）。
+        return _k32.WaitForSingleObject(self._hproc, 0) == WAIT_TIMEOUT
+
+    def exit_code(self):
+        """子进程退出码；还在跑则返回 None。用来在断言失败时说清楚是怎么死的。"""
+        code = wintypes.DWORD(0)
+        if not _k32.GetExitCodeProcess(self._hproc, ctypes.byref(code)):
+            return None
+        return None if code.value == STILL_ACTIVE else code.value
+
+    def diagnostics(self):
+        """断言失败时打印这些，免得只能靠猜（这里没有 Windows，改一轮要等 4 分钟）。"""
+        d = os.path.join(self.tmp, "render_dump.log")
+        exists = os.path.exists(d)
+        size = os.path.getsize(d) if exists else -1
+        return ("alive=%s exit_code=%s 已读到输出=%d 字节  render_dump.log存在=%s 大小=%s  帧数=%s"
+                % (self.alive(), self.exit_code(), len(self.raw),
+                   exists, size, self.nframes()))
 
     def quit(self, timeout=5):
         _k32.TerminateProcess(self._hproc, 0)
