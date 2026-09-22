@@ -280,9 +280,15 @@ class Term(drive.Term):
         d = os.path.join(self.tmp, "render_dump.log")
         exists = os.path.exists(d)
         size = os.path.getsize(d) if exists else -1
+        # ★ 必须把【已读到的原始字节】打出来：CI 第七轮只看到「已读到 16 字节 +
+        #   exit_code=1」，而 main() 里 return 1 的两处（"no console attached" /
+        #   "cannot query console buffer"）都写 stderr —— 不看字节根本没法区分
+        #   是启动就失败、还是渲染了一半崩掉。
+        head = self.raw[:200]
         return ("alive=%s exit_code=%s 已读到输出=%d 字节  render_dump.log存在=%s 大小=%s  帧数=%s"
+                "\n         已读字节(前200)=%r"
                 % (self.alive(), self.exit_code(), len(self.raw),
-                   exists, size, self.nframes()))
+                   exists, size, self.nframes(), head))
 
     def quit(self, timeout=5):
         _k32.TerminateProcess(self._hproc, 0)

@@ -64,7 +64,8 @@ def main():
             # ★ 失败时把驱动的诊断信息一起打出来。这里没有 Windows，改一轮要等
             #   CI 3~4 分钟，光看「FAIL 帮助页出现」根本不知道该往哪查。
             print("  [FAIL] %s %s" % (name, detail))
-            if box.get("t") is not None:
+            if box.get("t") is not None and not box.get("diag"):
+                box["diag"] = True
                 print("         诊断: %s" % box["t"].diagnostics())
             fails.append(name)
 
