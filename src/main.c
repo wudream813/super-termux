@@ -159,10 +159,31 @@ static BOOL WINAPI ctrl_handler(DWORD type) {
  * 而 GetStdHandle 拿来的那两个【不能】关（不属于我们）。 */
 static HANDLE g_hout_owned = NULL;
 static HANDLE g_hin_owned  = NULL;
+static DWORD  g_hout_err = 0;          /* 第一次 GetConsoleScreenBufferInfo 的 GetLastError */
+static BOOL   g_setmode_in_ok = FALSE;
+static BOOL   g_setmode_out_ok = FALSE;
+
+/* TERMUX_DUMP 下的启动进度打点。CI 的 ConPTY 冒烟测试靠它定位卡在哪一步：
+ * 这里没有 Windows 也没有 wine，termux.exe 在 ConPTY 下的运行期行为只能由
+ * CI 揭示，而每一轮要 3~4 分钟 —— 与其一轮一轮试，不如让它自己把走到哪一步
+ * 写进 mouse_dump.log。只在设置了 TERMUX_DUMP 时生效，正式使用完全无影响。 */
+static void dump_mark(const char *fmt, ...) {
+    if (!g_dump_enabled) return;
+    FILE *f = fopen("mouse_dump.log", "ab");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
 
 int main(void) {
     memset(&g_mux, 0, sizeof(g_mux));
     InitializeCriticalSection(&g_mux.cs);
+    /* 提前读，好让启动路径上的 dump_mark 打点生效（原来在 console 查询之后才赋值）。 */
+    g_dump_enabled = getenv("TERMUX_DUMP") != NULL;
 
     g_mux.hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     g_mux.hIn = GetStdHandle(STD_INPUT_HANDLE);
@@ -192,6 +213,9 @@ int main(void) {
          *
          * 普通控制台窗口下 STD_OUTPUT_HANDLE 本来就可读，这段分支【不会】进入，
          * 所以现有 Windows 行为完全不变。 */
+        g_hout_err = GetLastError();   /* 必须在 CreateFileW 之前记，否则会被覆盖 */
+        dump_mark("[boot] console-query-failed err=%lu -> 尝试 CONOUT$",
+                  (unsigned long)g_hout_err);
         HANDLE hCo = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                                  OPEN_EXISTING, 0, NULL);
@@ -208,6 +232,10 @@ int main(void) {
             return 1;
         }
     }
+    dump_mark("[boot] console-ok host=%dx%d conout_fallback=%d stdout_err=%lu",
+              (int)(csbi.srWindow.Right - csbi.srWindow.Left + 1),
+              (int)(csbi.srWindow.Bottom - csbi.srWindow.Top + 1),
+              g_hout_owned != NULL, (unsigned long)g_hout_err);
     g_mux.host_cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
     g_mux.total_host_rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
     g_mux.host_rows = g_mux.total_host_rows - 1;
@@ -234,14 +262,15 @@ int main(void) {
     DWORD im = g_mux.orig_in_mode;
     im &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE);
     im |= ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
-    SetConsoleMode(g_mux.hIn, im);
+    g_setmode_in_ok = SetConsoleMode(g_mux.hIn, im);
     DWORD om = g_mux.orig_out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT | DISABLE_NEWLINE_AUTO_RETURN;
-    SetConsoleMode(g_mux.hOut, om);
+    g_setmode_out_ok = SetConsoleMode(g_mux.hOut, om);
     g_mux.orig_cp = GetConsoleOutputCP();
     g_mux.orig_input_cp = GetConsoleCP();
     SetConsoleOutputCP(65001);
     SetConsoleCP(65001);
-    g_dump_enabled = getenv("TERMUX_DUMP") != NULL;
+    dump_mark("[boot] setmode in=%d out=%d in_mode=0x%lx",
+              (int)g_setmode_in_ok, (int)g_setmode_out_ok, (unsigned long)im);
     if (g_dump_enabled) {
         FILE *f = fopen("mouse_dump.log", "ab");
         if (f) {
@@ -251,6 +280,8 @@ int main(void) {
     }
     SetConsoleCtrlHandler(ctrl_handler, TRUE);
     load_config();
+    dump_mark("[boot] config-loaded mouse=%d default_startup=%d",
+              (int)g_mouse_enabled, (int)g_default_startup);
 
     /* mouse = false 时既不申请控制台鼠标事件，也不打开 VT 鼠标追踪 */
     if (!g_mouse_enabled) SetConsoleMode(g_mux.hIn, im & ~(DWORD)ENABLE_MOUSE_INPUT);
@@ -266,6 +297,7 @@ int main(void) {
         Sleep(3000);
         goto cleanup;
     }
+    dump_mark("[boot] pane-created id=%d", first);
     split_init_tab(first);
     g_mux.active_pane = first;
     if (g_default_startup == 1) {
@@ -273,7 +305,9 @@ int main(void) {
     }
     g_mux.needs_redraw = 1;
     render_screen();
+    dump_mark("[boot] first-render-done help_mode=%d", (int)g_mux.help_mode);
     handle_input();
+    dump_mark("[boot] input-loop-exited");
     for (int i = 0; i < g_mux.pane_count; i++) close_pane(i);
 
 cleanup:

@@ -26,6 +26,7 @@ quit、close），这样同一套断言两边都能跑。读帧的那几个方�
 只在 Windows 上能用。在别的平台 import 不会炸（方便静态检查），但实例化会
 抛 RuntimeError 并说明原因。
 """
+import io
 import os
 import subprocess
 import sys
@@ -292,7 +293,7 @@ class Term(drive.Term):
         md_txt = ""
         if os.path.exists(md):
             try:
-                md_txt = io.open(md, "r", encoding="utf-8", errors="replace").read()[-200:]
+                md_txt = io.open(md, "r", encoding="utf-8", errors="replace").read()[-900:]
             except OSError:
                 md_txt = "<读不了>"
         return ("alive=%s exit_code=%s 已读到输出=%d 字节  render_dump.log存在=%s 大小=%s  帧数=%s"
