@@ -110,6 +110,12 @@ jobs:
       - name: 交叉构建 Windows 版
         run: make all 2>&1 | tee build-windows.log
 
+      - name: 交叉编译主机侧 harness（提前抓 Windows 侧的链接错）
+        # plat_* 替身漏一个就是 undefined reference，而 Windows 作业要跑 3 分钟
+        # 才发现。这个作业本来就装了 mingw-w64，几秒钟就能提前抓到。
+        # 2026-09-22 就是这样发现 plat_user_home 被错误地放在 #ifndef _WIN32 里。
+        run: make crosscheck-win-harness
+
       - name: 构建 Linux 版
         run: make -B linux 2>&1 | tee build-linux.log
 

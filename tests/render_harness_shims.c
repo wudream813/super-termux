@@ -156,9 +156,17 @@ void pane_resize_to(int i, int c, int r) { (void)i; (void)c; (void)r; }
  * 链接期报 undefined reference。 */
 #ifndef _WIN32
 const WCHAR *plat_default_shell(void) { return L"/bin/sh"; }
+#endif
 
 /* config.c 的 resolve_ini_path() 在 exe 同目录找不到 ini 时会回退到用户主目录。
- * harness 里返回 NULL —— 等价于移植前 _wgetenv(L"USERPROFILE") 拿不到值，
- * 于是测试不会往磁盘上写任何配置文件。 */
+ * harness 里返回 NULL —— 等价于 _wgetenv(L"USERPROFILE") 拿不到值，于是测试
+ * 不会往磁盘上写任何配置文件。
+ *
+ * ★ 这个必须【两个平台都定义】，不能放进上面的 #ifndef _WIN32 里。
+ *   它原来在里面，于是 mingw 交叉编译 render_harness / sb_drag_harness 时
+ *   config.c 找不到它：undefined reference to `plat_user_home'。
+ *   （harness 两个平台都不链 src/platform_win.c / platform_posix.c，
+ *     所以两边的替身都得由这份 shims 提供。）
+ *   plat_default_shell 才是真的 POSIX-only —— Windows 侧默认 shell 来自
+ *   platform.h 的 TERMUX_DEFAULT_SHELL_W 宏，不走平台层函数。 */
 const WCHAR *plat_user_home(void) { return NULL; }
-#endif

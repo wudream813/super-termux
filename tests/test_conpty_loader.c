@@ -14,6 +14,16 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* ★ setenv 是 POSIX 的，MinGW 没有（只有 putenv / _putenv_s），编译会报
+ *   error: implicit declaration of function 'setenv'
+ * —— CI 的 windows 作业第二次跑就是挂在这里（2026-09-22）。
+ * _putenv_s 在 MinGW 的 <stdlib.h> 里，实测 -Wall -Wextra -Werror 能过。
+ * 本文件 13 处 setenv 的第三个参数【全是 1】（覆盖），而 _putenv_s 恒为覆盖，
+ * 语义完全一致，所以这个映射是安全的。 */
+#ifdef _WIN32
+#define setenv(name, value, overwrite) _putenv_s(name, value)
+#endif
+
 /* ---- 测试钩子 ---- */
 int stub_dll_present = 1;
 int stub_symbols_complete = 1;

@@ -100,6 +100,30 @@ test:
 	python3 verify_all.py
 
 # 主题 / 键位模块不依赖 Win32 API，可用 tests/stub 的 windows.h 替身在本机跑
+# 交叉编译主机侧 harness。这些 harness 在 Windows 作业里也要能【链上】，
+# 而 plat_* 替身漏一个就是 undefined reference —— Windows 作业要跑 3 分钟才
+# 发现，Linux 作业几秒钟就能提前抓到（它本来就装了 mingw-w64 交叉编译器）。
+# 2026-09-22 就是这么发现 plat_user_home 被错误地放在 #ifndef _WIN32 里的。
+HARNESS_SRC = src/render.c src/split.c src/framediff.c src/theme.c src/screen.c \
+              src/vt.c src/utf8.c src/keymap.c src/input.c src/config.c src/cliphtml.c
+crosscheck-win-harness:
+	@for h in tests/render_harness.c tests/sb_drag_harness.c tests/cascade_probe.c; do \
+	  case $$h in \
+	    *cascade_probe*) S="src/screen.c src/vt.c src/utf8.c src/theme.c" ;; \
+	    *)               S="$(HARNESS_SRC) tests/render_harness_shims.c" ;; \
+	  esac; \
+	  printf "  交叉编译 %-32s " "$$h"; \
+	  if x86_64-w64-mingw32-gcc -O1 -Itests/stub -Iinclude $$S $$h -o /tmp/xchk.exe 2>/tmp/xchk.log; then \
+	    echo "ok"; \
+	  else echo "FAIL"; cat /tmp/xchk.log; exit 1; \
+	  fi; \
+	done
+	x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -Werror -Itests/stub -Iinclude \
+	  src/theme.c src/keymap.c tests/test_config.c -o /tmp/xchk_ut.exe -lm
+	x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -Werror -Itests/loaderstub -Iinclude \
+	  tests/test_conpty_loader.c src/conpty_loader.c -o /tmp/xchk_ld.exe
+	@echo "  交叉编译 unittest / conpty_loader      ok"
+
 unittest:
 	gcc -O1 -Wall -Wextra -Werror -Itests/stub -Iinclude src/theme.c src/keymap.c tests/test_config.c -o /tmp/termux_test_config$(HOST_EXE_EXT) -lm
 	/tmp/termux_test_config$(HOST_EXE_EXT)
