@@ -170,3 +170,20 @@ const WCHAR *plat_default_shell(void) { return L"/bin/sh"; }
  *   plat_default_shell 才是真的 POSIX-only —— Windows 侧默认 shell 来自
  *   platform.h 的 TERMUX_DEFAULT_SHELL_W 宏，不走平台层函数。 */
 const WCHAR *plat_user_home(void) { return NULL; }
+
+/* ---------------------------------------------------------------------------
+ * dump_mark / g_dump_enabled 的替身。
+ *
+ * 同步义务：这两个原本定义在 src/globals.c 里，但 harness【不链 globals.c】
+ * （它有自己的 main，g_mux 等全局都由这份 shims 提供）。src/input.c 在
+ * handle_key() 里会调 dump_mark 记录 ConPTY 送来的按键，于是交叉编译
+ * render_harness / sb_drag_harness 时报：
+ *     undefined reference to `dump_mark'
+ *     undefined reference to `g_dump_enabled'
+ * 2026-09-22 就是这么挂的（make crosscheck-win-harness exit=2）。
+ *
+ * 替身直接留空：harness 不需要落盘诊断，而且 g_dump_enabled 恒为 0 时
+ * 真实现也是立刻 return，行为等价。
+ * ------------------------------------------------------------------------- */
+int g_dump_enabled = 0;
+void dump_mark(const char *fmt, ...) { (void)fmt; }

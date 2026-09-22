@@ -68,6 +68,28 @@ int g_search_len = 0, g_search_pos = 0;
 int g_search_dirty = 0;
 
 int g_dump_enabled = 0;
+
+/* TERMUX_DUMP 下的进度打点，写进 mouse_dump.log。
+ *
+ * 原来这是 src/main.c 里的 static，但 src/input.c 也要用（记录 ConPTY 送来的
+ * 每个 KEY_EVENT），所以挪到这里 —— globals.c 是 Windows 和 POSIX 两个 main
+ * 共用的，定义一份两边都能链上。
+ *
+ * 为什么值得常驻：CI 的 ConPTY 冒烟测试是目前【唯一】能在真 Windows 上跑
+ * termux.exe 的手段，而每一轮要 3~4 分钟。让程序自己把走到哪一步、收到什么键
+ * 写下来，比一轮一轮猜便宜得多。只在设置了 TERMUX_DUMP 时生效，
+ * 正式使用完全无影响（g_dump_enabled 为 0 时直接 return）。 */
+void dump_mark(const char *fmt, ...) {
+    if (!g_dump_enabled) return;
+    FILE *f = fopen("mouse_dump.log", "ab");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
 static int g_mouse_log_moves = 0;
 
 

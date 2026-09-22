@@ -13,8 +13,6 @@
 #include "input.h"
 #include "split.h"
 
-/* 定义在 src/globals.c。 */
-extern int g_dump_enabled;
 
 void host_write(const char *s, int len) {
     while (len > 0) {
@@ -164,21 +162,6 @@ static DWORD  g_hin_err  = 0;          /* GetConsoleMode(hIn) 的 GetLastError *
 static BOOL   g_setmode_in_ok = FALSE;
 static BOOL   g_setmode_out_ok = FALSE;
 
-/* TERMUX_DUMP 下的启动进度打点。CI 的 ConPTY 冒烟测试靠它定位卡在哪一步：
- * 这里没有 Windows 也没有 wine，termux.exe 在 ConPTY 下的运行期行为只能由
- * CI 揭示，而每一轮要 3~4 分钟 —— 与其一轮一轮试，不如让它自己把走到哪一步
- * 写进 mouse_dump.log。只在设置了 TERMUX_DUMP 时生效，正式使用完全无影响。 */
-static void dump_mark(const char *fmt, ...) {
-    if (!g_dump_enabled) return;
-    FILE *f = fopen("mouse_dump.log", "ab");
-    if (!f) return;
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    va_end(ap);
-    fputc('\n', f);
-    fclose(f);
-}
 
 int main(void) {
     memset(&g_mux, 0, sizeof(g_mux));

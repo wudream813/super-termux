@@ -3144,6 +3144,22 @@ void handle_key(KEY_EVENT_RECORD *ke) {
         return;
     }
     WORD vk = ke->wVirtualKeyCode; DWORD ctrl = ke->dwControlKeyState; WCHAR uc = ke->uChar.UnicodeChar;
+    /* ★ TERMUX_DUMP 下记录每个 key-down 的原始三元组。
+     *
+     * 为什么需要：CI 第十二轮里 `C-b :` 完全没反应（末帧还停在帮助页、帧数=2），
+     * 而 CHR(':') 的 KeySpec 是 {vk=0, ch=':', ctrl=0, alt=0, shift=0, shift_any=1}，
+     * shift_any=1 意味着 Shift 根本不参与匹配、vk=0 时按字符匹配 —— 照理必中
+     * ACT_COMMAND_PALETTE。唯一能解释的是 spec_match 第一行
+     *     if (s->ctrl != (unsigned char)is_ctrl) return 0;
+     * 把它挡了，也就是【ConPTY 把字节 ':' 翻出来的 KEY_EVENT 里 dwControlKeyState
+     * 仍然带着前一个 \x02 的 Ctrl 位】。这个假设必须用真机数据证实或推翻，
+     * 不能靠读代码猜 —— 这里没有 Windows，每猜一轮要等 CI 3~4 分钟。 */
+    if (g_dump_enabled && ke->bKeyDown) {
+        dump_mark("[key] vk=0x%02X ctrl=0x%04lX uc=U+%04X | prefix=%d help=%d palette=%d search=%d copy=%d",
+                  (unsigned)vk, (unsigned long)ctrl, (unsigned)uc,
+                  (int)g_mux.prefix_mode, (int)g_mux.help_mode, (int)g_mux.palette_mode,
+                  (int)g_search_mode, (int)g_copy_mode);
+    }
     BOOL is_ctrl = (ctrl & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0, is_alt = (ctrl & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0, is_shift = (ctrl & SHIFT_PRESSED) != 0;
 
     if (g_mux.active_pane >= 0 && g_mux.active_pane < g_mux.pane_count && g_mux.panes[g_mux.active_pane].exited_hold) {

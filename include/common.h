@@ -44,6 +44,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+
+/* 定义在 src/globals.c。TERMUX_DUMP 下的诊断打点（见那里的注释）。
+ * 声明放在 common.h 是因为 main.c / input.c / globals.c 都 include 它。 */
+extern int g_dump_enabled;
+void dump_mark(const char *fmt, ...);
 #include <wctype.h>
 
 #ifdef _MSC_VER
