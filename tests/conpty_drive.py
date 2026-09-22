@@ -46,6 +46,9 @@ if IS_WINDOWS:
 
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
     EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+    # ★ 传宽字符环境块必须带这个标志，否则 Windows 按 ANSI 解析那块内存，
+    #   轻则环境变量全乱，重则 CreateProcessW 直接 ERROR_INVALID_PARAMETER。
+    CREATE_UNICODE_ENVIRONMENT = 0x00000400
     INFINITE = 0xFFFFFFFF
 
     class COORD(ctypes.Structure):
@@ -171,10 +174,20 @@ class Term(drive.Term):
         self._attr = (ctypes.c_byte * size.value)()
         if not _k32.InitializeProcThreadAttributeList(self._attr, 1, 0, ctypes.byref(size)):
             _fail("InitializeProcThreadAttributeList 失败: %d" % ctypes.get_last_error())
+        # ★★★ lpValue 必须传 HPCON 的【值本身】，不是 ctypes.byref(self._hpc)。
+        #   这和 UpdateProcThreadAttribute 其它属性的惯例【相反】——文档写的是
+        #   「lpValue: A pointer to the attribute value」，但 PSEUDOCONSOLE 这一项
+        #   微软自己的示例（echocon）传的就是 hPC 本身。传 byref 的话，属性列表里
+        #   存的"句柄"会变成【那个变量的地址】，CreateProcessW 拿到无效 HPCON，
+        #   直接返回 ERROR_INVALID_PARAMETER (87)。
+        #   CI 的 windows 作业第五轮就是这么挂的（2026-09-22）：
+        #       RuntimeError: CreateProcessW 失败: 87
+        #   对照来源：github.com/13angs/switchboard/pull/75，作者也踩过同一个坑，
+        #   并确认微软示例是传值。
         if not _k32.UpdateProcThreadAttribute(
                 self._attr, 0,
                 ctypes.c_void_p(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE),
-                ctypes.byref(self._hpc), ctypes.sizeof(self._hpc), None, None):
+                self._hpc, ctypes.sizeof(self._hpc), None, None):
             _fail("UpdateProcThreadAttribute 失败: %d" % ctypes.get_last_error())
 
         si = STARTUPINFOEXW()
@@ -186,7 +199,7 @@ class Term(drive.Term):
         cmdline = ctypes.create_unicode_buffer('"%s"' % EXE)
         ok = _k32.CreateProcessW(
             EXE, cmdline, None, None, False,
-            EXTENDED_STARTUPINFO_PRESENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
             _env_block(e), self.tmp,
             ctypes.byref(si), ctypes.byref(pi))
         if not ok:
