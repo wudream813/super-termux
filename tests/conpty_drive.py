@@ -300,6 +300,31 @@ class Term(drive.Term):
         #   是【画面没变】还是【画面变了但文案不同】。CI 第十一轮就是这样卡住的：
         #   「关于页出现」失败但「版本号=2.0.2」通过，看着自相矛盾 —— 其实是因为
         #   帮助页头部本来就有 "版本 v2.0.2 | ..."，而关于页压根没打开（帧数一直是 2）。
+        # ★ 这两个文件是【现成的】诊断源，之前一直没读：
+        #   termux_dump.log   src/globals.c:97  dump_pane_bytes() —— 窗格读线程
+        #                     【实际收到】的字节。cmd.exe 的输出有没有真的进到
+        #                     termux，看这个就知道，不用猜。
+        #   conpty_source.log src/conpty_loader.c:78 —— 加载的是捆绑的 conpty.dll
+        #                     还是系统自带的，以及 flags。
+        #   另外把 tmp 下所有 *.log 的大小列出来，避免再有"文件其实存在但没人看"。
+        logs = {}
+        try:
+            for nm in sorted(os.listdir(self.tmp)):
+                if nm.endswith(".log"):
+                    fp = os.path.join(self.tmp, nm)
+                    logs[nm] = os.path.getsize(fp)
+        except OSError:
+            pass
+
+        def _head(nm, n):
+            fp = os.path.join(self.tmp, nm)
+            if not os.path.exists(fp):
+                return "<无此文件>"
+            try:
+                return io.open(fp, "r", encoding="utf-8", errors="replace").read()[:n]
+            except OSError as ex:
+                return "<读不了: %s>" % ex
+
         try:
             last = self.frame()
         except Exception as ex:      # frame() 在文件缺失时会抛
@@ -308,9 +333,14 @@ class Term(drive.Term):
                 "\n         mouse_dump.log存在=%s 内容=%r"
                 "\n         末帧(前700)=%r"
                 "\n         已读字节(前300)=%r"
+                "\n         tmp下的log=%s"
+                "\n         conpty_source=%r"
+                "\n         窗格收到的字节(termux_dump 前500)=%r"
                 % (self.alive(), self.exit_code(), len(self.raw),
                    exists, size, self.nframes(),
-                   os.path.exists(md), md_txt, last[:700], self.raw[:300]))
+                   os.path.exists(md), md_txt, last[:700], self.raw[:300],
+                   logs, _head("conpty_source.log", 200),
+                   _head("termux_dump.log", 500)))
 
     def quit(self, timeout=5):
         _k32.TerminateProcess(self._hproc, 0)
