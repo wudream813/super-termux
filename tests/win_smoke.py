@@ -128,6 +128,11 @@ def main():
         ck("关于页没有「单文件 C」这个歧义措辞", "单文件 C" not in f)
         ck("关于页仓库链接指向 super-termux", "wudream813/super-termux" in f)
 
+        # 关于页是特殊内部 pane，src/input.c:3015 明确写了「设置页 / 关于页不允许
+        # 分屏」—— 不先关掉它，下面的分屏断言必然失败。默认关闭键是 Ctrl+B x
+        # （src/keymap.c:81  VKEY_ANY('X') -> ACT_CLOSE_PANE）。
+        t.send(cd.PREFIX + b"x", wait=1.0)
+
         # ---- 3) 分屏真的多出一个窗格 ----
         n0 = t.nframes()
         t.send(cd.PREFIX + b"_", wait=1.0)       # 上下分屏

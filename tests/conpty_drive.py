@@ -296,12 +296,21 @@ class Term(drive.Term):
                 md_txt = io.open(md, "r", encoding="utf-8", errors="replace").read()[-900:]
             except OSError:
                 md_txt = "<读不了>"
+        # ★ 末帧内容是最有用的一条：断言失败时光知道"没找到某个字面量"没法判断
+        #   是【画面没变】还是【画面变了但文案不同】。CI 第十一轮就是这样卡住的：
+        #   「关于页出现」失败但「版本号=2.0.2」通过，看着自相矛盾 —— 其实是因为
+        #   帮助页头部本来就有 "版本 v2.0.2 | ..."，而关于页压根没打开（帧数一直是 2）。
+        try:
+            last = self.frame()
+        except Exception as ex:      # frame() 在文件缺失时会抛
+            last = "<取不到: %s>" % ex
         return ("alive=%s exit_code=%s 已读到输出=%d 字节  render_dump.log存在=%s 大小=%s  帧数=%s"
                 "\n         mouse_dump.log存在=%s 内容=%r"
-                "\n         已读字节(全部)=%r"
+                "\n         末帧(前700)=%r"
+                "\n         已读字节(前300)=%r"
                 % (self.alive(), self.exit_code(), len(self.raw),
                    exists, size, self.nframes(),
-                   os.path.exists(md), md_txt, self.raw[:500]))
+                   os.path.exists(md), md_txt, last[:700], self.raw[:300]))
 
     def quit(self, timeout=5):
         _k32.TerminateProcess(self._hproc, 0)
