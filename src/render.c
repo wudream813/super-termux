@@ -3222,8 +3222,16 @@ void render_screen(void) {
                 }
                 /* v1.8.37：正文末尾(text_rc)之后到屏幕右缘这一段本帧不被任何显式
                  * 字符覆盖，必须用 \x1b[K 清行尾，否则布局收缩（关闭分屏窗格后
-                 * 活动窗格扩宽）时会残留上一帧的内容（右侧屏幕不重置）。 */
-                pos += snprintf(out + pos, bs - pos, "\x1b[0m\x1b[K");
+                 * 活动窗格扩宽）时会残留上一帧的内容（右侧屏幕不重置）。
+                 * v2.0.5：但正文已经铺满宿主整宽（alt 屏 nano/vim 每行写到第 N 列）
+                 * 时【不能】再发 \x1b[K —— 光标此刻处于「延迟折行挂起」态，逻辑上
+                 * 仍在末列，libvterm 系终端会从末列开始清、把刚写的最后一列擦成空白
+                 * （tmux/pyte 保留，libvterm 清掉，各家不一致，不能赌）。本帧右缘无
+                 * 残留可清，直接跳过。真机 nano 打开 80 列宽文件末列 'E' 消失即此。 */
+                if (text_rc < g_mux.host_cols)
+                    pos += snprintf(out + pos, bs - pos, "\x1b[0m\x1b[K");
+                else
+                    pos += snprintf(out + pos, bs - pos, "\x1b[0m");
                 if (show_sb && dist <= 10 && y != sb_spare) {
                     /* 滚动条轨道画在最右列：先清行尾（上面已发 \x1b[K），再回到
                      * 最右列画 thumb / track。 */

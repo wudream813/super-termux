@@ -104,7 +104,9 @@ jobs:
         run: |
           sudo apt-get update
           # mingw-w64 提供 x86_64-w64-mingw32-gcc，用来交叉编译 Windows 版
-          sudo apt-get install -y mingw-w64
+          # libvterm-dev：tests/verify_lastcol.py 用它回放 termux 输出，做语义级断言
+          # （末列真的是 E）。没有它脚本只做字节级判据并打 [SKIP]，不会假绿。
+          sudo apt-get install -y mingw-w64 libvterm-dev
           gcc --version; python3 --version
 
       - name: 交叉构建 Windows 版

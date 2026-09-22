@@ -5,7 +5,7 @@
 终端复用器（Terminal Multiplexer）—— 模块化 C 架构，单文件可执行。
 在一个终端窗口里管理多个 shell 会话，像 tmux 一样分标签页、分屏、搜历史。
 
-当前版本：**v2.0.4**（正式支持 Windows / Linux / macOS 三个系统）
+当前版本：**v2.0.5**（正式支持 Windows / Linux / macOS 三个系统）
 
 ## 平台支持
 
@@ -300,6 +300,16 @@ python3 verify_config_theme.py     # 配置体系：主题参考色板完整性 
 
 
 ## 版本历史
+
+**v2.0.5** —— 修 **bug #31**：alt 屏全屏程序（nano / vim）铺满整宽时最后一列显示为空白（Linux 真机报告）。
+
+| | |
+|---|---|
+| 现象 | termux 里 `nano` 打开 80 列宽文件，每行最后一个字符没了、显示成空白；直接跑 nano 正常 |
+| 机理 | 整屏路径每行画完正文后无条件补 `\x1b[0m\x1b[K` 清行尾（v1.8.37 为关闭分屏窗格后右侧残留而加）。正文已写满宿主整宽时，宿主终端光标处于「延迟折行挂起」态、逻辑上仍在末列，`EL(0)` 从末列起清，把刚写的那一格擦掉。**各家终端不一致**：tmux / pyte 保留末列，libvterm（neovim、不少 GUI 终端的内核）擦掉 |
+| 修法 | `render.c` 整屏路径：`text_rc < host_cols` 才发 `\x1b[K`；满宽时右缘本就没有残留可清，只发 `\x1b[0m` |
+| 判据 | 新增 `tests/verify_lastcol.py`（`make lastcol-posix`，已进 `check-posix`）：真 PTY 起 termux + 模拟满宽 alt 屏程序，① 字节级：满宽行后不紧跟 `\x1b[K`；② 语义级：libvterm 回放后第 80 列是 `E`。修前二进制两条都红（EL 命中 23 处、末列 `' '`），修后全绿。v1.8.37 的场景（关右窗格后左窗格扩宽无残留）复测仍通过 |
+| 分屏路径 | 不受影响：`render_split_pane` 逐格铺底不用 `\x1b[K`，分屏里 nano 末列本来就正常（已实测） |
 
 **v2.0.4** —— 第六轮外部审计（Linux 真机 + ASan）：修 **BUG-12** 键名截断，加固 `split_layout` 契约，新增 `-O1` 编译门禁。
 

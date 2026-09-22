@@ -62,7 +62,7 @@ void dump_mark(const char *fmt, ...);
  *   Windows : main.c + platform_win.c + conpty_loader.c     (ConPTY + CreateProcessW)
  *   POSIX   : main_posix.c + platform_posix.c + term_input_posix.c   (forkpty)
  * 接口见 include/platform.h。 */
-#define TERMUX_VERSION "2.0.4"
+#define TERMUX_VERSION "2.0.5"
 
 /* 平台副标题。帮助页 / 关于页那几行共用 UI 代码里要用，所以跟 TERMUX_VERSION
  * 放一起（render.c 只 include 了 common.h，没有 platform.h）。

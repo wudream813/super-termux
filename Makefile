@@ -235,6 +235,11 @@ unittest-posix-input:
 	$(POSIX_CC) -O1 -Wall -Iinclude tests/test_term_input_posix.c src/term_input_posix.c -o /tmp/termux_tti
 	/tmp/termux_tti
 
+# v2.0.5：alt 屏满宽最后一列不能被 \x1b[K 擦掉（真 PTY 起 termux + libvterm 回放）。
+# 需要 POSIX 二进制，所以不进 verify_all.py（那个在 Windows 作业也跑）。
+lastcol-posix: posix-build
+	TERMUX_LASTCOL_EXE=$$(ls termux-linux termux-macos 2>/dev/null | head -1) python3 tests/verify_lastcol.py
+
 smoke-posix: posix-build
 	TERMUX_SMOKE_EXE=$(CURDIR)/$(POSIX_TARGET) python3 tests/posix_smoke.py
 
@@ -276,11 +281,11 @@ unittest-posix-env:
 	/tmp/termux_ee
 
 # POSIX 侧一把梭：编译 + 不变量检查 + 三个 POSIX 单测 + 真 pty 冒烟 + 剪贴板/配置
-check-posix: posix-build verify-port unittest-posix-input unittest-posix-write unittest-posix-cmdline unittest-posix-env smoke-posix clip-posix
+check-posix: posix-build verify-port unittest-posix-input unittest-posix-write unittest-posix-cmdline unittest-posix-env smoke-posix clip-posix lastcol-posix
 	@echo "POSIX 检查全部通过"
 
 
 clean:
 	rm -f $(TARGET) $(TARGET_CPP) termux-linux termux-macos *.o
 
-.PHONY: all cpp test unittest lint-o1 posix-build clean planA planB plans v19 v20 v21 v22 v23 v24 linux darwin posix verify-loader unittest-posix-input unittest-posix-write unittest-posix-cmdline unittest-posix-env smoke-posix clip-posix check-posix verify-port
+.PHONY: all cpp test unittest lint-o1 posix-build clean planA planB plans v19 v20 v21 v22 v23 v24 linux darwin posix verify-loader unittest-posix-input unittest-posix-write unittest-posix-cmdline unittest-posix-env smoke-posix clip-posix lastcol-posix check-posix verify-port
