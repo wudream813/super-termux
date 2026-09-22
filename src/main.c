@@ -155,6 +155,11 @@ static BOOL WINAPI ctrl_handler(DWORD type) {
     return TRUE;
 }
 
+/* bug #30 用：如果启动时另开了 CONOUT$ / CONIN$，退出时要自己关掉，
+ * 而 GetStdHandle 拿来的那两个【不能】关（不属于我们）。 */
+static HANDLE g_hout_owned = NULL;
+static HANDLE g_hin_owned  = NULL;
+
 int main(void) {
     memset(&g_mux, 0, sizeof(g_mux));
     InitializeCriticalSection(&g_mux.cs);
@@ -169,9 +174,39 @@ int main(void) {
     }
     CONSOLE_SCREEN_BUFFER_INFO csbi;
     if (!GetConsoleScreenBufferInfo(g_mux.hOut, &csbi)) {
-        fprintf(stderr, "termux: cannot query console buffer\n");
-        DeleteCriticalSection(&g_mux.cs);
-        return 1;
+        /* ★ bug #30：STD_OUTPUT_HANDLE 可能是【只写】的，而
+         * GetConsoleScreenBufferInfo 要求句柄带 GENERIC_READ —— 只写句柄会让它
+         * 返回 0（GetLastError = ERROR_INVALID_HANDLE，6）。
+         *
+         * 在 ConPTY 下这是【必然】的：子进程拿到的标准 I/O 是 ConDrv 上通用的
+         * "Input"/"Output" 句柄，而不是 CONIN$/CONOUT$。于是 termux 在启动
+         * 第一步就 "cannot query console buffer" 退出（2026-09-22 由 CI 的
+         * ConPTY 冒烟测试首次暴露：裸跑 stderr 正好是这句话，退出码 1）。
+         *
+         * 解法是另开一个 CONOUT$（读写都有）并改用它。同一个句柄也供
+         * host_write / SetConsoleMode 使用 —— 写 CONOUT$ 会落到进程所属的控制台
+         * 会话，在 ConPTY 下那个会话就是伪控制台，所以输出照样回到管道里。
+         * 这一改同时修好另外两处同样用 g_mux.hOut 查询的地方：
+         *   src/main.c:43（resize 时静默 return，等于 resize 检测失效）
+         *   src/platform_win.c:96（plat_console_size 直接返回 -1）
+         *
+         * 普通控制台窗口下 STD_OUTPUT_HANDLE 本来就可读，这段分支【不会】进入，
+         * 所以现有 Windows 行为完全不变。 */
+        HANDLE hCo = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                 OPEN_EXISTING, 0, NULL);
+        if (hCo != INVALID_HANDLE_VALUE) {
+            g_mux.hOut = hCo;
+            g_hout_owned = hCo;
+        }
+        if (!GetConsoleScreenBufferInfo(g_mux.hOut, &csbi)) {
+            /* 带上 GetLastError，免得下次又要多花一轮 CI 才知道卡在哪。 */
+            fprintf(stderr, "termux: cannot query console buffer (err=%lu)\n",
+                    (unsigned long)GetLastError());
+            if (g_hout_owned) { CloseHandle(g_hout_owned); g_hout_owned = NULL; }
+            DeleteCriticalSection(&g_mux.cs);
+            return 1;
+        }
     }
     g_mux.host_cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
     g_mux.total_host_rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
@@ -183,6 +218,19 @@ int main(void) {
     GetConsoleMode(g_mux.hIn, &g_mux.orig_in_mode);
     GetConsoleMode(g_mux.hOut, &g_mux.orig_out_mode);
     GetConsoleTitleW(g_orig_title, 255);
+    /* 输入侧同理：STD_INPUT_HANDLE 在 ConPTY 下是通用 "Input" 句柄，
+     * SetConsoleMode 一旦失败，程序会【看起来正常运行但收不到任何按键】，
+     * 比启动就报错更难查。所以这里也补一个 CONIN$ 兜底。 */
+    if (!SetConsoleMode(g_mux.hIn, g_mux.orig_in_mode) && g_mux.orig_in_mode) {
+        HANDLE hCi = CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                 OPEN_EXISTING, 0, NULL);
+        if (hCi != INVALID_HANDLE_VALUE) {
+            g_mux.hIn = hCi;
+            g_hin_owned = hCi;
+            GetConsoleMode(g_mux.hIn, &g_mux.orig_in_mode);
+        }
+    }
     DWORD im = g_mux.orig_in_mode;
     im &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE);
     im |= ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
@@ -242,6 +290,8 @@ cleanup:
     SetConsoleOutputCP(g_mux.orig_cp);
     SetConsoleCP(g_mux.orig_input_cp);
     render_cleanup();
+    if (g_hout_owned) { CloseHandle(g_hout_owned); g_hout_owned = NULL; }
+    if (g_hin_owned)  { CloseHandle(g_hin_owned);  g_hin_owned  = NULL; }
     DeleteCriticalSection(&g_mux.cs);
     printf("Bye!\n");
     return 0;
