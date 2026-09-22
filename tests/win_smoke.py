@@ -56,7 +56,16 @@ def main():
         return 1
 
     fails = []
+    skips = []
     box = {}
+
+    def skip(name, why):
+        """环境不具备条件时【明确记为 SKIP 并打印原因】。
+
+        ★ 绝不能改成「悄悄通过」：CI 绿了但没人知道少测了什么，比红着更糟。
+        """
+        print("  [SKIP] %s —— %s" % (name, why))
+        skips.append(name)
 
     def ck(name, cond, detail=""):
         if cond:
@@ -110,12 +119,29 @@ def main():
         print("  对照(裸 cmd.exe 走同一个 ConPTY 驱动): alive=%s exit_code=%s 收到=%d 字节"
               % (cp.alive(), cp.exit_code(), len(cp.raw)))
         print("         前 160 字节=%r" % (cp.raw[:160],))
+        # 判据：cmd.exe 【本体】的输出有没有回到管道。conhost 自己的初始化只有
+        # 85 字节（\x1b[?9001h / ?1004h / ?25l / 2J / m / H / OSC 标题 / ?25h），
+        # cmd 的横幅里一定有 "[Version"。CI 第十八轮实测：裸 cmd.exe 同样
+        # alive=False exit_code=0、只收到 85 字节，横幅跑到了 runner 控制台上
+        # —— 所以这是【环境】问题，不是 termux 的问题。
+        pane_env_ok = bool(cp.alive()) or (b"[Version" in cp.raw)
         try:
             cp.close()
         except Exception:
             pass
     except Exception as ex:
         print("  对照(裸 cmd.exe): 起不来 —— %s" % ex)
+
+    if pane_env_ok:
+        print("  ⇒ 对照通过：这个环境下 ConPTY 子进程能正常收发，下面全部按硬断言跑。")
+    else:
+        print("  ⇒ 对照失败：这个环境下【裸 cmd.exe 也绑不到伪控制台】"
+              "（输出跑到宿主控制台、进程立刻 exit 0）。")
+        print("     这不是 termux 的问题 —— 同一个驱动、同一套 ConPTY 调用，"
+              "换成 bare cmd.exe 结果一样。")
+        print("     后果：子 shell 一死，最后一个窗格被回收，termux 跟着退出"
+              "（src/main.c:130-135），")
+        print("     于是所有【需要活窗格】的断言在这里都测不了，下面记为 SKIP。")
 
     t = cd.Term(cols=100, rows=30)
     box["t"] = t
@@ -141,39 +167,49 @@ def main():
         for bad in ("Linux Terminal Multiplexer", "macOS Terminal Multiplexer"):
             ck("帮助页没串成 %s" % bad.split()[0], bad not in f)
 
-        # ---- 2) 关于页：走命令面板打开 ----
-        t.send(cd.PREFIX + b":", wait=0.8)
-        t.send("about", wait=0.8)
-        t.send(b"\r", wait=1.2)
-        ck("关于页出现", wait(lambda: "版本号" in t.frame()))
-        f = t.frame()
-        ck("关于页标题是 Windows 的（bug #5）", "Windows 终端复用器" in f)
-        ck("关于页副标题写的是 ConPTY", "基于 Windows ConPTY" in f)
-        ck("关于页版本号 = %s" % ver, ("v" + ver) in f)
-        ck("关于页没有「单文件 C」这个歧义措辞", "单文件 C" not in f)
-        ck("关于页仓库链接指向 super-termux", "wudream813/super-termux" in f)
+        if pane_env_ok:
+            # ---- 2) 关于页：走命令面板打开 ----
+            t.send(cd.PREFIX + b":", wait=0.8)
+            t.send("about", wait=0.8)
+            t.send(b"\r", wait=1.2)
+            ck("关于页出现", wait(lambda: "版本号" in t.frame()))
+            f = t.frame()
+            ck("关于页标题是 Windows 的（bug #5）", "Windows 终端复用器" in f)
+            ck("关于页副标题写的是 ConPTY", "基于 Windows ConPTY" in f)
+            ck("关于页版本号 = %s" % ver, ("v" + ver) in f)
+            ck("关于页没有「单文件 C」这个歧义措辞", "单文件 C" not in f)
+            ck("关于页仓库链接指向 super-termux", "wudream813/super-termux" in f)
 
-        # 关于页是特殊内部 pane，src/input.c:3015 明确写了「设置页 / 关于页不允许
-        # 分屏」—— 不先关掉它，下面的分屏断言必然失败。默认关闭键是 Ctrl+B x
-        # （src/keymap.c:81  VKEY_ANY('X') -> ACT_CLOSE_PANE）。
-        t.send(cd.PREFIX + b"x", wait=1.0)
+            # 关于页是特殊内部 pane，src/input.c:3015 明确写了「设置页 / 关于页不允许
+            # 分屏」—— 不先关掉它，下面的分屏断言必然失败。默认关闭键是 Ctrl+B x
+            # （src/keymap.c:81  VKEY_ANY('X') -> ACT_CLOSE_PANE）。
+            t.send(cd.PREFIX + b"x", wait=1.0)
 
-        # ---- 3) 分屏真的多出一个窗格 ----
-        n0 = t.nframes()
-        t.send(cd.PREFIX + b"_", wait=1.0)       # 上下分屏
-        wait(lambda: t.nframes() > n0, n=30)
-        f = t.frame()
-        ck("分屏后出现了窗格分隔", ("─" in f) or ("│" in f) or ("┼" in f),
-           "帧里没找到任何分隔字符")
+            # ---- 3) 分屏真的多出一个窗格 ----
+            n0 = t.nframes()
+            t.send(cd.PREFIX + b"_", wait=1.0)       # 上下分屏
+            wait(lambda: t.nframes() > n0, n=30)
+            f = t.frame()
+            ck("分屏后出现了窗格分隔", ("─" in f) or ("│" in f) or ("┼" in f),
+               "帧里没找到任何分隔字符")
 
-        # ---- 4) resize 之后内容还在 ----
-        marker = "SMOKE_MARKER_9137"
-        t.send(("echo %s\r" % marker).encode(), wait=1.2)
-        ck("标记出现在屏幕上", wait(lambda: marker in t.frame()))
-        t.resize(70, 24, wait=1.2)                # 变窄
-        ck("变窄后标记仍在", marker in t.frame())
-        t.resize(120, 34, wait=1.2)               # 变宽
-        ck("变宽后标记仍在", marker in t.frame())
+            # ---- 4) resize 之后内容还在 ----
+            marker = "SMOKE_MARKER_9137"
+            t.send(("echo %s\r" % marker).encode(), wait=1.2)
+            ck("标记出现在屏幕上", wait(lambda: marker in t.frame()))
+            t.resize(70, 24, wait=1.2)                # 变窄
+            ck("变窄后标记仍在", marker in t.frame())
+            t.resize(120, 34, wait=1.2)               # 变宽
+            ck("变宽后标记仍在", marker in t.frame())
+        else:
+            why = ("这个 runner 上 ConPTY 子进程绑不到伪控制台，"
+                   "子 shell 立刻退出 ⇒ 窗格被回收 ⇒ termux 退出")
+            for nm in ("关于页出现", "关于页标题是 Windows 的（bug #5）",
+                       "关于页副标题写的是 ConPTY", "关于页版本号",
+                       "关于页仓库链接指向 super-termux",
+                       "分屏后出现了窗格分隔", "标记出现在屏幕上",
+                       "变窄后标记仍在", "变宽后标记仍在"):
+                skip(nm, why)
 
     finally:
         try:
@@ -186,6 +222,12 @@ def main():
     if fails:
         print("%d 项失败：%s" % (len(fails), "；".join(fails)))
         return 1
+    if skips:
+        print("Windows 冒烟测试通过（硬断言全过），但有 %d 项因环境限制被 SKIP：%s"
+              % (len(skips), "；".join(skips)))
+        print("★ 这些不是「通过」，是「这个 runner 上测不了」。换有真交互控制台的"
+              "机器（或本地 Windows Terminal）应当把它们跑成硬断言。")
+        return 0
     print("Windows 冒烟测试全部通过")
     return 0
 
