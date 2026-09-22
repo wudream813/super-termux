@@ -232,7 +232,7 @@ int create_about_pane(void) {
         "  \x1b[038;2;217;119;054;1m■ 作  者 (Author)       :\x1b[0m \x1b[038;2;063;185;080;1mwu_dream813\x1b[0m\r\n"
         "  \x1b[038;2;217;119;054;1m■ 系统版本 (OS Version) :\x1b[0m \x1b[038;2;230;237;243m%s\x1b[0m\r\n"
         "  \x1b[038;2;048;054;061m────────────────────────────────────────────────────────────\x1b[0m\r\n\r\n"
-        "  \x1b[038;2;139;148;158m开源项目仓库 : \x1b[038;2;088;166;255;4mhttps://github.com/wudream813/win-termux\x1b[0m\r\n"
+        "  \x1b[038;2;139;148;158m开源项目仓库 : \x1b[038;2;088;166;255;4mhttps://github.com/wudream813/super-termux\x1b[0m\r\n"
         "  \x1b[038;2;139;148;158m开源许可协议 : \x1b[038;2;230;237;243mMIT License\x1b[0m\r\n\r\n"
         "  \x1b[038;2;110;118;129m提示: 这是一个独立的关于标签页，可点击右上角 [x] 或按 %s 关闭\x1b[0m\r\n",
         sys_ver, close_key);

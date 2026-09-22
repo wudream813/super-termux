@@ -20,6 +20,11 @@ import os
 import re
 import subprocess
 import sys
+# ★ 平台差异（MinGW 给无扩展名的 -o 补 .exe / MinGW 无 -fsanitize）
+#   统一收在 tests/hbuild.py；降级时会自己往 stderr 打 [SKIP-SANITIZER]。
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+import hbuild  # noqa: E402
+
 import tempfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -157,7 +162,7 @@ def run_cc(cfile, out, extra_objs=(), cxx=False, extra_inc=()):
     inc_args = []
     for d in extra_inc:
         inc_args += ["-I", d]
-    cmd = [cc, "-O1", "-g", "-fsanitize=address,undefined",
+    cmd = [cc, "-O1", "-g", *hbuild.sanitize_flags(),
            "-Wall", "-Wextra"] + inc_args + ["-I", INC, cfile, "-o", out] + list(extra_objs)
     if cxx:
         cmd += ["-x", "c++"]
@@ -213,7 +218,7 @@ def main():
         def obj(name):
             of = os.path.join(td, name + ".o")
             p = subprocess.run(
-                ["gcc", "-O1", "-g", "-fsanitize=address,undefined",
+                ["gcc", "-O1", "-g", *hbuild.sanitize_flags(),
                  "-I", stubdir, "-I", INC, "-c",
                  os.path.join(SRC, name + ".c"), "-o", of],
                 capture_output=True, text=True)
@@ -224,7 +229,7 @@ def main():
 
         objs = [obj("screen"), obj("vt"), obj("utf8"), obj("cliphtml")]
         gobj = os.path.join(td, "globals.o")
-        p = subprocess.run(["gcc", "-O1", "-g", "-fsanitize=address,undefined",
+        p = subprocess.run(["gcc", "-O1", "-g", *hbuild.sanitize_flags(),
                             "-I", stubdir, "-I", INC, "-c", glob, "-o", gobj],
                            capture_output=True, text=True)
         if p.returncode != 0:

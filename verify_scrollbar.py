@@ -21,6 +21,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+# ★ 平台差异（MinGW 给无扩展名的 -o 补 .exe / MinGW 无 -fsanitize）
+#   统一收在 tests/hbuild.py；降级时会自己往 stderr 打 [SKIP-SANITIZER]。
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+import hbuild  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parent
 RENDER = (ROOT / "src" / "render.c").read_text(encoding="utf-8")
@@ -92,8 +98,8 @@ def run(src_text):
     with tempfile.TemporaryDirectory() as td:
         c = Path(td) / "sb.c"
         c.write_text(src_text, encoding="utf-8")
-        exe = Path(td) / "sb"
-        r = subprocess.run(["gcc", "-O1", "-Wall", "-Wextra", "-Werror", str(c), "-o", str(exe)],
+        exe = Path(hbuild.exe_path(td, "sb"))
+        r = subprocess.run([hbuild.gcc(), "-O1", "-Wall", "-Wextra", "-Werror", str(c), "-o", str(exe)],
                            capture_output=True, text=True)
         if r.returncode:
             print(r.stderr)

@@ -14,6 +14,11 @@ import os
 import subprocess
 import sys
 import tempfile
+# ★ 平台差异（MinGW 给无扩展名的 -o 补 .exe / MinGW 不支持 -fsanitize）
+#   统一收在 tests/hbuild.py，不要在这里各写一份 sys.platform 判断。
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+import hbuild  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = (ROOT / "src" / "render.c").read_text(encoding="utf-8")
@@ -146,10 +151,10 @@ def main() -> int:
     code = PRELUDE + "\n" + MATCHING + "\n" + DRIVER
     with tempfile.TemporaryDirectory() as tmp:
         c_file = os.path.join(tmp, "palette_search.c")
-        exe = os.path.join(tmp, "palette_search")
+        exe = hbuild.exe_path(tmp, "palette_search")
         Path(c_file).write_text(code, encoding="utf-8")
         result = subprocess.run(
-            ["gcc", "-std=c99", "-O2", "-Wall", "-Wextra", c_file, "-o", exe],
+            [hbuild.gcc(), "-std=c99", "-O2", "-Wall", "-Wextra", c_file, "-o", exe],
             capture_output=True,
             text=True,
         )

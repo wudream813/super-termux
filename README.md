@@ -1,11 +1,11 @@
-# win-termux
+# super-termux
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 终端复用器（Terminal Multiplexer）—— 模块化 C 架构，单文件可执行。
 在一个终端窗口里管理多个 shell 会话，像 tmux 一样分标签页、分屏、搜历史。
 
-当前版本：**v2.0.1**（正式支持 Windows / Linux / macOS 三个系统）
+当前版本：**v2.0.2**（正式支持 Windows / Linux / macOS 三个系统）
 
 ## 平台支持
 
@@ -150,7 +150,7 @@ TERMUX_DUMP=1 ./termux-linux
 - 配置文件分四段：`[general]` 行为、`[theme]` 配色、`[keys]` 键位、`[menu]` 新建菜单。
 
 ```ini
-# win-termux 配置文件 (UTF-8)
+# super-termux 配置文件 (UTF-8)
 
 [general]
 theme = github-dark        # github-dark | one-dark | nord | gruvbox-dark | dracula
@@ -300,6 +300,26 @@ python3 verify_config_theme.py     # 配置体系：主题参考色板完整性 
 
 
 ## 版本历史
+
+**v2.0.2** —— 仓库改名 `win-termux` → **`super-termux`**（已经支持三个系统，
+名字里的 `win-` 不再合适）。关于页的仓库链接、生成的 `termux.ini` 头部注释、
+README 标题同步更新；`history.md` 和描述历史 bug 的代码注释**保持原样**，
+不改写过去的记录。
+
+这一版还补上了 Windows 侧缺失的运行时测试。CI 的 `windows` 作业以前只有
+「构建 + 静态检查」，一个运行时测试都没有：
+
+- **主机侧回归**：`make unittest`、`make verify-loader`、`verify_all.py`。这些用
+  `tests/stub/windows.h` 替身，不需要真终端。为此把两个只在 Windows 上出现的
+  坑收进了 `tests/hbuild.py` 和 Makefile 的 `HOST_EXE_EXT`：MinGW 会给【无扩展名】
+  的 `-o` 自动补 `.exe`（`-o foo` 产出 `foo.exe`，脚本随后找 `foo` 就挂），
+  以及 MinGW 不支持 `-fsanitize`（现在显式降级并打 `[SKIP-SANITIZER]`，不静默）。
+- **真 ConPTY 冒烟测试**：新增 `tests/conpty_drive.py`（`CreatePseudoConsole` +
+  `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`，接口与 `tests/drive.py` 对齐，读帧的
+  方法直接复用）和 `tests/win_smoke.py`。验的是**运行期**证据：关于页/帮助页的
+  平台文案（bug #5/#9 以前只做到 `gcc -E` 预处理级）、分屏真的多出窗格、
+  resize 之后历史还在 —— 最后一项正是最初那个「resize 丢历史」bug 的老家，
+  此前从没有过 Windows 上的自动化复现手段。
 
 **v2.0.1** —— 修正「单文件 C」这个措辞。关于页副标题原来写「基于 …… 的高性能单文件 C
 终端复用多标签环境」，「单文件 C」很容易被读成「源码只有一个 C 文件」，而实际是

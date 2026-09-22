@@ -18,6 +18,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+# ★ 平台差异（MinGW 给无扩展名的 -o 补 .exe / MinGW 不支持 -fsanitize）
+#   统一收在 tests/hbuild.py，不要在这里各写一份 sys.platform 判断。
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+import hbuild  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parent
 hdr = (ROOT / "include" / "screen.h").read_text(encoding="utf-8")
@@ -830,8 +836,9 @@ def main() -> int:
         c = Path(td) / "t.c"
         exe = Path(td) / "t.bin"
         c.write_text(CODE, encoding="utf-8")
+        hbuild.sanitize_report()   # 不可用时大声说明，别悄悄降级
         build = subprocess.run(
-            ["gcc", "-O1", "-g", "-fsanitize=address,undefined", "-Wall", "-Wextra",
+            [hbuild.gcc(), "-O1", "-g", *hbuild.sanitize_flags(), "-Wall", "-Wextra",
              "-o", str(exe), str(c)],
             capture_output=True, text=True)
         if build.returncode:

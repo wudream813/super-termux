@@ -66,6 +66,28 @@ jobs:
         # MSYS2 的 python 包给的是 python 而不是 python3，所以不走 make verify-port
         run: python tests/verify_port.py
 
+      - name: 主机侧回归（tests/stub 的 windows.h 替身，不需要真终端）
+        # ★ Gap A：这个作业以前【一个运行时测试都没有】，只有构建 + 静态检查。
+        #   下面这些用的是 tests/stub/windows.h 替身，不需要真终端，只要有 gcc。
+        #   平台差异（MinGW 给无扩展名的 -o 补 .exe / MinGW 无 -fsanitize）已经
+        #   收进 tests/hbuild.py 和 Makefile 的 HOST_EXE_EXT。
+        run: |
+          set -e
+          # MINGW64 的 python 包给的是 python 而不是 python3，而 harness 脚本里
+          # 写的是 python3。补一个同名入口，别去改十几个脚本。
+          command -v python3 >/dev/null 2>&1 || ln -sf "$(command -v python)" /usr/bin/python3
+          python3 --version
+          make unittest          # 主题/键位/配置，-Werror
+          make verify-loader     # conpty_loader 的决策逻辑
+          python3 verify_all.py
+
+      - name: Windows 冒烟测试（真 ConPTY 驱动 termux.exe）
+        # ★ Gap B：tests/conpty_drive.py 用 CreatePseudoConsole 把 termux.exe
+        #   挂到真 ConPTY 上，接口和 tests/drive.py 对齐。验的是运行期证据：
+        #   关于页/帮助页的平台文案（bug #5/#9 以前只做到预处理级）、分屏、
+        #   以及 resize 之后历史还在 —— 后者正是最初那个丢历史 bug 的老家。
+        run: python tests/win_smoke.py
+
       - uses: actions/upload-artifact@v4
         with:
           name: termux-windows

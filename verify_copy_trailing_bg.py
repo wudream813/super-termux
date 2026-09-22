@@ -19,6 +19,11 @@ import os
 import re
 import subprocess
 import sys
+# ★ 平台差异（MinGW 给无扩展名的 -o 补 .exe / MinGW 无 -fsanitize）
+#   统一收在 tests/hbuild.py；降级时会自己往 stderr 打 [SKIP-SANITIZER]。
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+import hbuild  # noqa: E402
+
 import tempfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -142,11 +147,11 @@ def main():
     harness = HARNESS.replace("%(func)s", func)
     with tempfile.TemporaryDirectory() as td:
         hc = os.path.join(td, "harness.c")
-        binp = os.path.join(td, "harness")
+        binp = hbuild.exe_path(td, "harness")
         open(hc, "w", encoding="utf-8").write(harness)
         inc = os.path.join(ROOT, "include")
         p = subprocess.run(
-            ["gcc", "-O1", "-g", "-fsanitize=address,undefined",
+            ["gcc", "-O1", "-g", *hbuild.sanitize_flags(),
              "-Wall", "-Wextra", "-Werror", "-I", inc, hc, "-o", binp],
             capture_output=True, text=True)
         if p.returncode != 0:

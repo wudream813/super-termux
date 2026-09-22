@@ -101,8 +101,8 @@ test:
 
 # 主题 / 键位模块不依赖 Win32 API，可用 tests/stub 的 windows.h 替身在本机跑
 unittest:
-	gcc -O1 -Wall -Wextra -Werror -Itests/stub -Iinclude src/theme.c src/keymap.c tests/test_config.c -o /tmp/termux_test_config -lm
-	/tmp/termux_test_config
+	gcc -O1 -Wall -Wextra -Werror -Itests/stub -Iinclude src/theme.c src/keymap.c tests/test_config.c -o /tmp/termux_test_config$(HOST_EXE_EXT) -lm
+	/tmp/termux_test_config$(HOST_EXE_EXT)
 
 # ===========================================================================
 # POSIX（Linux / macOS）构建。引擎代码与 Windows 完全共用，只有 main / 进程 /
@@ -119,6 +119,15 @@ POSIX_SRC = src/config.c src/cliphtml.c src/framediff.c src/globals.c src/input.
 POSIX_CC     ?= cc
 POSIX_CFLAGS = -O2 -std=gnu11 -Wall -Wextra -Iinclude
 UNAME_S := $(shell uname -s)
+# ★ 主机侧测试产物在 Windows（含 MSYS2/MINGW64，uname -s 形如
+#   MINGW64_NT-10.0-26100）上必须显式带 .exe：MinGW 的 gcc 只会给【无扩展名】
+#   的 -o 自动补 .exe，补完 Makefile 再去执行没扩展名的路径就找不到了。
+#   实测见 tests/hbuild.py 的文档字符串。
+ifneq (,$(findstring MINGW,$(UNAME_S))$(findstring MSYS,$(UNAME_S))$(findstring CYGWIN,$(UNAME_S)))
+HOST_EXE_EXT := .exe
+else
+HOST_EXE_EXT :=
+endif
 ifeq ($(UNAME_S),Darwin)
   POSIX_LDFLAGS  = -lpthread
   POSIX_TARGET   = termux-macos

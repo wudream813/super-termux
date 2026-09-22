@@ -328,7 +328,7 @@ void save_config(void) {
     int len;
 
     const char *header =
-        "# win-termux 配置文件 (UTF-8)\r\n"
+        "# super-termux 配置文件 (UTF-8)\r\n"
         "# [general] 全局行为 / [theme] 配色 / [keys] 键位 / [menu] 新建菜单\r\n"
         "\r\n"
         "[general]\r\n"

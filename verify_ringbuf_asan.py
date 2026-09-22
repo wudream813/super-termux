@@ -11,6 +11,11 @@ import tempfile
 import os
 import sys
 from pathlib import Path
+# ★ 平台差异（MinGW 给无扩展名的 -o 补 .exe / MinGW 无 -fsanitize）
+#   统一收在 tests/hbuild.py；降级时会自己往 stderr 打 [SKIP-SANITIZER]。
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+import hbuild  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parent
 
@@ -220,7 +225,7 @@ def main():
             f.write(C_TEST_CODE)
 
         compile_cmd = [
-            "gcc", "-O2", "-g", "-fsanitize=address,undefined",
+            "gcc", "-O2", "-g", *hbuild.sanitize_flags(),
             "-o", exe_path, c_path
         ]
         res = subprocess.run(compile_cmd, capture_output=True, text=True)

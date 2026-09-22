@@ -4,9 +4,12 @@
 # 每个 case 一个进程（conpty_loader_init 内部缓存结果），逐个跑并汇总退出码。
 set -u
 cd "$(dirname "$0")/.." || exit 1
+# ★ Windows（MSYS2/MINGW64，uname -s 形如 MINGW64_NT-...）上 MinGW 的 gcc 会给
+#   【无扩展名】的 -o 自动补 .exe，后面再执行没扩展名的路径就找不到。显式带上。
+case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) EXE=.exe ;; *) EXE= ;; esac
 
-BIN=/tmp/tcl_base
-BIN_A=/tmp/tcl_planA
+BIN=/tmp/tcl_base$EXE
+BIN_A=/tmp/tcl_planA$EXE
 rc=0
 
 echo "=== conpty_loader 决策逻辑回归 ==="

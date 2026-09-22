@@ -23,6 +23,11 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+# ★ 平台差异统一收在 tests/hbuild.py（MinGW 无 -fsanitize，会显式跳过并说明）。
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+import hbuild  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parent
 FRAMEDIFF_C = ROOT / "src" / "framediff.c"
@@ -130,7 +135,7 @@ def main() -> int:
             print("FAIL: real_realloc.c 编译失败", file=sys.stderr)
             return 1
         cp = subprocess.run(
-            ["gcc", "-O1", "-g", "-fsanitize=address", "-fno-omit-frame-pointer",
+            [hbuild.gcc(), "-O1", "-g", *hbuild.sanitize_flags("address"), "-fno-omit-frame-pointer",
              "-Drealloc=fio_realloc", "-I" + str(ROOT / "include"),
              str(harness), str(FRAMEDIFF_C), str(realobj), "-o", str(exe), "-lm"],
             capture_output=True, text=True)

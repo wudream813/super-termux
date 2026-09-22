@@ -17,8 +17,11 @@
 # （trace 显示 59->24 时 hist=0、height=7，即拖窄发生在敲 dir 之前）。
 set -e
 cd "$(dirname "$0")/.."
+# ★ Windows（MSYS2/MINGW64，uname -s 形如 MINGW64_NT-...）上 MinGW 的 gcc 会给
+#   【无扩展名】的 -o 自动补 .exe，后面再执行没扩展名的路径就找不到。显式带上。
+case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) EXE=.exe ;; *) EXE= ;; esac
 
-BIN=/tmp/verify_cascade_probe
+BIN=/tmp/verify_cascade_probe$EXE
 gcc -O1 -Itests/stub -Iinclude tests/cascade_probe.c \
     src/screen.c src/vt.c src/utf8.c src/theme.c -o "$BIN"
 
@@ -123,7 +126,7 @@ done
 echo "=== 4) 探测器自检（对已知坏代码必须报 FAIL，否则上面的 PASS 不可信）==="
 TMPVT=/tmp/vt_cup_regress.c
 python3 tools/make_cup_regress_vt.py src/vt.c "$TMPVT"
-BADBIN=/tmp/verify_cascade_probe_bad
+BADBIN=/tmp/verify_cascade_probe_bad$EXE
 gcc -O1 -Itests/stub -Iinclude tests/cascade_probe.c \
     src/screen.c "$TMPVT" src/utf8.c src/theme.c -o "$BADBIN"
 r=$(SPLIT=771 MID=24 SEQ=82 "$BADBIN" "$V2" 59 29 2>&1 | tail -1)
@@ -135,7 +138,7 @@ esac
 echo "=== 5) reanchor 自检（快照丢 wrap 标志的坏变体必须报 FAIL）==="
 TMPSC=/tmp/screen_reanchor_regress.c
 python3 tools/make_reanchor_regress_screen.py src/screen.c "$TMPSC"
-BADBIN2=/tmp/verify_cascade_probe_bad2
+BADBIN2=/tmp/verify_cascade_probe_bad2$EXE
 gcc -O1 -Itests/stub -Iinclude tests/cascade_probe.c \
     "$TMPSC" src/vt.c src/utf8.c src/theme.c -o "$BADBIN2"
 r=$(NEEDLES="$NDL" SPLIT=771 MID=24 SEQ=82 "$BADBIN2" "$V2" 59 29 2>&1 | tail -1)
@@ -148,7 +151,7 @@ rm -f "$TMPSC" "$BADBIN2"
 echo "=== 6) bug#18 自检（去掉新底行续行规则后，末态判据必须报 FAIL）==="
 TMPVT2=/tmp/vt_eolcont_regress.c
 python3 tools/make_eolcont_regress_vt.py src/vt.c "$TMPVT2"
-BADBIN3=/tmp/verify_cascade_probe_bad3
+BADBIN3=/tmp/verify_cascade_probe_bad3$EXE
 gcc -O1 -Itests/stub -Iinclude tests/cascade_probe.c \
     src/screen.c "$TMPVT2" src/utf8.c src/theme.c -o "$BADBIN3"
 if python3 tools/check_dir_records.py "$BADBIN3" "$V2" 59 29 \
@@ -164,7 +167,7 @@ rm -f "$TMPVT2" "$BADBIN3" /tmp/eolcont_selfcheck.txt /tmp/dircheck.txt
 echo "=== 7) CSI 自检（把「CSI 一律作废判定窗口」改回去后，v3 必须报 FAIL）==="
 TMPVT3=/tmp/vt_csi_regress.c
 python3 tools/make_csi_regress_vt.py src/vt.c "$TMPVT3"
-BADBIN4=/tmp/verify_cascade_probe_bad4
+BADBIN4=/tmp/verify_cascade_probe_bad4$EXE
 gcc -O1 -Itests/stub -Iinclude tests/cascade_probe.c \
     src/screen.c "$TMPVT3" src/utf8.c src/theme.c -o "$BADBIN4"
 if python3 tools/check_dir_records.py "$BADBIN4" "$V3" 120 29 \
@@ -196,7 +199,7 @@ fi
 echo "=== 9) 两趟重绘自检（把修复撤回后，v6 必须报 FAIL）==="
 TMPVT4=/tmp/vt_repass_regress.c
 python3 tools/make_repass_regress_vt.py src/vt.c "$TMPVT4"
-BADBIN5=/tmp/verify_cascade_probe_bad5
+BADBIN5=/tmp/verify_cascade_probe_bad5$EXE
 gcc -O1 -Itests/stub -Iinclude tests/cascade_probe.c \
     src/screen.c "$TMPVT4" src/utf8.c src/theme.c -o "$BADBIN5"
 if python3 tools/check_prompt_bottom.py "$BADBIN5" "$V6" 120 29 \

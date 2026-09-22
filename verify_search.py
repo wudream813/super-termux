@@ -11,6 +11,11 @@ import tempfile
 import os
 import sys
 from pathlib import Path
+# ★ 平台差异（MinGW 给无扩展名的 -o 补 .exe / MinGW 不支持 -fsanitize）
+#   统一收在 tests/hbuild.py，不要在这里各写一份 sys.platform 判断。
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+import hbuild  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parent
 src = (ROOT / "src" / "input.c").read_text(encoding="utf-8")
@@ -393,11 +398,11 @@ def main():
     print("=== Scrollback History Search Test (verify_search.py) ===")
     with tempfile.TemporaryDirectory() as tmpdir:
         c_path = os.path.join(tmpdir, "test_search.c")
-        exe_path = os.path.join(tmpdir, "test_search")
+        exe_path = hbuild.exe_path(tmpdir, "test_search")
         with open(c_path, "w", encoding="utf-8") as f:
             f.write(C_SEARCH_TEST_CODE)
 
-        compile_cmd = ["gcc", "-O2", "-Wall", "-o", exe_path, c_path]
+        compile_cmd = [hbuild.gcc(), "-O2", "-Wall", "-o", exe_path, c_path]
         res = subprocess.run(compile_cmd, capture_output=True, text=True)
         if res.returncode != 0:
             print("Compilation error:", res.stderr)

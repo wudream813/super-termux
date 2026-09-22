@@ -8,16 +8,25 @@
   - kids()     查残留子进程
   - frame()    用项目自己的 tools/frame2txt.py 解码最后一帧
 """
-import fcntl
 import os
-import pty
 import re
 import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import time
+
+# ★ fcntl / pty / termios 是 POSIX 专有，Windows 上没有。
+#   tests/conpty_drive.py（Windows 的 ConPTY 驱动）要复用本模块里读
+#   render_dump.log 的那几个方法 —— frame() / nframes() / frame_sizes() /
+#   grid()，它们【一个 POSIX 调用都不用】。所以把这三个 import 变成有条件的，
+#   让 Windows 也能 import 本模块。POSIX 路径行为完全不变：下面的 Term 照原样
+#   用 fcntl/pty/termios，只是名字改成延迟到用时才解析而已（os.name 判定在
+#   import 期就决定了，不会有运行期分支开销）。
+if os.name == "posix":
+    import fcntl
+    import pty
+    import termios
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRAME2TXT = os.path.join(ROOT, "tools", "frame2txt.py")

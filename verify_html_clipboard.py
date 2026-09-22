@@ -17,6 +17,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+# ★ 平台差异（MinGW 给无扩展名的 -o 补 .exe / MinGW 无 -fsanitize）
+#   统一收在 tests/hbuild.py；降级时会自己往 stderr 打 [SKIP-SANITIZER]。
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+import hbuild  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parent
 SRC = (ROOT / "src" / "cliphtml.c").read_text(encoding="utf-8")
@@ -194,7 +200,7 @@ def main():
         td = Path(td)
         (td / "harness.c").write_text(HARNESS, encoding="utf-8")
         exe = td / "t"
-        cmd = ["gcc", "-O1", "-g", "-fsanitize=address,undefined",
+        cmd = ["gcc", "-O1", "-g", *hbuild.sanitize_flags(),
                "-Wall", "-Wextra", "-Werror",
                "-I", str(ROOT / "include"),
                str(ROOT / "src" / "cliphtml.c"),

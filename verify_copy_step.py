@@ -11,6 +11,12 @@ v1.8.20 回归：复制模式移动光标（键盘 ←/→ 与鼠标端点）一
 变异：把 copy_step_char 改成每次只走 1 格（旧行为），用例立即失败。
 """
 import os
+# ★ 平台差异（MinGW 给无扩展名的 -o 补 .exe / MinGW 无 -fsanitize）
+#   统一收在 tests/hbuild.py；降级时会自己往 stderr 打 [SKIP-SANITIZER]。
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+import hbuild  # noqa: E402
+
 import subprocess
 import tempfile
 
@@ -124,14 +130,14 @@ def main():
         for hdr in ["shellapi.h", "process.h", "windowsx.h"]:
             open(os.path.join(stub, hdr), "w").write('#pragma once\n#include "windows.h"\n')
         uo = os.path.join(td, "utf8.o")
-        p = subprocess.run(["gcc", "-O1", "-g", "-fsanitize=address,undefined",
+        p = subprocess.run(["gcc", "-O1", "-g", *hbuild.sanitize_flags(),
                             "-I", stub, "-I", INC, "-c", os.path.join(SRC, "utf8.c"), "-o", uo],
                            capture_output=True, text=True)
         if p.returncode != 0:
             print(p.stderr); raise SystemExit("utf8 编译失败")
         hc = os.path.join(td, "h.c"); bp = os.path.join(td, "h")
         open(hc, "w").write(h)
-        p = subprocess.run(["gcc", "-O1", "-g", "-fsanitize=address,undefined",
+        p = subprocess.run(["gcc", "-O1", "-g", *hbuild.sanitize_flags(),
                             "-Wall", "-Wextra", "-Werror", "-I", INC, hc, uo, "-o", bp],
                            capture_output=True, text=True)
         if p.returncode != 0:

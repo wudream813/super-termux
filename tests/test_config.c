@@ -1,4 +1,4 @@
-/* win-termux 配置体系单元测试（主题引擎 + 键位表）
+/* super-termux 配置体系单元测试（主题引擎 + 键位表）
  *
  * 这些模块不依赖任何 Win32 调用，因此可以用 tests/stub 里的最小 windows.h
  * 替身在 Linux 上原生编译、直接执行断言：

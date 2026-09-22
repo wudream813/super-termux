@@ -16,6 +16,11 @@ v1.8.19 回归：选区端点必须吸附到完整字符，避免选中半个宽
 import os
 import subprocess
 import sys
+# ★ 平台差异（MinGW 给无扩展名的 -o 补 .exe / MinGW 无 -fsanitize）
+#   统一收在 tests/hbuild.py；降级时会自己往 stderr 打 [SKIP-SANITIZER]。
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+import hbuild  # noqa: E402
+
 import tempfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -137,13 +142,13 @@ def main():
         binp = os.path.join(td, "h")
         open(hc, "w", encoding="utf-8").write(harness)
         uo = os.path.join(td, "utf8.o")
-        p = subprocess.run(["gcc", "-O1", "-g", "-fsanitize=address,undefined",
+        p = subprocess.run(["gcc", "-O1", "-g", *hbuild.sanitize_flags(),
                             "-I", stub, "-I", INC, "-c",
                             os.path.join(SRC, "utf8.c"), "-o", uo],
                            capture_output=True, text=True)
         if p.returncode != 0:
             print(p.stderr); raise SystemExit("utf8 编译失败")
-        p = subprocess.run(["gcc", "-O1", "-g", "-fsanitize=address,undefined",
+        p = subprocess.run(["gcc", "-O1", "-g", *hbuild.sanitize_flags(),
                             "-Wall", "-Wextra", "-Werror", "-I", INC,
                             hc, uo, "-o", binp],
                            capture_output=True, text=True)
