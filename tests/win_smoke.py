@@ -101,7 +101,11 @@ def main():
     #   所以必须先分清是 termux 的问题还是这个环境/驱动模式的问题。
     #   这个对照能一刀切开：cmd.exe 自己也回不来 ⇒ 环境/驱动；能回来 ⇒ termux。
     try:
-        cp = cd.Term(cols=100, rows=30, dump=False, exe="cmd.exe")
+        # ★ 必须给【绝对路径】：CreateProcessW 一旦传了 lpApplicationName 就
+        #   【不搜 PATH】，写 "cmd.exe" 会直接 ERROR_FILE_NOT_FOUND (2)。
+        #   CI 第十七轮就是这么白跑了一轮。ComSpec 是 cmd 的规范位置。
+        cmd_exe = os.environ.get("ComSpec") or r"C:\Windows\System32\cmd.exe"
+        cp = cd.Term(cols=100, rows=30, dump=False, exe=cmd_exe)
         cp.drain(2.5)
         print("  对照(裸 cmd.exe 走同一个 ConPTY 驱动): alive=%s exit_code=%s 收到=%d 字节"
               % (cp.alive(), cp.exit_code(), len(cp.raw)))
