@@ -124,6 +124,12 @@ crosscheck-win-harness:
 	  tests/test_conpty_loader.c src/conpty_loader.c -o /tmp/xchk_ld.exe
 	@echo "  交叉编译 unittest / conpty_loader      ok"
 
+	@# 符号级检查：链接在本地【发现不了】撞名（Debian 的 mingw-w64 不会那么早把
+	@# libkernel32.a 的目标文件拉进来），必须比对符号表。见 tools/check_win32_symbol_clash.py。
+	x86_64-w64-mingw32-gcc -O1 -Itests/loaderstub -Iinclude -c tests/test_conpty_loader.c -o /tmp/xchk_ld.o
+	x86_64-w64-mingw32-gcc -O1 -Itests/stub -Iinclude -c tests/render_harness_shims.c -o /tmp/xchk_sh.o
+	python3 tools/check_win32_symbol_clash.py /tmp/xchk_ld.o /tmp/xchk_sh.o
+
 unittest:
 	gcc -O1 -Wall -Wextra -Werror -Itests/stub -Iinclude src/theme.c src/keymap.c tests/test_config.c -o /tmp/termux_test_config$(HOST_EXE_EXT) -lm
 	/tmp/termux_test_config$(HOST_EXE_EXT)
