@@ -337,11 +337,25 @@ static inline DWORD GetModuleFileNameW(void *h, WCHAR *b, DWORD n) {
     (void)h; if (n > 0) b[0] = 0; return 0;
 }
 static inline DWORD GetFileAttributesW(const WCHAR *p) { (void)p; return INVALID_FILE_ATTRIBUTES; }
+/* ★ 这三个是【C 运行时】的名字，不是 Win32 API。
+ * Linux 上 glibc 没有它们，所以 static inline 补一份没问题。
+ * 但在 MinGW 上，本文件第 10 行 include 的 <wchar.h> 会拉进
+ * corecrt_wstdlib.h / corecrt_wstdio.h，那里已经把 _wgetenv / _wfopen /
+ * _snwprintf 声明成非 static 的 CRT 函数 —— 再写 static 定义就是
+ *   error: static declaration of '_wgetenv' follows non-static declaration
+ * （CI 的 windows 作业第一次跑主机侧回归就是这么挂的，2026-09-22。）
+ * 所以在 Windows 上【不要】自己定义，直接用真 CRT 的实现：对 harness 反而更
+ * 真实 —— 它本来就要 termux.ini 打不开时优雅失败，真 _wfopen 找不到文件
+ * 同样返回 NULL，效果一致。
+ * 注意 GetConsoleMode / WriteConsoleA 那一类不用这么处理：它们是 Win32 API，
+ * 声明在 <windows.h> 里，而本文件正是顶替 <windows.h> 的，不会同时出现。 */
+#if !defined(_WIN32)
 static inline WCHAR *_wgetenv(const WCHAR *n) { (void)n; return 0; }
 static inline FILE *_wfopen(const WCHAR *p, const WCHAR *m) { (void)p; (void)m; return 0; }
 static inline int _snwprintf(WCHAR *b, size_t n, const WCHAR *f, ...) {
     (void)b; (void)n; (void)f; return 0;
 }
+#endif
 static inline void *ShellExecuteW(void *a, const WCHAR *b, const WCHAR *c, const WCHAR *d,
                                   const WCHAR *e, int f2) {
     (void)a; (void)b; (void)c; (void)d; (void)e; (void)f2; return 0;
