@@ -58,6 +58,9 @@ void reap_dead_panes(void) {
         }
         DWORD exit_code = 0;
         if (p->process != NULL_HANDLE && plat_proc_exited(p->process, &exit_code)) {
+            /* exit_code==0 时下面是静默关窗格，屏幕上不留任何痕迹 —— 打点补上。 */
+            dump_mark("[pane] %d 子进程退出 code=%lu -> %s", i, (unsigned long)exit_code,
+                      exit_code ? "保留窗格并提示" : "静默关闭");
             if (exit_code != 0) {
                 plat_thread_join(&p->read_thread, 250);
                 char msg[256];
@@ -306,6 +309,14 @@ int create_pane_shell_with_dir(const WCHAR *shell, const WCHAR *workdir) {
     DeleteProcThreadAttributeList(si.lpAttributeList);
     free(si.lpAttributeList);
     si.lpAttributeList = NULL;
+    /* ★ TERMUX_DUMP 打点：子 shell 到底起没起来、起来后什么时候退的。
+     * CI 第十四轮定位到 termux 在帮助页之后就 exit 0，而 handle_input 唯一的
+     * 退出条件是「所有 pane 都死了」(src/main.c:130-135)，reap_dead_panes 对
+     * exit_code==0 又是【静默关窗格】(src/pane.c:60-77，不显示红字) —— 所以
+     * 屏幕上什么都看不出来。必须把这两件事记下来。 */
+    dump_mark("[pane] spawn created=%d err=%lu pid=%lu",
+              (int)(created != 0), (unsigned long)(created ? 0 : GetLastError()),
+              (unsigned long)pi.dwProcessId);
     if (!created) {
         DWORD err = GetLastError();
         CloseHandle(pi_r); pi_r = NULL;
