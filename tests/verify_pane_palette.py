@@ -18,6 +18,8 @@ v2.0.6 加了 pane_foreground / pane_background / pane_black … pane_bright_whi
      验证 ini 落盘与窗格字节都变。
   F. (v2.0.8) pane_scrollbar / pane_scrollbar_track 滚动条颜色（悬停右缘后抓字节）。
   G. (v2.0.8) 窗格配色页两列的值起始列一致（libvterm 回放，宽字符对齐）。
+  H. (v2.0.9) 预设方案应用 / 编辑时光标位置 / 窄终端单列+滚动。
+  I. (v2.0.9) 60 列窄终端下各设置子页的按钮仍在屏幕内（不折行、不裁掉）。
 
 修前二进制跑本脚本：A 过，B/C 必红（那时根本没有这些键）。
 """
@@ -234,7 +236,7 @@ def capture_pane_page():
 
 
 # 每行输出「值段」的起始列：紧跟在色块（两个纯底色空格）之后的那一格。
-# 只看第 6..15 行（0 基 5..14），每行应恰有两个（左右两列）。
+# 只看第 7..16 行（0 基 6..15），每行应恰有两个（左右两列）。
 VTERM_COLS_C = r"""
 #include <vterm.h>
 #include <stdio.h>
@@ -247,7 +249,7 @@ int main(int argc, char **argv) {
     FILE *f = fopen(argv[3], "rb"); if (!f) return 2;
     char buf[65536]; size_t n;
     while ((n = fread(buf, 1, sizeof buf, f)) > 0) vterm_input_write(vt, buf, n);
-    for (int r = 5; r < 15; r++) {
+    for (int r = 6; r < 16; r++) {
         for (int c = 0; c < C; c++) {
             VTermScreenCell cell; VTermPos p = {r, c};
             vterm_screen_get_cell(scr, p, &cell);
@@ -264,6 +266,144 @@ int main(int argc, char **argv) {
         printf("\n");
     }
     return 0;
+}
+"""
+
+
+# argv[4] = 要找的文字：找到则输出 "col <起始列>"，没找到输出 "notfound"。
+# 用于断言窄终端下按钮/内容没有被裁到屏幕外（或折行到侧栏行上）。
+VTERM_NOWRAP_C = r"""
+#include <vterm.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    int R = atoi(argv[1]), C = atoi(argv[2]);
+    VTerm *vt = vterm_new(R, C); vterm_set_utf8(vt, 1);
+    VTermScreen *scr = vterm_obtain_screen(vt); vterm_screen_reset(scr, 1);
+    FILE *f = fopen(argv[3], "rb"); if (!f) return 2;
+    char buf[65536]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) vterm_input_write(vt, buf, n);
+    const char *needle = argv[4];
+    for (int r = 0; r < R; r++) {
+        char line[1024]; int cc[1024]; int k = 0;
+        for (int c = 0; c < C; c++) {
+            VTermScreenCell cell; VTermPos p = {r, c};
+            vterm_screen_get_cell(scr, p, &cell);
+            if (cell.width == 0 || cell.chars[0] == (uint32_t)-1) continue;
+            unsigned ch = cell.chars[0] ? cell.chars[0] : ' ';
+            char u[5]; int m = 0;
+            if (ch < 0x80) u[m++] = (char)ch;
+            else if (ch < 0x800) { u[m++] = (char)(0xC0 | (ch >> 6)); u[m++] = (char)(0x80 | (ch & 0x3F)); }
+            else { u[m++] = (char)(0xE0 | (ch >> 12)); u[m++] = (char)(0x80 | ((ch >> 6) & 0x3F)); u[m++] = (char)(0x80 | (ch & 0x3F)); }
+            for (int i = 0; i < m && k < 1000; i++) { cc[k] = c; line[k++] = u[i]; }
+        }
+        line[k] = 0;
+        char *hit = strstr(line, needle);
+        if (hit) {
+            /* leftblank：该行最左 20 列（侧栏区）是否全空。右侧内容折行时会从行首
+             * 续写（v2.0.8 里「亮白…」顶掉了整行），leftblank = 0 即为折行污染。 */
+            int lb = 1;
+            for (int c = 0; c < 20 && c < C; c++) {
+                VTermScreenCell cell; VTermPos p = {r, c};
+                vterm_screen_get_cell(scr, p, &cell);
+                unsigned ch = cell.chars[0];
+                if (ch && ch != (uint32_t)-1 && ch != ' ') { lb = 0; break; }
+            }
+            printf("col %d row %d leftblank %d\n", cc[(int)(hit - line)] + 1, r + 1, lb);
+            return 0;
+        }
+    }
+    printf("notfound\n"); return 1;
+}
+"""
+
+
+def capture_page_keys(rows, cols, keys):
+    """起 termux(rows x cols)，依次发 keys，返回收到的全部字节。"""
+    td = tempfile.mkdtemp(prefix="termux_palette_keys_")
+    exe = os.path.join(td, "termux")
+    shutil.copy2(EXE, exe)
+    os.chmod(exe, 0o755)
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(td)
+        os.environ["TERM"] = "xterm-256color"; os.environ["SHELL"] = "/bin/sh"; os.environ["PS1"] = "$ "
+        try:
+            os.execv(exe, ["termux"])
+        finally:
+            os._exit(127)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    os.kill(pid, signal.SIGWINCH)
+    got = bytearray()
+
+    def drain(t):
+        end = time.time() + t
+        while time.time() < end:
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    got.extend(os.read(fd, 65536))
+                except OSError:
+                    break
+
+    drain(1.5)
+    for k in keys:
+        os.write(fd, k); drain(0.4)
+    drain(0.6)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    shutil.rmtree(td, ignore_errors=True)
+    return bytes(got)
+
+
+# argv[4] = 要找的文字。若它以 '#' 开头：找到含它的行，要求光标在同一行且列 = 该串末尾之后 → "ok"；
+# 否则：只报告它出现在哪一行（"row N"），没找到 → "notfound"。
+VTERM_CURSOR_C = r"""
+#include <vterm.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+static int row_text(VTermScreen *scr, int r, int C, char *line, int *cellcol /* cellcol[byteidx] */) {
+    int n = 0;
+    for (int c = 0; c < C; c++) {
+        VTermScreenCell cell; VTermPos p = {r, c};
+        vterm_screen_get_cell(scr, p, &cell);
+        if (cell.width == 0 || cell.chars[0] == (uint32_t)-1) continue;   /* 宽字符后半格 */
+        unsigned ch = cell.chars[0] ? cell.chars[0] : ' ';
+        char u[5]; int k = 0;
+        if (ch < 0x80) u[k++] = (char)ch;
+        else if (ch < 0x800) { u[k++] = (char)(0xC0 | (ch >> 6)); u[k++] = (char)(0x80 | (ch & 0x3F)); }
+        else { u[k++] = (char)(0xE0 | (ch >> 12)); u[k++] = (char)(0x80 | ((ch >> 6) & 0x3F)); u[k++] = (char)(0x80 | (ch & 0x3F)); }
+        for (int i = 0; i < k && n < 1000; i++) { cellcol[n] = c; line[n++] = u[i]; }
+    }
+    line[n] = 0; return n;
+}
+int main(int argc, char **argv) {
+    int R = atoi(argv[1]), C = atoi(argv[2]);
+    VTerm *vt = vterm_new(R, C); vterm_set_utf8(vt, 1);
+    VTermScreen *scr = vterm_obtain_screen(vt); vterm_screen_reset(scr, 1);
+    VTermState *st = vterm_obtain_state(vt);
+    FILE *f = fopen(argv[3], "rb"); if (!f) return 2;
+    char buf[65536]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) vterm_input_write(vt, buf, n);
+    const char *needle = argv[4];
+    VTermPos cur; vterm_state_get_cursorpos(st, &cur);
+    for (int r = 0; r < R; r++) {
+        char line[1024]; int cc[1024];
+        row_text(scr, r, C, line, cc);
+        char *hit = strstr(line, needle);
+        if (!hit) continue;
+        int start = (int)(hit - line);
+        if (needle[0] != '#') { printf("row %d col %d\n", r, cc[start]); return 0; }
+        int endcol = cc[start + (int)strlen(needle) - 1] + 1;
+        if (cur.row == r && cur.col == endcol) { printf("ok\n"); return 0; }
+        printf("cursor row=%d col=%d, expected row=%d col=%d\n", cur.row, cur.col, r, endcol); return 0;
+    }
+    printf("notfound\n"); return 1;
 }
 """
 
@@ -385,8 +525,8 @@ def main():
         print("  [SKIP] libvterm 语义级回放 —— 本机没有 libvterm-dev")
 
     # E. 设置页 UI（v2.0.7）：不用手改 ini，在「窗格配色」子页里改
-    #   E1 默认选中「默认背景」：Enter → 打 ffffff → Enter
-    e1, ini1 = run_settings_ui([(b"\r", 0.4), (b"ffffff\r", 0.6)], "UI_E1")
+    #   E1 ↓ 到「默认背景」：Enter → 打 ffffff → Enter
+    e1, ini1 = run_settings_ui([(b"\x1b[B", 0.2), (b"\r", 0.4), (b"ffffff\r", 0.6)], "UI_E1")   # ↓ 从方案行到「默认背景」
     ck("E1 设置页改默认背景 → termux.ini 写入 pane_background = #ffffff",
        "pane_background = #ffffff" in ini_pane_lines(ini1), "pane 行=%r" % ini_pane_lines(ini1))
     se1 = sgr_last_before(e1, b"UI_E1")
@@ -394,14 +534,14 @@ def main():
        se1 is not None and "48;2;255;255;255" in se1, "实际 SGR=%r" % se1)
     #   E2 左列往下 5 行 = 「红色」(索引 1)：Enter → ff0000 → Enter；再 R 复位默认背景？不，
     #      这里只验证红色：ini 只应有 pane_red，不应有 pane_background
-    e2, ini2 = run_settings_ui([(b"\x1b[B", 0.2)] * 5 + [(b"\r", 0.4), (b"ff0000\r", 0.6)], "UI_E2")   # 左列：背景/前景/滑块/轨道/黑/红
+    e2, ini2 = run_settings_ui([(b"\x1b[B", 0.2)] * 6 + [(b"\r", 0.4), (b"ff0000\r", 0.6)], "UI_E2")   # 方案行→背景/前景/滑块/轨道/黑/红
     ck("E2 设置页改「红色」→ termux.ini 写入 pane_red = #ff0000",
        ini_pane_lines(ini2) == ["pane_red = #ff0000"], "pane 行=%r" % ini_pane_lines(ini2))
     se2 = sgr_last_before(e2, b"RED_UI_E2")
     ck("E2 SGR 31 红字发 38;2;255;0;0",
        se2 is not None and "38;2;255;0;0" in se2, "实际 SGR=%r" % se2)
     #   E3 改完再按 R 复位当前项：ini 里不应再有该键
-    e3, ini3 = run_settings_ui([(b"\r", 0.4), (b"ffffff\r", 0.6), (b"r", 0.5)], "UI_E3")
+    e3, ini3 = run_settings_ui([(b"\x1b[B", 0.2), (b"\r", 0.4), (b"ffffff\r", 0.6), (b"r", 0.5)], "UI_E3")
     ck("E3 R 复位当前项 → ini 不再含 pane_background", ini_pane_lines(ini3) == [], "pane 行=%r" % ini_pane_lines(ini3))
     se3 = sgr_last_before(e3, b"UI_E3")
     ck("E3 复位后普通文字回到 16 色 ;40", se3 is not None and re.search(r"(^|;)40$", se3) is not None, "实际 SGR=%r" % se3)
@@ -419,7 +559,7 @@ def main():
     ck("F1 只配滚动条时普通文字仍是 16 色 ;40（不影响 palette 透传）",
        sf is not None and re.search(r"(^|;)40$", sf) is not None, "实际 SGR=%r" % sf)
     #    F2 走设置页：左列第 3 行 = 滚动条滑块
-    e4, ini4 = run_settings_ui([(b"\x1b[B", 0.2)] * 2 + [(b"\r", 0.4), (b"00ff00\r", 0.6)], "UI_F2")
+    e4, ini4 = run_settings_ui([(b"\x1b[B", 0.2)] * 3 + [(b"\r", 0.4), (b"00ff00\r", 0.6)], "UI_F2")
     ck("F2 设置页改「滚动条滑块」→ ini 写入 pane_scrollbar = #00ff00",
        ini_pane_lines(ini4) == ["pane_scrollbar = #00ff00"], "pane 行=%r" % ini_pane_lines(ini4))
 
@@ -451,6 +591,91 @@ def main():
         shutil.rmtree(td, ignore_errors=True)
     else:
         print("  [SKIP] G 对齐检查 —— 本机没有 libvterm-dev")
+
+    # H. (v2.0.9) 预设方案 / 窄终端单列 / 编辑时光标位置
+    #   H1 方案行 →×5 = GitHub Light，Enter 应用：ini 出现 20 个 pane_ 键，窗格文字白底
+    h1, inih = run_settings_ui([(b"\x1b[C", 0.2)] * 5 + [(b"\r", 0.8)], "UI_H1")
+    ck("H1 应用「GitHub Light」方案 → ini 写入全部 20 个 pane_* 键", len(ini_pane_lines(inih)) == 20, "pane 行=%r" % ini_pane_lines(inih))
+    ck("H1 方案里 pane_background = #ffffff", "pane_background = #ffffff" in ini_pane_lines(inih))
+    sh = sgr_before(h1, b"UI_H1")   # sgr_before 排除回显字面量与 RED_ 前缀，取程序输出那行
+    ck("H1 应用方案后窗格普通文字发 48;2;255;255;255 / 38;2;36;41;47",
+       sh is not None and "48;2;255;255;255" in sh and "38;2;36;41;47" in sh, "实际 SGR=%r" % sh)
+    if os.path.exists("/usr/include/vterm.h"):
+        td = tempfile.mkdtemp(prefix="termux_palette_cur_")
+        src = os.path.join(td, "vt.c"); vt = os.path.join(td, "vt")
+        with open(src, "w") as f:
+            f.write(VTERM_CURSOR_C)
+        r = subprocess.run(["gcc", "-O1", src, "-o", vt, "-lvterm"], capture_output=True, text=True)
+        if r.returncode == 0:
+            #   H2 光标：120 列，↓ 到默认背景，Enter，打 "ab" → 光标必须紧跟在 "#ab" 之后（同一行）
+            dump = os.path.join(td, "h2.bin")
+            with open(dump, "wb") as f:
+                f.write(capture_page_keys(40, 120, [b"\x02s", b"W", b"\x1b[B", b"\r", b"ab"]))
+            out = subprocess.run([vt, "40", "120", dump, "#ab"], capture_output=True, text=True).stdout.strip()
+            ck("H2 编辑「默认背景」时光标紧跟在 #ab 之后（同一行、'#'列+3）", out == "ok", "实际 %r" % out)
+            #   H3 右列：→ 到右列首项（青色），Enter（预填 6 位），光标在 '#'+7
+            dump3 = os.path.join(td, "h3.bin")
+            with open(dump3, "wb") as f:
+                f.write(capture_page_keys(40, 120, [b"\x02s", b"W", b"\x1b[B", b"\x1b[C", b"\r"]))
+            out3 = subprocess.run([vt, "40", "120", dump3, "#00cdcd"], capture_output=True, text=True).stdout.strip()
+            ck("H3 右列项编辑时光标在预填 6 位之后", out3 == "ok", "实际 %r" % out3)
+            #   H4 窄终端 60 列：两列装不下 → 单列，右列内容不再被裁掉；「亮白」滚动后可见
+            dump4 = os.path.join(td, "h4.bin")
+            with open(dump4, "wb") as f:
+                f.write(capture_page_keys(24, 60, [b"\x02s", b"W"] + [b"\x1b[B"] * 20))
+            out4 = subprocess.run([vt, "24", "60", dump4, "亮白                (跟随终端)"], capture_output=True, text=True).stdout.strip()
+            m4 = re.match(r"row (\d+) col (\d+)", out4)
+            ck("H4 60 列 × 24 行：单列 + 滚动后「亮白 (跟随终端)」完整可见，且在右侧区域内（列 >= 24，"
+               "v2.0.8 是右列折行盖到侧栏/底栏上）", m4 is not None and int(m4.group(2)) >= 24, "实际 %r" % out4)
+        else:
+            print("  [SKIP] libvterm 编译失败：%s" % r.stderr.strip()[:200])
+        shutil.rmtree(td, ignore_errors=True)
+    else:
+        print("  [SKIP] H2-H4 —— 本机没有 libvterm-dev")
+
+    # I. (v2.0.9) 窄终端（60 列 × 24 行）：设置各子页不折行、按钮不被裁到屏幕外
+    if os.path.exists("/usr/include/vterm.h"):
+        td = tempfile.mkdtemp(prefix="termux_palette_narrow_")
+        src = os.path.join(td, "vt.c"); vt2 = os.path.join(td, "vt2")
+        with open(src, "w") as f:
+            f.write(VTERM_NOWRAP_C)
+        r = subprocess.run(["gcc", "-O1", src, "-o", vt2, "-lvterm"], capture_output=True, text=True)
+        if r.returncode == 0:
+            # (页键, needle, 说明, 是否要求该行左侧 20 列为空)
+            #   只有窗格配色页能要求 leftblank：它滚到底时左侧对应的是侧栏空白区；
+            #   键位/启动/行为页左侧本来就有侧栏菜单，只断言按钮没被裁出屏幕。
+            for page, needle, label, need_lb in [
+                (b"W", "亮白", "窗格配色页：最后一项「亮白」在右侧区域内", 1),
+                (b"K", "[改]", "键位页：[改] 按钮在屏幕内", 0),
+                (b"", "[改]", "启动/菜单项页：[改] 按钮在屏幕内", 0),
+                (b"B", "[-]", "行为页：scrollback [-] 按钮在屏幕内", 0),
+            ]:
+                d = os.path.join(td, "i.bin")
+                with open(d, "wb") as f:
+                    keys = [b"\x02s"]
+                    if page:
+                        keys.append(page)
+                    if page == b"W":
+                        keys += [b"\x1b[B"] * 20
+                    f.write(capture_page_keys(24, 60, keys))
+                out = subprocess.run([vt2, "24", "60", d, needle], capture_output=True, text=True).stdout.strip()
+                m = re.match(r"col (\d+) row (\d+) leftblank (\d+)", out)
+                ok_i = m is not None and int(m.group(1)) >= 24 and (not need_lb or m.group(3) == "1")
+                ck("I 60 列 × 24 行 —— " + label +
+                   ("，且所在行左侧 20 列（侧栏空白区）没被折行内容占掉" if need_lb else ""),
+                   ok_i, "实际 %r" % out)
+            # 不折行：窗格配色页右侧内容没有溢出到第 2 行（?7l 生效的间接证据：行内文字被截断而非绕行）
+            d = os.path.join(td, "i2.bin")
+            with open(d, "wb") as f:
+                f.write(capture_page_keys(24, 60, [b"\x02s", b"W"]))
+            out = subprocess.run([vt2, "24", "60", d, "侧栏"], capture_output=True, text=True).stdout.strip()
+            ck("I 60 列 × 24 行 —— 侧栏「启动 (Startup)」整行仍在其行内（右侧内容没有折行盖过来）",
+               out.startswith("col 1") or out == "notfound", "实际 %r" % out)
+        else:
+            print("  [SKIP] libvterm 编译失败：%s" % r.stderr.strip()[:200])
+        shutil.rmtree(td, ignore_errors=True)
+    else:
+        print("  [SKIP] I 组 —— 本机没有 libvterm-dev")
 
     print()
     if FAILS:

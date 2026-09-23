@@ -2064,17 +2064,40 @@ static void handle_settings_appearance_key(WORD vk, WCHAR uc, BOOL is_ctrl) {
 /* v2.0.7：窗格配色页键盘。排布见 render.c 的 g_pane_order（两列各 9 行）。 */
 static void handle_settings_pane_key(WORD vk, WCHAR uc, BOOL is_ctrl) {
     if (vk == VK_ESCAPE) { settings_leave_subpage(); return; }
-    int p = settings_pane_order_pos(g_settings_pane_sel);
-    if (p < 0) p = 0;
-    if (vk == VK_UP)   { if (p % SETTINGS_PANE_ROWS > 0) p--; g_settings_pane_sel = settings_pane_order_slot(p); g_mux.needs_redraw = 1; return; }
-    if (vk == VK_DOWN) { if (p % SETTINGS_PANE_ROWS < SETTINGS_PANE_ROWS - 1 && p + 1 < THEME_PANE_SLOTS) p++; g_settings_pane_sel = settings_pane_order_slot(p); g_mux.needs_redraw = 1; return; }
-    if (vk == VK_LEFT || vk == VK_RIGHT) {
-        int t = vk == VK_RIGHT ? p + SETTINGS_PANE_ROWS : p - SETTINGS_PANE_ROWS;
-        if (t >= 0 && t < THEME_PANE_SLOTS) g_settings_pane_sel = settings_pane_order_slot(t);
-        g_mux.needs_redraw = 1;
-        return;
+    int sb_w = SETTINGS_SIDEBAR_W;
+    if (sb_w > g_mux.host_cols / 2) sb_w = g_mux.host_cols / 2;
+    if (sb_w < 15) sb_w = 15;
+    if (sb_w > g_mux.host_cols) sb_w = g_mux.host_cols;
+    if (sb_w < 1) sb_w = 1;
+    int main_left = sb_w + 3;
+    int rows = settings_pane_rows_per_col(g_mux.host_cols, main_left);   /* 单列时 = 20 */
+    /* 方案行（g_settings_pane_sel == -1）：←/→ 换方案，Enter 应用，↓ 进槽位表 */
+    if (g_settings_pane_sel == -1) {
+        int n = theme_pane_scheme_count();
+        if (vk == VK_LEFT)  { g_settings_pane_scheme = (g_settings_pane_scheme + n - 1) % n; g_mux.needs_redraw = 1; return; }
+        if (vk == VK_RIGHT) { g_settings_pane_scheme = (g_settings_pane_scheme + 1) % n; g_mux.needs_redraw = 1; return; }
+        if (vk == VK_DOWN)  { g_settings_pane_sel = settings_pane_order_slot(0); g_mux.needs_redraw = 1; return; }
+        if (vk == VK_UP)    { return; }
+        if (vk == VK_RETURN || vk == VK_SPACE) {
+            theme_pane_scheme_apply(g_settings_pane_scheme);
+            save_config();
+            g_mux.needs_redraw = 1;
+            return;
+        }
+        /* R / Ctrl+R 落到下面的公共处理 */
+    } else {
+        int p = settings_pane_order_pos(g_settings_pane_sel);
+        if (p < 0) p = 0;
+        if (vk == VK_UP)   { if (p % rows > 0) { p--; g_settings_pane_sel = settings_pane_order_slot(p); } else g_settings_pane_sel = -1; g_mux.needs_redraw = 1; return; }
+        if (vk == VK_DOWN) { if (p % rows < rows - 1 && p + 1 < THEME_PANE_SLOTS) p++; g_settings_pane_sel = settings_pane_order_slot(p); g_mux.needs_redraw = 1; return; }
+        if (vk == VK_LEFT || vk == VK_RIGHT) {
+            int t = vk == VK_RIGHT ? p + rows : p - rows;
+            if (t >= 0 && t < THEME_PANE_SLOTS) g_settings_pane_sel = settings_pane_order_slot(t);
+            g_mux.needs_redraw = 1;
+            return;
+        }
+        if (vk == VK_RETURN || vk == VK_SPACE) { settings_pane_hex_edit_begin(g_settings_pane_sel); g_mux.needs_redraw = 1; return; }
     }
-    if (vk == VK_RETURN || vk == VK_SPACE) { settings_pane_hex_edit_begin(g_settings_pane_sel); g_mux.needs_redraw = 1; return; }
     if (is_ctrl && (vk == 'R' || uc == 0x12)) {
         theme_clear_pane_all();
         save_config();
@@ -2082,7 +2105,8 @@ static void handle_settings_pane_key(WORD vk, WCHAR uc, BOOL is_ctrl) {
         return;
     }
     if (uc == 'r' || uc == 'R') {
-        theme_clear_pane_slot(g_settings_pane_sel);
+        if (g_settings_pane_sel == -1) theme_clear_pane_all();   /* 方案行上 R = 清全部（回到跟随终端） */
+        else theme_clear_pane_slot(g_settings_pane_sel);
         save_config();
         g_mux.needs_redraw = 1;
         return;
@@ -2693,10 +2717,19 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             return;
         }
         if (g_settings_nav == SETTINGS_NAV_PANE) {
+            if (r == SETTINGS_PANE_SCHEME_ROW && c >= main_left) {
+                /* 点方案行：点在「‹」左半边换上一个，其余换下一个；已经选中时再点 = 应用 */
+                if (g_settings_pane_sel == -1) { theme_pane_scheme_apply(g_settings_pane_scheme); save_config(); }
+                else g_settings_pane_sel = -1;
+                g_hex_edit_active = 0;
+                g_mux.needs_redraw = 1;
+                return;
+            }
             for (int slot = 0; slot < THEME_PANE_SLOTS; slot++) {
-                int row = settings_pane_row(slot);
-                int col = settings_pane_col(main_left, slot);
-                if (r == row && c >= col && c < col + SETTINGS_PANE_COL_W - 1) {
+                int row = settings_pane_row(host_cols, main_left, slot);
+                int col = settings_pane_col(host_cols, main_left, slot);
+                if (row < 0 || row >= SETTINGS_PANE_ROW0 + settings_pane_visible_rows(host_rows, host_cols, main_left)) continue;
+                if (r == row && c >= col && c < col + SETTINGS_PANE_ITEM_W) {
                     g_settings_pane_sel = slot;
                     settings_pane_hex_edit_begin(slot);
                     g_mux.needs_redraw = 1;
@@ -2709,11 +2742,14 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             int entry = settings_keys_entry_at(host_rows, r);
             if (entry >= 0) {
                 g_settings_keys_sel = entry;
-                if (c >= main_left + SETTINGS_KEYS_RESET_COL && c < main_left + SETTINGS_KEYS_RESET_COL + 6) {
+                int rcol = settings_keys_reset_col(host_cols, main_left);
+                int ecol = settings_keys_edit_col(host_cols, main_left);
+                int pcol = settings_keys_prefix_col(host_cols, main_left);
+                if (c >= main_left + rcol && c < main_left + rcol + 6) {
                     settings_keys_reset_entry(entry);
-                } else if (c >= main_left + SETTINGS_KEYS_EDIT_COL && c < main_left + SETTINGS_KEYS_EDIT_COL + 4) {
+                } else if (c >= main_left + ecol && c < main_left + ecol + 4) {
                     g_key_capture_active = 1;
-                } else if (c >= main_left + SETTINGS_KEYS_PREFIX_COL && c < main_left + SETTINGS_KEYS_PREFIX_COL + 6) {
+                } else if (c >= main_left + pcol && c < main_left + pcol + 6) {
                     settings_keys_toggle_prefix(entry);
                 }
                 g_mux.needs_redraw = 1;
@@ -2756,10 +2792,13 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             }
             for (int i = 0; i < g_chooser_item_count; i++) {
                 if (r == 10 + i) {
-                    int h_up = (c >= main_left + 53 && c <= main_left + 55);
-                    int h_dn = (c >= main_left + 56 && c <= main_left + 58);
-                    int h_ed = (c >= main_left + 59 && c <= main_left + 62);
-                    int h_del = (c >= main_left + 63 && c <= main_left + 66);
+                    int mbtn = settings_menu_btn_col(host_cols, main_left);
+                    int mud = settings_menu_show_ud(host_cols, main_left);
+                    int ecol = mbtn + (mud ? 6 : 0);
+                    int h_up = (mud && c >= main_left + mbtn && c <= main_left + mbtn + 2);
+                    int h_dn = (mud && c >= main_left + mbtn + 3 && c <= main_left + mbtn + 5);
+                    int h_ed = (c >= main_left + ecol && c <= main_left + ecol + 3);
+                    int h_del = (c >= main_left + ecol + 4 && c <= main_left + ecol + 7);
                     if (h_up) {
                         if (i > 0) {
                             ChooserItem tmp = g_chooser_items[i];

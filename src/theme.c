@@ -342,6 +342,52 @@ void theme_pane_fallback_rgb(int slot, int *r, int *g, int *b) {
     if (b) *b = x16[i][2];
 }
 
+/* ---- 窗格配色预设（取自 Windows Terminal 内置方案与各主题官方色板）----
+ * 顺序：黑 红 绿 黄 蓝 紫 青 白，亮黑…亮白，前景，背景。 */
+typedef struct { const char *name; const char *hex[18]; } PaneScheme;
+static const PaneScheme g_pane_schemes[] = {
+    { "Campbell", { "0c0c0c","c50f1f","13a10e","c19c00","0037da","881798","3a96dd","cccccc",
+                    "767676","e74856","16c60c","f9f1a5","3b78ff","b4009e","61d6d6","f2f2f2", "cccccc","0c0c0c" } },
+    { "One Half Light", { "383a42","e45649","50a14f","c18401","0184bc","a626a4","0997b3","fafafa",
+                    "4f525d","df6c75","98c379","e4c07a","61afef","c577dd","56b5c1","ffffff", "383a42","fafafa" } },
+    { "One Half Dark", { "282c34","e06c75","98c379","e5c07b","61afef","c678dd","56b6c2","dcdfe4",
+                    "5a6374","e06c75","98c379","e5c07b","61afef","c678dd","56b6c2","dcdfe4", "dcdfe4","282c34" } },
+    { "Solarized Light", { "002b36","dc322f","859900","b58900","268bd2","d33682","2aa198","eee8d5",
+                    "073642","cb4b16","586e75","657b83","839496","6c71c4","93a1a1","fdf6e3", "657b83","fdf6e3" } },
+    { "Solarized Dark", { "002b36","dc322f","859900","b58900","268bd2","d33682","2aa198","eee8d5",
+                    "073642","cb4b16","586e75","657b83","839496","6c71c4","93a1a1","fdf6e3", "839496","002b36" } },
+    { "GitHub Light", { "24292f","cf222e","116329","4d2d00","0969da","8250df","1b7c83","6e7781",
+                    "57606a","a40e26","1a7f37","633c01","218bff","a475f9","3192aa","8c959f", "24292f","ffffff" } },
+    { "Dracula", { "21222c","ff5555","50fa7b","f1fa8c","bd93f9","ff79c6","8be9fd","f8f8f2",
+                    "6272a4","ff6e6e","69ff94","ffffa5","d6acff","ff92df","a4ffff","ffffff", "f8f8f2","282a36" } },
+    { "Nord", { "3b4252","bf616a","a3be8c","ebcb8b","81a1c1","b48ead","88c0d0","e5e9f0",
+                    "4c566a","bf616a","a3be8c","ebcb8b","81a1c1","b48ead","8fbcbb","eceff4", "d8dee9","2e3440" } },
+};
+int theme_pane_scheme_count(void) { return (int)(sizeof(g_pane_schemes) / sizeof(g_pane_schemes[0])); }
+const char *theme_pane_scheme_name(int i) {
+    return (i >= 0 && i < theme_pane_scheme_count()) ? g_pane_schemes[i].name : "";
+}
+static void pane_scheme_slots(int i, ThemeRGB out[THEME_PANE_SLOTS]) {
+    for (int k = 0; k < 18; k++) parse_hex6(g_pane_schemes[i].hex[k], &out[k]);
+    out[THEME_PANE_SB_THUMB] = out[8];              /* 亮黑：在深浅底上都是中灰 */
+    out[THEME_PANE_SB_TRACK] = out[THEME_PANE_BG];
+}
+int theme_pane_scheme_apply(int i) {
+    if (i < 0 || i >= theme_pane_scheme_count()) return 0;
+    ThemeRGB v[THEME_PANE_SLOTS];
+    pane_scheme_slots(i, v);
+    for (int k = 0; k < THEME_PANE_SLOTS; k++) { g_pane_val[k] = v[k]; g_pane_set[k] = 1; }
+    return 1;
+}
+int theme_pane_scheme_matches(int i) {
+    if (i < 0 || i >= theme_pane_scheme_count()) return 0;
+    ThemeRGB v[THEME_PANE_SLOTS];
+    pane_scheme_slots(i, v);
+    for (int k = 0; k < THEME_PANE_SLOTS; k++)
+        if (!g_pane_set[k] || g_pane_val[k].r != v[k].r || g_pane_val[k].g != v[k].g || g_pane_val[k].b != v[k].b) return 0;
+    return 1;
+}
+
 int theme_pane_any(void) {
     for (int i = 0; i < THEME_PANE_SLOTS; i++) if (g_pane_set[i]) return 1;
     return 0;

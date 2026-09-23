@@ -94,9 +94,13 @@ mouse_body = func_body(INPUT, "void handle_settings_mouse(MOUSE_EVENT_RECORD *me
 new_pages = mouse_body.split("if (g_settings_nav == SETTINGS_NAV_APPEARANCE)", 1)[1] \
                       .split("if (g_settings_nav == 0)", 1)[0]
 for sym in ("settings_theme_row(", "settings_role_row(", "settings_role_col(",
-            "settings_keys_entry_at(", "SETTINGS_KEYS_EDIT_COL", "SETTINGS_KEYS_RESET_COL",
+            "settings_keys_entry_at(", "settings_keys_edit_col(", "settings_keys_reset_col(",
             "SETTINGS_BEHAVIOR_ROW0", "SETTINGS_SB_MINUS_COL", "SETTINGS_SB_PLUS_COL"):
     check(sym in new_pages, f"命中测试通过 {sym} 复用渲染侧几何")
+menu_page = mouse_body.split("if (g_settings_nav == 0)", 1)[1]
+check("settings_menu_btn_col(host_cols, main_left)" in menu_page and
+      "settings_menu_show_ud(host_cols, main_left)" in menu_page,
+      "菜单项表格的按钮命中同样复用渲染侧收缩几何（窄终端下 [改]/[删] 不会画点分离）")
 literal_rows = re.findall(r"r == (\d+)", new_pages)
 check(not literal_rows, f"命中测试没有写死行号（发现 {literal_rows}）")
 check("settings_sidebar_extra_rows(" in mouse_body and "settings_sidebar_extra_rows(" in RENDER,
@@ -118,8 +122,8 @@ check("keymap_describe(action" in keys and "keymap_action_is_overridden(action)"
 check("keymap_prefix_describe(combo" in keys and "keymap_prefix_text()" not in keys,
       "键位页第一行必须显示 Ctrl+B 这种可读写法，而不是 ini 里的 C-b")
 check("keymap_action_uses_prefix(action)" in keys and '"[前缀]" : "[直接]"'.replace("'", "") in keys.replace("'", "") and
-      "settings_keys_toggle_prefix" in INPUT and "SETTINGS_KEYS_PREFIX_COL" in RENDER and
-      "SETTINGS_KEYS_PREFIX_COL" in INPUT,
+      "settings_keys_toggle_prefix" in INPUT and "settings_keys_prefix_col(" in RENDER and
+      "settings_keys_prefix_col(" in INPUT,
       "键位页没有“是否使用前缀”的切换（渲染 / 键盘 / 鼠标三侧）")
 check("search_case_sensitive" in behavior and "SETTINGS_BEHAVIOR_TOGGLES" in RENDER and
       "SETTINGS_BEHAVIOR_TOGGLES" in INPUT,
@@ -154,11 +158,12 @@ print("\n== 5) 命令面板入口与光标 ==")
 for act in ("PALETTE_ACTION_OPEN_APPEARANCE", "PALETTE_ACTION_OPEN_KEYS", "PALETTE_ACTION_OPEN_BEHAVIOR"):
     check(act in RENDER and act in INPUT, f"命令面板存在入口 {act}")
 cursor_block = RENDER[RENDER.index("g_hex_edit_active && !g_settings_show_presets"):]
-cursor_block = cursor_block[:cursor_block.index("} else {")]
+cursor_block = cursor_block[:cursor_block.index("if (g_settings_nav >= 1")]
 check("g_settings_nav <= g_chooser_item_count" in RENDER,
       "只有菜单项详情页显示文本光标，三个分类页不会留下错位光标")
-check("settings_role_row(g_hex_edit_role)" in cursor_block,
-      "颜色十六进制编辑时光标落在对应角色行")
+check("settings_role_row(g_hex_edit_role)" in cursor_block and
+      "settings_pane_row(host_cols, main_left, slot)" in cursor_block.replace("g_mux.host_cols", "host_cols"),
+      "颜色十六进制编辑时光标落在对应行（外观页用 settings_role_row，窗格配色页用 settings_pane_row）")
 
 print("\n== 6) 菜单项的启动默认颜色 (v1.8.9) ==")
 check("int color;" in TYPES_H, "ChooserItem 必须带 color 字段")
@@ -186,9 +191,9 @@ check("g_mouse_x <= col + SETTINGS_ROLE_COL_W - 3" in RENDER,
 # v1.8.31：键位页整行 hover 不得覆盖右侧按钮列（[前缀]/[改]/[复位]），否则鼠标
 # 停在按钮上时行底色与按钮底色叠加（“文字 hover 带到按钮上”）。按钮高亮独立判断。
 check("int keys_on_btn" in RENDER and
-      "g_mouse_x < main_left + SETTINGS_KEYS_PREFIX_COL - 1" in RENDER and
+      "g_mouse_x < main_left + prefix_col - 1" in RENDER and "int prefix_col = settings_keys_prefix_col(host_cols, main_left)" in RENDER and
       "int row_under_mouse = (g_mouse_y == row - 1);" in RENDER and
-      'h_edit = (row_under_mouse' in RENDER and 'h_reset = (row_under_mouse' in RENDER,
+      'h_edit = (row_under_mouse' in RENDER and 'h_reset = (show_reset && row_under_mouse' in RENDER,
       "键位页整行 hover 未排除按钮列（文字 hover 会带到 [前缀]/[改]/[复位] 按钮上）")
 # 行为页 scrollback 行的 [-]/[+] 同理。
 check("int sb_on_btn" in RENDER and

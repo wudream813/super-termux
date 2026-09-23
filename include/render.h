@@ -17,16 +17,22 @@
 #define SETTINGS_ROLE_ROWS      8
 #define SETTINGS_ROLE_COL_W     34
 /* 窗格配色页（v2.0.7）：18 个 pane_* 槽位，两列各 9 行 */
-#define SETTINGS_PANE_ROW0      6
+/* 窗格配色页：第 5 行是方案行（[方案] ‹ Campbell › …），槽位表从第 7 行起。
+ * 每项宽 = 1 + 16 标签 + 1 + 2 色块 + 1 + 8 值 = 29，加列间距 = 32。
+ * 右侧区域装不下两列（< 2*32）时自动改成单列 20 行（窄终端不再被截掉右列）。 */
+#define SETTINGS_PANE_SCHEME_ROW 5
+#define SETTINGS_PANE_ROW0      7
 #define SETTINGS_PANE_ROWS      10
-#define SETTINGS_PANE_COL_W     36
+#define SETTINGS_PANE_COL_W     32
+#define SETTINGS_PANE_ITEM_W    29
+#define SETTINGS_PANE_VALUE_OFF 22   /* 值段（'#'）在 col+VALUE_OFF-1（1 基）：1+16+1+2+1 = 21 列前缀 */
 #define SETTINGS_KEYS_ROW0      6
 #define SETTINGS_BEHAVIOR_ROW0  6
 #define SETTINGS_BEHAVIOR_TOGGLES 5   /* mouse / copy_move_deselect / confirm_on_exit / confirm_on_close / search_case_sensitive */
 /* 相对 main_left 的按钮列偏移，渲染时用绝对定位写出，鼠标按同样的偏移命中。
  * v1.8.44：说明列加宽到 36（最长中文说明约 32 列）、动作名列 20、键位列 18，
  * 按钮相应右移；命中与渲染共用同一常量。 */
-#define SETTINGS_KEYS_PREFIX_COL 79   /* [前缀] / [直接] 切换 */
+#define SETTINGS_KEYS_PREFIX_COL 79   /* [前缀] / [直接] 切换（宽终端；窄终端见 settings_keys_*_col 函数） */
 
 /* v1.8.9: 菜单项的「启动默认颜色」选择条。
  * 第 0 格是「默认」(宽 6)，其后 8 格分别是标签色 1-8 (每格宽 3)，格子彼此相连，
@@ -136,8 +142,31 @@ void settings_sidebar_extra_rows(int *appearance_r, int *keys_r, int *behavior_r
 int settings_theme_row(int idx);
 int settings_role_row(int role);
 int settings_role_col(int main_left, int role);
-int settings_pane_row(int slot);
-int settings_pane_col(int main_left, int slot);
+/* host_cols 决定单列/双列（见 SETTINGS_PANE_* 注释）。 */
+int settings_pane_two_cols(int host_cols, int main_left);
+int settings_pane_rows_per_col(int host_cols, int main_left);
+/* 可见行数（矮终端 + 单列时不够 20 行，会按 g_settings_pane_scroll 滚动；返回 -1 = 该项当前不可见） */
+int settings_pane_visible_rows(int host_rows, int host_cols, int main_left);
+void settings_pane_clamp_scroll(int host_rows, int host_cols, int main_left);
+int settings_pane_row(int host_cols, int main_left, int slot);
+int settings_pane_col(int host_cols, int main_left, int slot);
+int settings_pane_hint_row(int host_rows, int host_cols, int main_left);
+/* v2.0.9：键位页列宽随可用宽度收缩（窄终端先砍「说明」列，再压「动作名」列），
+ * 保证 [前缀]/[改]/[复位] 三个按钮始终留在屏幕内（以前 60 列时它们被裁到屏幕外，
+ * 点不到也看不到）。render 绘制与 input 命中判定共用同一套。 */
+int settings_keys_name_w(int host_cols, int main_left);
+int settings_keys_desc_w(int host_cols, int main_left);
+int settings_keys_combo_w(int host_cols, int main_left);
+int settings_keys_prefix_col(int host_cols, int main_left);
+int settings_keys_edit_col(int host_cols, int main_left);
+int settings_keys_reset_col(int host_cols, int main_left);
+int settings_keys_show_reset(int host_cols, int main_left);
+/* v2.0.9：菜单项管理页（启动页下半部分）每行的 [↑][↓][改][删] 按钮列同样随宽度收缩：
+ * 先压「启动命令行」列（30 → 8），极窄时只留 [改][删]（调序用 Ctrl+↑/↓）。
+ * 渲染与鼠标命中共用。 */
+int settings_menu_cmd_w(int host_cols, int main_left);
+int settings_menu_btn_col(int host_cols, int main_left);
+int settings_menu_show_ud(int host_cols, int main_left);   /* 是否画 [↑][↓] */
 int settings_pane_order_slot(int pos);
 int settings_pane_order_pos(int slot);
 int settings_sidebar_pane_row(void);

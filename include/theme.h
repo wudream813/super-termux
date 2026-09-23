@@ -97,6 +97,13 @@ int theme_has_overrides(void);
 #define THEME_PANE_SB_TRACK 19
 #define THEME_PANE_SLOTS 20
 /* 名字 -> 槽位（0..15 索引色，16 fg，17 bg）；不是 pane_* 返回 -1。 */
+/* v2.0.9：窗格配色预设方案（Campbell / One Half / Solarized / GitHub Light / Dracula / Nord）。
+ * apply 会把全部 20 个槽位一次写满（滚动条滑块 = 亮黑，轨道 = 背景），之后仍可逐项改。 */
+int  theme_pane_scheme_count(void);
+const char *theme_pane_scheme_name(int i);
+int  theme_pane_scheme_apply(int i);
+/* 当前 20 个槽位与方案 i 完全一致时返回 1（设置页用来标 [●]）。 */
+int  theme_pane_scheme_matches(int i);
 int  theme_pane_slot_index(const char *name);
 const char *theme_pane_slot_name(int slot);
 int  theme_set_pane_hex(const char *name, const char *hex);

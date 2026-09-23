@@ -483,6 +483,25 @@ static void test_pane_palette(void) {
           && theme_pane_slot_index("pane_scrollbar_track") == THEME_PANE_SB_TRACK, "v2.0.8 滚动条两个槽位");
     check(THEME_PANE_SLOTS == 20, "共 20 个槽位（16 索引 + fg/bg + 滚动条滑块/轨道）");
     {
+        int n = theme_pane_scheme_count();
+        check(n >= 6, "内置多套窗格配色方案（用户要求「加一些主题」）");
+        int named = 1;
+        for (int i = 0; i < n; i++) if (!theme_pane_scheme_name(i)[0]) named = 0;
+        check(named, "每套方案都有名字（设置页方案行不会显示空白）");
+        check(theme_pane_scheme_matches(0) == 0, "没有配置时不该与任何方案「完全一致」");
+        check(theme_pane_scheme_apply(0) == 1, "应用第 0 套方案");
+        int all_set = 1;
+        for (int k = 0; k < THEME_PANE_SLOTS; k++) {
+            int r = -1, g = -1, b = -1;
+            if (!theme_pane_rgb(k, &r, &g, &b)) all_set = 0;
+        }
+        check(all_set, "应用方案后 20 个槽位全部有值（滚动条两项也一起设好）");
+        check(theme_pane_scheme_matches(0) == 1, "应用后与方案 0 完全一致（设置页标 ●）");
+        check(theme_pane_scheme_matches(1) == 0, "与另一套方案不一致");
+        theme_clear_pane_all();
+        check(theme_pane_any() == 0, "Ctrl+R 清除全部后回到「跟随终端」");
+    }
+    {
         int all_named = 1;
         for (int i = 0; i < THEME_PANE_SLOTS; i++)
             if (!theme_pane_slot_name(i)[0] || !theme_pane_slot_label(i)[0]) all_named = 0;

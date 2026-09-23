@@ -138,10 +138,18 @@ for lo, hi in ((52, 54), (55, 57), (58, 61), (62, 65)):
     mouse_range = set(range(lo, hi + 1))
     ansi_range = set(range(lo + 1, hi + 2))
     check({x - 1 for x in ansi_range} == mouse_range, "设置表格按钮 hover/点击范围不一致")
+# v2.0.9：菜单表格的 [↑][↓][改][删] 按钮列改为随可用宽度收缩后，渲染与命中必须
+# 共用同一套几何函数（settings_menu_btn_col / settings_menu_show_ud），否则窄终端上
+# 按钮画在一处、点在另一处。
+check("settings_menu_btn_col(host_cols, main_left)" in RENDER and
+      "settings_menu_btn_col(host_cols, main_left)" in INPUT and
+      "settings_menu_show_ud(host_cols, main_left)" in RENDER and
+      "settings_menu_show_ud(host_cols, main_left)" in INPUT,
+      "菜单表格按钮列的收缩几何没有在渲染与命中两侧共用")
 check("append_padded_utf8(out, bs, &pos, &row_cols, dname, 12)" in RENDER,
       "设置表格显示名称没有按终端列宽补齐")
-check("append_padded_utf8(out, bs, &pos, &row_cols, dcmd, 30)" in RENDER,
-      "设置表格命令行没有按终端列宽补齐")
+check("append_padded_utf8(out, bs, &pos, &row_cols, dcmd, settings_menu_cmd_w(host_cols, main_left))" in RENDER,
+      "设置表格命令行没有按终端列宽补齐（v2.0.9：宽度随可用列收缩，窄终端上按钮才不会被裁掉）")
 check("%-12s" not in RENDER and "%-30s" not in RENDER,
       "设置表格仍使用按字节计算的 %-Ns 补齐")
 
