@@ -104,6 +104,8 @@ const char *theme_pane_scheme_name(int i);
 int  theme_pane_scheme_apply(int i);
 /* 当前 20 个槽位与方案 i 完全一致时返回 1（设置页用来标 [●]）。 */
 int  theme_pane_scheme_matches(int i);
+/* 取方案 i 的 20 个槽位颜色（只算不写，给浮层做色块预览）。 */
+void theme_pane_scheme_preview(int i, ThemeRGB out[THEME_PANE_SLOTS]);
 int  theme_pane_slot_index(const char *name);
 const char *theme_pane_slot_name(int slot);
 int  theme_set_pane_hex(const char *name, const char *hex);

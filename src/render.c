@@ -566,11 +566,235 @@ void render_settings_presets(char *out, int bs, int *posp, int host_rows, int ho
  * 渲染与鼠标命中共用同一套几何函数，避免两边写死行号后走偏。
  * ------------------------------------------------------------------------- */
 
+/* v2.1.0：侧栏自适应。原布局固定要 13+菜单项数 行，终端一矮 [A]/[K]/[B]/[W] 四个
+ * 入口就被挤到屏幕外（用户报「终端太矮时设置显示不全」——连子页都进不去）。
+ * 规则：① 先省掉「导航选项」表头与两条分隔行（省 3 行）；② 再省 [P] 快速预设库行
+ * （P 键仍可）；③ 菜单项列表按剩余空间截断（数字键 1-9 仍能选）。四个入口和
+ * [Ctrl+S] 保存行永远留在屏内。 */
+void settings_sidebar_geom(int host_rows, int item_count, SettingsSidebarGeom *g) {
+    memset(g, 0, sizeof(*g));
+    int want = 13 + item_count;          /* [W] 落在 host_rows-1 所需的最小高度 */
+    g->hdr = 2;
+    if (host_rows < want) { g->compact = 1; want -= 3; }
+    if (host_rows < want) { g->hide_presets = 1; want -= 1; }
+    g->nav_label = g->compact ? 0 : 3;
+    g->sep1      = g->compact ? 0 : 4;
+    g->start     = g->compact ? 3 : 5;
+    g->sep2      = g->compact ? 0 : 6;
+    g->items_row0 = g->start + (g->compact ? 1 : 2);
+    int fixed_below = g->hide_presets ? 5 : 6;    /* [+] (+ [P]) + [A][K][B][W] */
+    int cap = host_rows - 1 - fixed_below - g->items_row0 + 1;
+    if (cap < 0) cap = 0;
+    if (cap > item_count) cap = item_count;
+    g->items_cap = cap;
+    g->add = g->items_row0 + cap;
+    g->presets = g->hide_presets ? 0 : g->add + 1;
+    int nav0 = g->hide_presets ? g->add + 1 : g->add + 2;
+    g->app = nav0; g->keys = nav0 + 1; g->beh = nav0 + 2; g->pane = nav0 + 3;
+    g->save = host_rows;
+}
+
 void settings_sidebar_extra_rows(int *appearance_r, int *keys_r, int *behavior_r) {
-    int base = 8 + g_chooser_item_count;   /* 快速预设库所在行 */
-    if (appearance_r) *appearance_r = base + 1;
-    if (keys_r) *keys_r = base + 2;
-    if (behavior_r) *behavior_r = base + 3;
+    SettingsSidebarGeom g;
+    settings_sidebar_geom(g_mux.host_rows, g_chooser_item_count, &g);
+    if (appearance_r) *appearance_r = g.app;
+    if (keys_r) *keys_r = g.keys;
+    if (behavior_r) *behavior_r = g.beh;
+}
+
+/* ---- 页内纵向滚动（渲染与命中判定同源）----
+ * natural = 高终端下的行号；可见带为 [first, host_rows]，滚动量 *scroll 由本页持有，
+ * 并被夹到「选中项所在行始终可见」。返回 -1 = 该行不在可见区（调用方跳过绘制）。 */
+int settings_page_row(int host_rows, int natural, int first, int last, int *scroll, int sel_natural) {
+    int vis = host_rows - first + 1;
+    if (vis < 3) vis = 3;
+    if (vis > last - first + 1) vis = last - first + 1;
+    int maxs = (last - first + 1) - vis;
+    if (maxs < 0) maxs = 0;
+    if (sel_natural >= first && sel_natural <= last) {
+        if (*scroll > sel_natural - first) *scroll = sel_natural - first;
+        if (*scroll < sel_natural - first - vis + 1) *scroll = sel_natural - first - vis + 1;
+    }
+    if (*scroll > maxs) *scroll = maxs;
+    if (*scroll < 0) *scroll = 0;
+    if (natural < first || natural > last) return -1;
+    int r = natural - *scroll;
+    if (r < first || r > first + vis - 1) return -1;
+    return r;
+}
+
+/* 反查：屏幕行 -> 自然行。先按「选中项始终可见」把滚动量夹一遍，保证 input 的命中
+ * 判定与上一帧渲染用的是同一个滚动量（否则点一下会偏一行）。 */
+int settings_page_natural_at(int host_rows, int row, int first, int last, int *scroll, int sel_natural) {
+    settings_page_row(host_rows, first, first, last, scroll, sel_natural);
+    int vis = host_rows - first + 1;
+    if (vis < 3) vis = 3;
+    if (vis > last - first + 1) vis = last - first + 1;
+    if (row < first || row > first + vis - 1) return -1;
+    int natural = row + *scroll;
+    if (natural < first || natural > last) return -1;
+    return natural;
+}
+
+void settings_scroll_mark(char *out, int bs, int *posp, int row, int right_col,
+                          int first_vis, int last_vis, int total) {
+    if (total <= last_vis - first_vis + 1 && first_vis <= 1) return;   /* 没滚动就不标 */
+    char tag[32];
+    snprintf(tag, sizeof(tag), "(%d-%d/%d)", first_vis, last_vis, total);
+    int tl = (int)strlen(tag);
+    if (right_col - tl < 1) return;
+    int pos = *posp;
+    pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[038;2;110;118;129m%s\x1b[0m",
+                    row, right_col - tl + 1, tag);
+    *posp = pos;
+}
+
+/* 提示行右端的位置指示：仅当本页确实需要滚动时画。 */
+void settings_page_mark(char *out, int bs, int *posp, int row, int right_col, int host_rows,
+                        int first, int last, int *scroll) {
+    int tot = last - first + 1;
+    int vis = host_rows - first + 1;
+    if (vis < 3) vis = 3;
+    if (vis > tot) vis = tot;
+    if (tot <= vis) return;
+    int top = first + *scroll;
+    if (top + vis - 1 > last) top = last - vis + 1;
+    if (top < first) top = first;
+    settings_scroll_mark(out, bs, posp, row, right_col, top, top + vis - 1, tot);
+}
+
+/* 外观页：自然行 3..22（标题/提示/5 个主题/语义色标题+说明/16 色两列 8 行/提示） */
+#define SETTINGS_APPEAR_FIRST 3
+#define SETTINGS_APPEAR_LAST  (SETTINGS_ROLE_ROW0 + SETTINGS_ROLE_ROWS + 1)
+int settings_appearance_row_view(int host_rows, int natural) {
+    return settings_page_row(host_rows, natural, SETTINGS_APPEAR_FIRST, SETTINGS_APPEAR_LAST,
+                             &g_settings_appear_scroll, settings_appearance_sel_natural(host_rows));
+}
+int settings_appearance_sel_natural(int host_rows) {
+    (void)host_rows;
+    int tc = theme_count();
+    int sel = g_settings_theme_sel;
+    if (sel < 0) return -1;
+    if (sel < tc) return settings_theme_row(sel);
+    if (sel < tc + TH_ROLE_COUNT) return settings_role_row(sel - tc);
+    return -1;
+}
+int settings_appearance_natural_at(int host_rows, int row) {
+    return settings_page_natural_at(host_rows, row, SETTINGS_APPEAR_FIRST, SETTINGS_APPEAR_LAST,
+                                    &g_settings_appear_scroll, settings_appearance_sel_natural(host_rows));
+}
+/* 行为页：自然行 3..14（标题/提示/5 开关/scrollback/提示） */
+#define SETTINGS_BEHAVIOR_LAST (SETTINGS_BEHAVIOR_ROW0 + SETTINGS_BEHAVIOR_TOGGLES + 3)
+int settings_behavior_row_view(int host_rows, int natural) {
+    return settings_page_row(host_rows, natural, 3, SETTINGS_BEHAVIOR_LAST,
+                             &g_settings_behavior_scroll, settings_behavior_sel_natural(host_rows));
+}
+int settings_behavior_sel_natural(int host_rows) {
+    (void)host_rows;
+    if (g_settings_behavior_sel < 0) return -1;
+    return SETTINGS_BEHAVIOR_ROW0 + g_settings_behavior_sel;
+}
+int settings_behavior_natural_at(int host_rows, int row) {
+    return settings_page_natural_at(host_rows, row, 3, SETTINGS_BEHAVIOR_LAST,
+                                    &g_settings_behavior_scroll, settings_behavior_sel_natural(host_rows));
+}
+/* 菜单项详细配置页：自然行 3..19（标题 + 4 组「标签+输入框」+ 颜色 + 按钮 + 提示） */
+#define SETTINGS_DETAIL_FIRST 3
+#define SETTINGS_DETAIL_LAST  19
+int settings_detail_row_view(int host_rows, int natural) {
+    int sel = -1;
+    if (g_settings_field >= 0 && g_settings_field <= 3) sel = 5 + g_settings_field * 2;
+    return settings_page_row(host_rows, natural, SETTINGS_DETAIL_FIRST, SETTINGS_DETAIL_LAST,
+                             &g_settings_detail_scroll, sel);
+}
+/* 默认启动项页：自然行 3..(10+n+2)（标题/提示/两个选项/管理标题+说明/表头/n 行/按钮/提示） */
+static int settings_startup_last(int host_rows) {
+    (void)host_rows;
+    return 12 + (g_chooser_item_count > 0 ? g_chooser_item_count : 1);
+}
+int settings_startup_row_view(int host_rows, int natural) {
+    int sel = (g_settings_table_sel >= 0) ? 10 + g_settings_table_sel : -1;
+    return settings_page_row(host_rows, natural, 3, settings_startup_last(host_rows),
+                             &g_settings_startup_scroll, sel);
+}
+int settings_startup_natural_at(int host_rows, int row) {
+    return settings_page_natural_at(host_rows, row, 3, settings_startup_last(host_rows),
+                                    &g_settings_startup_scroll,
+                                    (g_settings_table_sel >= 0) ? 10 + g_settings_table_sel : -1);
+}
+int settings_detail_natural_at(int host_rows, int row) {
+    int sel = -1;
+    if (g_settings_field >= 0 && g_settings_field <= 3) sel = 5 + g_settings_field * 2;
+    return settings_page_natural_at(host_rows, row, SETTINGS_DETAIL_FIRST, SETTINGS_DETAIL_LAST,
+                                    &g_settings_detail_scroll, sel);
+}
+
+/* 截断气泡：跟随鼠标的小浮层，最多 3 行、按显示宽度折行。 */
+static void render_settings_tooltip(char *out, int bs, int *posp, int host_rows, int host_cols) {
+    if (g_mouse_x < 0 || g_mouse_y < 0) return;
+    if (g_hex_edit_active || g_key_capture_active || g_settings_show_presets || g_settings_show_pane_schemes)
+        return;
+    const SettingsTip *t = settings_tip_at(g_mouse_y + 1, g_mouse_x + 1);
+    if (!t || !t->full[0]) return;
+
+    int bw = t->len + 4;                       /* │ 空格 内容 空格 │ */
+    if (bw > host_cols) bw = host_cols;
+    int cap = bw - 4;
+    if (cap < 6) { cap = 6; bw = cap + 4; if (bw > host_cols) return; }
+
+    /* 折行：逐字累计显示宽度，一行放不下就换行；最多 3 行，末尾补「...」 */
+    int slen = (int)strlen(t->full);
+    int lstart[4], llen[4], nl = 0;
+    int i = 0;
+    while (i < slen && nl < 3) {
+        lstart[nl] = i;
+        int col = 0, j = i;
+        while (j < slen) {
+            int adv = 0;
+            unsigned cp = utf8_decode_cp(t->full + j, slen - j, &adv);
+            if (adv <= 0) break;
+            if (is_zero_width_cp(cp)) { j += adv; continue; }
+            int cw = is_wide_cp(cp) ? 2 : 1;
+            if (col + cw > cap) break;
+            /* 末行要留出「...」的位置 */
+            if (i + 0 >= 0 && j + adv < slen && nl == 2 && col + cw + 3 > cap) break;
+            j += adv; col += cw;
+        }
+        if (j == i) j = i + 1;                 /* 永不空转 */
+        llen[nl] = j - i;
+        i = j;
+        nl++;
+    }
+    int clipped = (i < slen);
+    int bh = nl + 2;
+
+    int top = g_mouse_y + 2;                   /* 鼠标行的下一行 */
+    if (top + bh - 1 > host_rows) top = (g_mouse_y + 1) - bh;   /* 放不下就翻到上方 */
+    if (top < 2) top = 2;
+    int left = g_mouse_x + 1;
+    if (left + bw - 1 > host_cols) left = host_cols - bw + 1;
+    if (left < 1) left = 1;
+
+    const char *BG = "\x1b[048;2;022;027;034m";   /* 与其它浮层同色：不引入新用色 */
+    const char *BR = "\x1b[038;2;121;192;255m";
+    int pos = *posp;
+    pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH%s\x1b[0m┌", top, left, BR);
+    for (int c = 1; c < bw - 1 && pos < bs - 3; c++) { out[pos++]='\xe2'; out[pos++]='\x94'; out[pos++]='\x80'; }
+    pos += snprintf(out + pos, bs - pos, "┐\x1b[0m");
+    for (int k = 0; k < nl; k++) {
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH%s│\x1b[0m%s ", top + 1 + k, left, BR, BG);
+        int used = utf8_cols(t->full + lstart[k], llen[k]);
+        for (int b = 0; b < llen[k] && pos < bs - 8; b++) out[pos++] = t->full[lstart[k] + b];
+        int pad = cap - used;
+        if (clipped && k == nl - 1) pad -= 3;
+        for (int c = 0; c < pad; c++) { if (pos < bs - 1) out[pos++] = ' '; }
+        if (clipped && k == nl - 1) { out[pos++]='.'; out[pos++]='.'; out[pos++]='.'; }
+        pos += snprintf(out + pos, bs - pos, " %s\x1b[0m%s│\x1b[0m", BG, BR);
+    }
+    pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH%s\x1b[0m└", top + bh - 1, left, BR);
+    for (int c = 1; c < bw - 1 && pos < bs - 3; c++) { out[pos++]='\xe2'; out[pos++]='\x94'; out[pos++]='\x80'; }
+    pos += snprintf(out + pos, bs - pos, "┘\x1b[0m");
+    *posp = pos;
 }
 
 int settings_theme_row(int idx) { return SETTINGS_THEME_ROW0 + idx; }
@@ -674,46 +898,82 @@ static const char *settings_row_style(int selected, int hovered) {
  * 反馈「太窄会显示不了」）。用法：begin(行, 起点, 样式) → text(...)* → end()。
  * 裁剪只看显示列数（宽字符算 2），末尾不补空格。 */
 static int g_sl_left = 0;   /* begin 时记住的剩余可用列 */
+static int g_sl_row = 0, g_sl_col0 = 1;   /* v2.1.0：当前行与行首列（截断气泡登记用） */
+static int g_sl_hidden = 0;               /* 1 = 本行不可见，begin 已提前返回 */
+static SettingsTip g_tips[SETTINGS_TIP_MAX];
+static int g_tip_n;
+void settings_tip_reset(void) { g_tip_n = 0; g_sl_row = 0; }
+int settings_tip_count(void) { return g_tip_n; }
+const SettingsTip *settings_tip_at(int row, int col) {
+    const SettingsTip *fallback = NULL;
+    for (int i = 0; i < g_tip_n; i++) {
+        const SettingsTip *t = &g_tips[i];
+        if (t->row != row) continue;
+        if (!fallback) fallback = t;
+        if (col >= t->col && col < t->col + t->len) return t;   /* 优先鼠标所在的那一段 */
+    }
+    return fallback;
+}
+
 static void settings_line_begin(char *out, int bs, int *posp, int row, int main_left, int host_cols, const char *sgr) {
+    /* 调用方给 -1 = 这一行滚出了可见区：整行不发（text 因 g_sl_left=0 自动跳过，
+     * end 只复位属性，不会留下任何字符）。 */
+    if (row < 0) { g_sl_hidden = 1; g_sl_left = 0; g_sl_row = 0; return; }
+    g_sl_hidden = 0;
     g_sl_left = host_cols - main_left + 1;
+    g_sl_row = row; g_sl_col0 = main_left;
     if (g_sl_left < 0) g_sl_left = 0;
     *posp += snprintf(out + *posp, bs - *posp, "\x1b[%d;%dH%s", row, main_left, sgr);
 }
 static void settings_line_sgr(char *out, int bs, int *posp, const char *sgr) {
+    if (g_sl_hidden) return;
     *posp += snprintf(out + *posp, bs - *posp, "%s", sgr);
 }
 static void settings_line_text(char *out, int bs, int *posp, const char *text) {
-    if (g_sl_left <= 0) return;
+    if (g_sl_left <= 0 || g_sl_hidden) return;
     int w = utf8_cols(text, (int)strlen(text));
     if (w <= g_sl_left) {
         *posp += snprintf(out + *posp, bs - *posp, "%s", text);
         g_sl_left -= w;
     } else {
+        /* 横向装不下：截到行尾并补「...」，同时把全文登记进气泡表，
+         * 鼠标停在这一行上时以浮层给出完整内容。 */
+        int budget = g_sl_left - 3;
+        if (budget < 1) budget = 1;
         int before = *posp;
-        append_padded_utf8(out, bs, posp, NULL, text, g_sl_left);
+        append_padded_utf8(out, bs, posp, NULL, text, budget);
         /* 去掉 append_padded_utf8 尾部补的空格 */
         int slen = (int)strlen(text);
         while (*posp > before + slen && *posp > before && out[*posp - 1] == ' ') (*posp)--;
+        if (g_sl_left > 3 && *posp < bs - 4) { out[(*posp)++]='.'; out[(*posp)++]='.'; out[(*posp)++]='.'; }
         g_sl_left = 0;
+        if (g_sl_row > 0 && g_tip_n < SETTINGS_TIP_MAX) {
+            SettingsTip *t = &g_tips[g_tip_n++];
+            t->row = g_sl_row; t->col = g_sl_col0; t->len = w;
+            snprintf(t->full, sizeof(t->full), "%s", text);
+        }
     }
 }
 static void settings_line_end(char *out, int bs, int *posp) {
+    if (g_sl_hidden) return;
     *posp += snprintf(out + *posp, bs - *posp, "\x1b[0m");
 }
 
 static void render_settings_appearance(char *out, int bs, int *posp, int host_rows, int host_cols, int main_left) {
     int pos = *posp;
     (void)host_cols;
-    settings_line_begin(out, bs, &pos, 3, main_left, host_cols, "\x1b[038;2;121;192;255;1m");
+    settings_line_begin(out, bs, &pos, settings_appearance_row_view(host_rows, 3),
+                        main_left, host_cols, "\x1b[038;2;121;192;255;1m");
         settings_line_text(out, bs, &pos, "■ 配色主题 (Theme)");
         settings_line_end(out, bs, &pos);
-    settings_line_begin(out, bs, &pos, 4, main_left, host_cols, "\x1b[038;2;139;148;158m");
+    settings_line_begin(out, bs, &pos, settings_appearance_row_view(host_rows, 4),
+                        main_left, host_cols, "\x1b[038;2;139;148;158m");
         settings_line_text(out, bs, &pos, "↑/↓ 选择，Enter/Space 立即应用并写入 termux.ini：");
         settings_line_end(out, bs, &pos);
 
     for (int i = 0; i < theme_count(); i++) {
-        int row = settings_theme_row(i);
-        if (row > host_rows) break;
+        int row = settings_appearance_row_view(host_rows, settings_theme_row(i));
+        if (row < 0) continue;   /* 滚出可见区 */
         int active = (i == theme_index());
         int selected = (g_settings_theme_sel == i);
         int hovered = (g_mouse_y == row - 1 && g_mouse_x >= main_left - 1 && g_mouse_x < main_left + 40);
@@ -729,20 +989,22 @@ static void render_settings_appearance(char *out, int bs, int *posp, int host_ro
         }
     }
 
-    int title_r = SETTINGS_ROLE_ROW0 - 2;
+    int title_r = settings_appearance_row_view(host_rows, SETTINGS_ROLE_ROW0 - 2);
+    if (title_r < 0) title_r = 0;
     settings_line_begin(out, bs, &pos, title_r, main_left, host_cols, "\x1b[038;2;121;192;255;1m");
         settings_line_text(out, bs, &pos, "■ 语义颜色 (Palette)");
         settings_line_sgr(out, bs, &pos, "\x1b[038;2;139;148;158m");
         settings_line_text(out, bs, &pos, "   Enter 编辑十六进制, R 复位当前项, Ctrl+R 清除全部");
         settings_line_end(out, bs, &pos);
-    settings_line_begin(out, bs, &pos, title_r + 1, main_left, host_cols, "\x1b[038;2;139;148;158m");
+    settings_line_begin(out, bs, &pos, settings_appearance_row_view(host_rows, SETTINGS_ROLE_ROW0 - 1),
+                        main_left, host_cols, "\x1b[038;2;139;148;158m");
         settings_line_text(out, bs, &pos, "界面里所有派生色都由这 16 个角色混合得出，改一个即可成套生效。窗格内 cmd 的底色/字色见 termux.ini 的 pane_*。");
         settings_line_end(out, bs, &pos);
 
     for (int role = 0; role < TH_ROLE_COUNT; role++) {
-        int row = settings_role_row(role);
+        int row = settings_appearance_row_view(host_rows, settings_role_row(role));
         int col = settings_role_col(main_left, role);
-        if (row > host_rows) continue;
+        if (row < 0) continue;   /* 滚出可见区 */
         int selected = (g_settings_theme_sel == theme_count() + role);
         /* hover 列区间与点击命中一致：c ∈ [col, col+COL_W-2]（g_mouse_x = c-1）。 */
         int hovered = (g_mouse_y == row - 1 && g_mouse_x >= col - 1 && g_mouse_x <= col + SETTINGS_ROLE_COL_W - 3);
@@ -763,8 +1025,8 @@ static void render_settings_appearance(char *out, int bs, int *posp, int host_ro
         }
     }
 
-    int hint_r = SETTINGS_ROLE_ROW0 + SETTINGS_ROLE_ROWS + 1;
-    if (hint_r > host_rows) hint_r = host_rows;
+    int hint_r = settings_appearance_row_view(host_rows, SETTINGS_ROLE_ROW0 + SETTINGS_ROLE_ROWS + 1);
+    if (hint_r < 0) hint_r = host_rows;
     if (g_hex_edit_active) {
         pos += snprintf(out + pos, bs - pos,
             "\x1b[%d;%dH\x1b[038;2;210;153;034;1m正在编辑 %s：输入 6 位十六进制，Enter 确认，Esc 取消\x1b[0m",
@@ -773,6 +1035,8 @@ static void render_settings_appearance(char *out, int bs, int *posp, int host_ro
         settings_line_begin(out, bs, &pos, hint_r, main_left, host_cols, "\x1b[038;2;139;148;158m");
         settings_line_text(out, bs, &pos, "提示: ↑/↓ 选择, ←/→ 换列, Enter 应用/编辑, R 复位, Ctrl+R 清除全部自定义, Ctrl+S 保存, Esc 返回");
         settings_line_end(out, bs, &pos);
+        settings_page_mark(out, bs, &pos, hint_r, host_cols, host_rows,
+                           SETTINGS_APPEAR_FIRST, SETTINGS_APPEAR_LAST, &g_settings_appear_scroll);
     }
     *posp = pos;
 }
@@ -781,11 +1045,122 @@ static void render_settings_appearance(char *out, int bs, int *posp, int host_ro
  * 与外观页的 UI 角色分开：那 16 个只管 termux 自己的界面。
  * hex 编辑框复用外观页的 g_hex_edit_*：g_hex_edit_role >= 0 是 UI 角色，
  * < 0 是 pane 槽位（编码 -(slot+1)），两页不会同时开。 */
+/* v2.1.0：不走 settings_line_begin 的行（自己发 CUP 的那些）在截断前把行/列登记上，
+ * 否则气泡会挂到上一条 begin 的行号上（窗格页的值段就是这么串位的）。 */
+static void settings_tip_arm(int row, int col0) { g_sl_row = row; g_sl_col0 = col0; }
+
 static void append_clipped_utf8(char *out, int bs, int *posp, const char *s, int max_cols) {
     int saved = g_sl_left;
     g_sl_left = max_cols;
     settings_line_text(out, bs, posp, s);
     g_sl_left = saved;
+}
+
+/* v2.1.0：预设方案选择浮层 —— 用户反馈「窗格配色要可以选择」。原先方案行只显示
+ * 一个名字、←/→ 逐个换，既看不见有哪些、也看不见长什么样。改成 Enter/点击弹出
+ * 完整列表：每行带 背景/前景/红/绿 四个色块预览，↑/↓ 或数字选中、Enter 应用。
+ * 视觉语言与「常用命令行预设」浮层一致（同一套边框 + [Esc] 取消行）。 */
+void pane_scheme_picker_geom(int host_rows, int host_cols, int *top, int *left, int *w, int *h) {
+    int n = theme_pane_scheme_count();
+    int pw = 44;
+    if (pw > host_cols) pw = host_cols;
+    if (pw < 22) pw = 22;
+    int ph = n + 3;                       /* 标题 + n 项 + [Esc] + 底边 */
+    if (ph > host_rows) ph = host_rows;
+    if (ph < 5) ph = 5;
+    int t = (host_rows - ph) / 2 + 1;
+    if (t < 1) t = 1;
+    if (t + ph > host_rows + 1) t = host_rows + 1 - ph;
+    if (t < 1) t = 1;
+    int l = (host_cols - pw) / 2 + 1;
+    if (l < 1) l = 1;
+    if (l + pw > host_cols + 1) l = host_cols + 1 - pw;
+    if (l < 1) l = 1;
+    if (top) *top = t;
+    if (left) *left = l;
+    if (w) *w = pw;
+    if (h) *h = ph;
+}
+
+/* 浮层里一行能放下的色块个数：名字列 16 格 + 两侧留白，其余给色块（每块 2 列）。 */
+int pane_scheme_picker_swatches(int pw) {
+    int avail = pw - 1 - 2 - 4 - 16 - 1 - 3;   /* │  两空格 [n] 空格 名字 空格 块… ● */
+    if (avail < 0) avail = 0;
+    return avail / 2;
+}
+
+void render_pane_scheme_picker(char *out, int bs, int *posp, int host_rows, int host_cols) {
+    int pos = *posp;
+    int top, left, pw, ph;
+    pane_scheme_picker_geom(host_rows, host_cols, &top, &left, &pw, &ph);
+    int n = theme_pane_scheme_count();
+    int nsw = pane_scheme_picker_swatches(pw);
+    int name_w = pw - 1 - 2 - 4 - 1 - 1 - nsw * 2 - 3;
+    if (name_w < 6) name_w = 6;
+    if (name_w > 16) name_w = 16;
+
+    char hdr[96];
+    snprintf(hdr, sizeof(hdr), "┌─ 窗格配色方案 ↑/↓ 选择, Enter 应用 ");
+    pos += snprintf(out + pos, bs - pos, "[%d;%dH[038;2;255;255;255m[048;2;031;136;061;1m%s", top, left, hdr);
+    int cols = utf8_cols(hdr, (int)strlen(hdr));
+    while (cols < pw - 1 && pos < bs - 8) {
+        out[pos++] = '\xe2'; out[pos++] = '\x94'; out[pos++] = '\x80';
+        cols++;
+    }
+    pos += snprintf(out + pos, bs - pos, "┐\x1b[0m");
+
+    for (int i = 0; i < n; i++) {
+        int r = top + 1 + i;
+        if (r > top + ph - 2) break;
+        int row_hover = (g_mouse_y == r - 1 && g_mouse_x >= left - 1 && g_mouse_x < left - 1 + pw);
+        int is_sel = (i == g_settings_pane_scheme);
+        int applied = theme_pane_scheme_matches(i);
+        const char *bg = (row_hover || is_sel) ? "\x1b[048;2;045;055;072m" : "\x1b[048;2;022;027;034m";
+        const char *fg = is_sel ? "\x1b[038;2;255;255;255;1m" : "\x1b[038;2;230;237;243m";
+        char tag[16];
+        snprintf(tag, sizeof(tag), "[%d]", i + 1);
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[048;2;033;038;045m│\x1b[0m%s  \x1b[038;2;210;153;034m%s\x1b[0m%s\x1b[0m",
+                        r, left, bg, tag, bg);
+        int ccols = 1 + 2 + utf8_cols(tag, (int)strlen(tag));
+        /* 名字与色块之间的空格计入 name_w 之外，和预设浮层同一算法：tag 后 1 格分隔 */
+        pos += snprintf(out + pos, bs - pos, "%s ", bg);
+        ccols += 1;
+        pos += snprintf(out + pos, bs - pos, "%s%s", fg, bg);
+        append_padded_utf8(out, bs, &pos, &ccols, theme_pane_scheme_name(i), name_w);
+        pos += snprintf(out + pos, bs - pos, "\x1b[0m%s", bg);
+        ccols += 1;
+        ThemeRGB prev[THEME_PANE_SLOTS];
+        theme_pane_scheme_preview(i, prev);
+        for (int k = 0; k < nsw; k++) {
+            /* 与窗格配色表同序：背景、前景、滑块、轨道，再是 16 个 ANSI 色 */
+            int slot = settings_pane_order_slot(k);
+            if (slot < 0 || slot >= THEME_PANE_SLOTS) slot = k;
+            append_swatch(out, bs, &pos, prev[slot].r, prev[slot].g, prev[slot].b);
+            ccols += 2;
+        }
+        pos += snprintf(out + pos, bs - pos, " %s%s\x1b[0m",
+                        applied ? "\x1b[038;2;063;185;080;1m" : "\x1b[038;2;048;054;061m",
+                        applied ? "●" : "○");
+        ccols += 2;
+        pad_to_right_border(out, bs, &pos, &ccols, pw);
+    }
+
+    int esc_r = top + 1 + n;
+    if (esc_r <= top + ph - 2) {
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[048;2;033;038;045m│\x1b[0m\x1b[048;2;022;027;034m  \x1b[048;2;033;038;045m\x1b[038;2;139;148;158m [Esc] 取消 \x1b[0m\x1b[048;2;022;027;034m", esc_r, left);
+        int ccols = 1 + 2 + 12;
+        pad_to_right_border(out, bs, &pos, &ccols, pw);
+    }
+
+    int bot_r = top + ph - 1;
+    pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[048;2;033;038;045m└", bot_r, left);
+    int bcols = 1;
+    while (bcols < pw - 1 && pos < bs - 8) {
+        out[pos++] = '\xe2'; out[pos++] = '\x94'; out[pos++] = '\x80';
+        bcols++;
+    }
+    pos += snprintf(out + pos, bs - pos, "┘\x1b[0m");
+    *posp = pos;
 }
 
 static void render_settings_pane(char *out, int bs, int *posp, int host_rows, int host_cols, int main_left) {
@@ -805,8 +1180,10 @@ static void render_settings_pane(char *out, int bs, int *posp, int host_rows, in
         int hovered = (g_mouse_y == SETTINGS_PANE_SCHEME_ROW - 1 && g_mouse_x >= main_left - 1 && g_mouse_x < main_left - 1 + avail);
         int matched = theme_pane_scheme_matches(g_settings_pane_scheme);
         char line[128];
-        snprintf(line, sizeof(line), " 预设方案  ‹ %s › %s", theme_pane_scheme_name(g_settings_pane_scheme), matched ? "● 已应用" : "  Enter 应用");
+        snprintf(line, sizeof(line), " 预设方案  ‹ %-14s ›  [选择…]  ←/→ 换  Enter 打开方案列表  %s",
+                 theme_pane_scheme_name(g_settings_pane_scheme), matched ? "● 已应用" : " ");
         pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH%s", SETTINGS_PANE_SCHEME_ROW, main_left, settings_row_style(sel_scheme, hovered));
+        settings_tip_arm(SETTINGS_PANE_SCHEME_ROW, main_left);
         append_clipped_utf8(out, bs, &pos, line, avail);
         pos += snprintf(out + pos, bs - pos, "\x1b[0m");
     }
@@ -832,6 +1209,7 @@ static void render_settings_pane(char *out, int bs, int *posp, int host_rows, in
         if (item_avail < SETTINGS_PANE_VALUE_OFF) continue;   /* 极窄：只放得下标签 */
         append_swatch(out, bs, &pos, r, g, b);
         int val_avail = item_avail - SETTINGS_PANE_VALUE_OFF;
+        settings_tip_arm(row, col + SETTINGS_PANE_VALUE_OFF - 1);
         if (g_hex_edit_active && g_hex_edit_role == -(slot + 1)) {
             char shown[16];
             snprintf(shown, sizeof(shown), "#%s", g_hex_edit_buf);
@@ -866,15 +1244,18 @@ static void render_settings_pane(char *out, int bs, int *posp, int host_rows, in
         char line[160];
         snprintf(line, sizeof(line), "正在编辑 %s：输入 6 位十六进制，Enter 确认，Esc 取消", theme_pane_slot_label(-g_hex_edit_role - 1));
         pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[038;2;210;153;034;1m", hint_r, main_left);
+        settings_tip_arm(hint_r, main_left);
         append_clipped_utf8(out, bs, &pos, line, avail);
         pos += snprintf(out + pos, bs - pos, "\x1b[0m");
     } else {
         pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[038;2;139;148;158m", hint_r, main_left);
+        settings_tip_arm(hint_r, main_left);
         append_clipped_utf8(out, bs, &pos, "提示: ↑/↓ 选择, ←/→ 换列/换方案, Enter 编辑/应用方案, R 复位当前项, Ctrl+R 清除全部, Esc 返回", avail);
         pos += snprintf(out + pos, bs - pos, "\x1b[0m");
         int ex_r = hint_r + 1;
         if (ex_r <= host_rows - 1) {
             pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[038;2;110;118;129m", ex_r, main_left);
+            settings_tip_arm(ex_r, main_left);
             append_clipped_utf8(out, bs, &pos, "例：浅色窗格 → 选「GitHub Light」方案 Enter；或手动改默认背景 ffffff、默认前景 24292f。改完立即生效并写入 termux.ini。", avail);
             pos += snprintf(out + pos, bs - pos, "\x1b[0m");
         }
@@ -1074,10 +1455,12 @@ static void render_settings_keys(char *out, int bs, int *posp, int host_rows, in
 static void render_settings_behavior(char *out, int bs, int *posp, int host_rows, int host_cols, int main_left) {
     int pos = *posp;
     (void)host_cols;
-    settings_line_begin(out, bs, &pos, 3, main_left, host_cols, "\x1b[038;2;121;192;255;1m");
+    settings_line_begin(out, bs, &pos, settings_behavior_row_view(host_rows, 3),
+                        main_left, host_cols, "\x1b[038;2;121;192;255;1m");
         settings_line_text(out, bs, &pos, "■ 行为 (Behavior)");
         settings_line_end(out, bs, &pos);
-    settings_line_begin(out, bs, &pos, 4, main_left, host_cols, "\x1b[038;2;139;148;158m");
+    settings_line_begin(out, bs, &pos, settings_behavior_row_view(host_rows, 4),
+                        main_left, host_cols, "\x1b[038;2;139;148;158m");
         settings_line_text(out, bs, &pos, "↑/↓ 选择，Space/Enter 切换开关，←/→ 调整数值（scrollback 步进 1000）：");
         settings_line_end(out, bs, &pos);
 
@@ -1089,8 +1472,8 @@ static void render_settings_behavior(char *out, int bs, int *posp, int host_rows
         {"search_case_sensitive", "搜索锁定大小写（区分大小写）",  g_search_case_sensitive},
     };
     for (int i = 0; i < SETTINGS_BEHAVIOR_TOGGLES; i++) {
-        int row = SETTINGS_BEHAVIOR_ROW0 + i;
-        if (row > host_rows) break;
+        int row = settings_behavior_row_view(host_rows, SETTINGS_BEHAVIOR_ROW0 + i);
+        if (row < 0) continue;   /* 滚出可见区 */
         int selected = (g_settings_behavior_sel == i);
         int hovered = (g_mouse_y == row - 1 && g_mouse_x >= main_left - 1 && g_mouse_x < main_left + 60);
         pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH%s %s %-22s \x1b[0m%s%s\x1b[0m",
@@ -1099,8 +1482,8 @@ static void render_settings_behavior(char *out, int bs, int *posp, int host_rows
                         settings_row_style(selected, hovered), toggles[i].desc);
     }
 
-    int sb_row = SETTINGS_BEHAVIOR_ROW0 + SETTINGS_BEHAVIOR_TOGGLES;
-    if (sb_row <= host_rows) {
+    int sb_row = settings_behavior_row_view(host_rows, SETTINGS_BEHAVIOR_ROW0 + SETTINGS_BEHAVIOR_TOGGLES);
+    if (sb_row > 0) {
         int selected = (g_settings_behavior_sel == SETTINGS_BEHAVIOR_TOGGLES);
         /* scrollback 行右侧有 [-] / [+] 按钮，整行 hover 只覆盖文字区（到 [-]
          * 前一列）；按钮有自己的高亮，避免行底色与按钮底色叠加。 */
@@ -1138,16 +1521,21 @@ static void render_settings_behavior(char *out, int bs, int *posp, int host_rows
                         sb_row, main_left + SETTINGS_SB_PLUS_COL + 4);
     }
 
-    int hint_r = SETTINGS_BEHAVIOR_ROW0 + SETTINGS_BEHAVIOR_TOGGLES + 3;
-    if (hint_r > host_rows) hint_r = host_rows;
+    int hint_r = settings_behavior_row_view(host_rows, SETTINGS_BEHAVIOR_ROW0 + SETTINGS_BEHAVIOR_TOGGLES + 3);
+    if (hint_r < 0) hint_r = host_rows;
     settings_line_begin(out, bs, &pos, hint_r, main_left, host_cols, "\x1b[038;2;139;148;158m");
-        settings_line_text(out, bs, &pos, "提示: Space/Enter 切换, ←/→ 调整 scrollback, Ctrl+S 保存, Esc 返回");
+        settings_line_text(out, bs, &pos, "提示: Space/Enter 切换, ←/→ 调整 scrollback, ↑/↓ 越界自动翻页, Ctrl+S 保存, Esc 返回");
         settings_line_end(out, bs, &pos);
+        settings_page_mark(out, bs, &pos, hint_r, host_cols, host_rows,
+                           3, SETTINGS_BEHAVIOR_LAST, &g_settings_behavior_scroll);
     *posp = pos;
 }
 
 void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host_cols) {
     int pos = *posp;
+    settings_tip_reset();          /* v2.1.0：截断行登记表每帧重建 */
+    SettingsSidebarGeom sbg;
+    settings_sidebar_geom(host_rows, g_chooser_item_count, &sbg);
     int sb_w = SETTINGS_SIDEBAR_W;
     if (sb_w > host_cols / 2) sb_w = host_cols / 2;
     if (sb_w < 15) sb_w = 15;
@@ -1169,19 +1557,28 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
         pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[038;2;048;054;061m│\x1b[0m", r, sb_w);
     }
 
-    pos += snprintf(out + pos, bs - pos, "\x1b[3;1H\x1b[038;2;121;192;255;1m  导航选项\x1b[0m");
-    pos += snprintf(out + pos, bs - pos, "\x1b[4;1H\x1b[038;2;048;054;061m─────────────────────\x1b[0m");
+    if (sbg.nav_label) {          /* 矮终端：表头/分隔行先省掉，把行留给入口 */
+        char navlab[64];
+        if (sbg.items_cap < g_chooser_item_count)
+            snprintf(navlab, sizeof(navlab), "  导航选项 (条目 1-%d/%d)", sbg.items_cap, g_chooser_item_count);
+        else
+            snprintf(navlab, sizeof(navlab), "  导航选项");
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H\x1b[038;2;121;192;255;1m%s\x1b[0m", sbg.nav_label, navlab);
+    }
+    if (sbg.sep1)
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H\x1b[038;2;048;054;061m─────────────────────\x1b[0m", sbg.sep1);
 
     int is_sel0 = (g_settings_nav == 0);
-    int h_start = (g_mouse_y == 4 && g_mouse_x >= 0 && g_mouse_x < sb_w);
+    int h_start = (g_mouse_y == sbg.start - 1 && g_mouse_x >= 0 && g_mouse_x < sb_w);
     const char *start_style = is_sel0 ? (h_start ? "\x1b[048;2;048;075;110m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;038;060;088m\x1b[038;2;121;192;255;1m")
                                       : (h_start ? "\x1b[048;2;033;038;045m\x1b[038;2;255;255;255;1m" : "\x1b[038;2;230;237;243m");
-    pos += snprintf(out + pos, bs - pos, "\x1b[5;1H%s  %s 启动 (Startup)  \x1b[0m", start_style, (is_sel0 ? "▶" : " "));
+    pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H%s  %s 启动 (Startup)  \x1b[0m", sbg.start, start_style, (is_sel0 ? "▶" : " "));
 
-    pos += snprintf(out + pos, bs - pos, "\x1b[6;1H\x1b[038;2;048;054;061m┈┈ 菜单项配置 ┈┈┈┈┈┈─\x1b[0m");
+    if (sbg.sep2)
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H\x1b[038;2;048;054;061m┈┈ 菜单项配置 ┈┈┈┈┈┈─\x1b[0m", sbg.sep2);
 
-    for (int i = 0; i < g_chooser_item_count; i++) {
-        int r = 7 + i;
+    for (int i = 0; i < g_chooser_item_count && i < sbg.items_cap; i++) {
+        int r = sbg.items_row0 + i;
         if (r > host_rows - 3) break;
         int is_sel = (g_settings_nav == i + 1);
         int h_item = (g_mouse_y == r - 1 && g_mouse_x >= 0 && g_mouse_x < sb_w);
@@ -1192,25 +1589,32 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
         pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H%s  %s [%d] %-10s\x1b[0m", r, item_style, is_sel ? "▶" : " ", i + 1, dname);
     }
 
-    int add_r = 7 + g_chooser_item_count;
+    int add_r = sbg.add;
     if (add_r <= host_rows - 2) {
         int h_add = (g_mouse_y == add_r - 1 && g_mouse_x >= 0 && g_mouse_x < sb_w);
-        pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H%s  [+] 添加新条目    \x1b[0m", add_r, h_add ? "\x1b[048;2;063;185;080m\x1b[038;2;013;017;023;1m" : "\x1b[038;2;063;185;080;1m");
+        if (sbg.items_cap < g_chooser_item_count) {
+            char addlab[64];
+            snprintf(addlab, sizeof(addlab), "  [+] 添加(共%d项)", g_chooser_item_count);
+            settings_line_begin(out, bs, &pos, add_r, 1, sb_w, h_add ? "\x1b[048;2;063;185;080m\x1b[038;2;013;017;023;1m" : "\x1b[038;2;063;185;080;1m");
+            settings_line_text(out, bs, &pos, addlab);
+            settings_line_end(out, bs, &pos);
+        } else {
+            pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H%s  [+] 添加新条目    \x1b[0m", add_r, h_add ? "\x1b[048;2;063;185;080m\x1b[038;2;013;017;023;1m" : "\x1b[038;2;063;185;080;1m");
+        }
     }
 
-    int pre_r = 8 + g_chooser_item_count;
-    if (pre_r <= host_rows - 2) {
+    int pre_r = sbg.presets;
+    if (pre_r > 0 && pre_r <= host_rows - 2) {
         int h_pre = (g_mouse_y == pre_r - 1 && g_mouse_x >= 0 && g_mouse_x < sb_w);
         pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H%s  [P] 快速预设库    \x1b[0m", pre_r, h_pre ? "\x1b[048;2;031;136;061m\x1b[038;2;255;255;255;1m" : "\x1b[038;2;031;136;061;1m");
     }
 
-    int app_r, keys_r, beh_r;
-    settings_sidebar_extra_rows(&app_r, &keys_r, &beh_r);
+    int app_r = sbg.app, keys_r = sbg.keys, beh_r = sbg.beh;
     const struct { int row; const char *label; int nav; } extra_nav[4] = {
         {app_r,  "  [A] 外观 / 主题   ", SETTINGS_NAV_APPEARANCE},
         {keys_r, "  [K] 键位设置      ", SETTINGS_NAV_KEYS},
         {beh_r,  "  [B] 行为开关      ", SETTINGS_NAV_BEHAVIOR},
-        {beh_r + 1, "  [W] 窗格配色      ", SETTINGS_NAV_PANE},
+        {sbg.pane,   "  [W] 窗格配色      ", SETTINGS_NAV_PANE},
     };
     for (int i = 0; i < 4; i++) {
         int row = extra_nav[i].row;
@@ -1238,38 +1642,42 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
     } else if (g_settings_nav == SETTINGS_NAV_PANE) {
         render_settings_pane(out, bs, &pos, host_rows, host_cols, main_left);
     } else if (g_settings_nav == 0) {
-        settings_line_begin(out, bs, &pos, 3, main_left, host_cols, "\x1b[038;2;121;192;255;1m");
+        int s0 = settings_startup_row_view(host_rows, 3);
+        int s4 = settings_startup_row_view(host_rows, 4);
+        int s5 = settings_startup_row_view(host_rows, 5);
+        settings_line_begin(out, bs, &pos, s0, main_left, host_cols, "\x1b[038;2;121;192;255;1m");
         settings_line_text(out, bs, &pos, "■ 默认启动项设置 (Default Startup Item)");
         settings_line_end(out, bs, &pos);
-        settings_line_begin(out, bs, &pos, 4, main_left, host_cols, "\x1b[038;2;139;148;158m");
+        settings_line_begin(out, bs, &pos, s4, main_left, host_cols, "\x1b[038;2;139;148;158m");
         settings_line_text(out, bs, &pos, "选择每次打开 termux 窗口时默认显示的界面 (按 ←/→/Space/T/H 切换)：");
         settings_line_end(out, bs, &pos);
 
-        int opt0_hover = (g_mouse_y == 4 && g_mouse_x >= main_left - 1 && g_mouse_x < main_left + 25);
-        int opt1_hover = (g_mouse_y == 4 && g_mouse_x >= main_left + 28 && g_mouse_x < main_left + 50);
+        int opt0_hover = (s5 > 0 && g_mouse_y == s5 - 1 && g_mouse_x >= main_left - 1 && g_mouse_x < main_left + 25);
+        int opt1_hover = (s5 > 0 && g_mouse_y == s5 - 1 && g_mouse_x >= main_left + 28 && g_mouse_x < main_left + 50);
 
         const char *opt0_style = (g_default_startup == 0) ? (opt0_hover ? "\x1b[048;2;140;205;255m\x1b[038;2;013;017;023;1m" : "\x1b[048;2;121;192;255m\x1b[038;2;013;017;023;1m")
                                                           : (opt0_hover ? "\x1b[048;2;045;055;072m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;230;237;243m");
         const char *opt1_style = (g_default_startup == 1) ? (opt1_hover ? "\x1b[048;2;140;205;255m\x1b[038;2;013;017;023;1m" : "\x1b[048;2;121;192;255m\x1b[038;2;013;017;023;1m")
                                                           : (opt1_hover ? "\x1b[048;2;045;055;072m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;230;237;243m");
 
-        pos += snprintf(out + pos, bs - pos, "\x1b[5;%dH%s [●] 默认终端 (Terminal) \x1b[0m   %s [○] 内置帮助 (Help) \x1b[0m",
-                        main_left, opt0_style, opt1_style);
+        if (s5 > 0)
+            pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH%s [●] 默认终端 (Terminal) \x1b[0m   %s [○] 内置帮助 (Help) \x1b[0m",
+                            s5, main_left, opt0_style, opt1_style);
 
-        settings_line_begin(out, bs, &pos, 7, main_left, host_cols, "\x1b[038;2;121;192;255;1m");
+        settings_line_begin(out, bs, &pos, settings_startup_row_view(host_rows, 7), main_left, host_cols, "\x1b[038;2;121;192;255;1m");
         settings_line_text(out, bs, &pos, "■ [+] 新建菜单项顺序与管理 ([+] Menu Order)");
         settings_line_end(out, bs, &pos);
-        settings_line_begin(out, bs, &pos, 8, main_left, host_cols, "\x1b[038;2;139;148;158m");
+        settings_line_begin(out, bs, &pos, settings_startup_row_view(host_rows, 8), main_left, host_cols, "\x1b[038;2;139;148;158m");
         settings_line_text(out, bs, &pos, "按 ↑/↓ 选择行，Ctrl+↑/↓ 调顺序，Enter/[改] 编辑，X/[删] 移除：");
         settings_line_end(out, bs, &pos);
 
-        settings_line_begin(out, bs, &pos, 9, main_left, host_cols, "\x1b[038;2;121;192;255;1m");
+        settings_line_begin(out, bs, &pos, settings_startup_row_view(host_rows, 9), main_left, host_cols, "\x1b[038;2;121;192;255;1m");
         settings_line_text(out, bs, &pos, "   序号  显示名称        启动命令行                       操作");
         settings_line_end(out, bs, &pos);
 
         for (int i = 0; i < g_chooser_item_count; i++) {
-            int r = 10 + i;
-            if (r > host_rows - 2) break;
+            int r = settings_startup_row_view(host_rows, 10 + i);
+            if (r < 0) continue;
             int row_hover = (g_mouse_y == r - 1 && g_mouse_x >= main_left - 1 && g_mouse_x < host_cols);
             int row_focus = (i == g_settings_table_sel);
             /* 按钮列随可用宽度收缩（渲染与命中共用 settings_menu_*）：
@@ -1322,8 +1730,8 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
             pos += snprintf(out + pos, bs - pos, "%s[删]\x1b[0m", h_del ? "\x1b[048;2;248;081;073m\x1b[038;2;255;255;255;1m" : TB_BG "\x1b[038;2;248;081;073m");
         }
 
-        int btn_r = 10 + g_chooser_item_count + 1;
-        if (btn_r <= host_rows) {
+        int btn_r = settings_startup_row_view(host_rows, 10 + g_chooser_item_count + 1);
+        if (btn_r > 0) {
             int h_add = (g_mouse_y == btn_r - 1 && g_mouse_x >= main_left - 1 && g_mouse_x < main_left + 13);
             int h_pre = (g_mouse_y == btn_r - 1 && g_mouse_x >= main_left + 15 && g_mouse_x < main_left + 29);
 
@@ -1332,72 +1740,110 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
             pos += snprintf(out + pos, bs - pos, "%s [P] 快速预设 \x1b[0m", h_pre ? "\x1b[048;2;031;136;061m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;031;136;061;1m");
         }
 
-        int hint_r = btn_r + 2 <= host_rows ? btn_r + 2 : host_rows;
+        int hint_r = settings_startup_row_view(host_rows, 12 + g_chooser_item_count);
+        if (hint_r < 0) hint_r = host_rows;
         settings_line_begin(out, bs, &pos, hint_r, main_left, host_cols, "\x1b[038;2;139;148;158m");
         settings_line_text(out, bs, &pos, "提示: ↑/↓ 选择, Ctrl+↑/↓ 调序, Enter 编辑, X 删除, + 新建, P 预设, Ctrl+S 保存, Esc 退出");
         settings_line_end(out, bs, &pos);
+        settings_page_mark(out, bs, &pos, hint_r, host_cols, host_rows, 3,
+                           settings_startup_last(host_rows), &g_settings_startup_scroll);
     } else {
         int item_idx = g_settings_nav - 1;
-        pos += snprintf(out + pos, bs - pos, "\x1b[3;%dH\x1b[038;2;121;192;255;1m■ 菜单项详细配置: [%d] %s\x1b[0m",
-                        main_left, item_idx + 1, g_chooser_items[item_idx].name);
+        /* v2.1.0：菜单项详细配置页有 11 行（标题 / 4 组字段 / 按钮 / 提示），终端一矮
+         * 就整片画到屏幕外（用户报「终端太矮时设置显示不全」）。改成整页上滚，行号
+         * 一律经 settings_detail_row_view() 换算；滚出可见区的行不画，命中判定同函数反查。 */
+        int d_title = settings_detail_row_view(host_rows, 3);
+        int d_f0 = settings_detail_row_view(host_rows, 5), d_f0i = settings_detail_row_view(host_rows, 6);
+        int d_f1 = settings_detail_row_view(host_rows, 8), d_f1i = settings_detail_row_view(host_rows, 9);
+        int d_f2 = settings_detail_row_view(host_rows, 11), d_f2i = settings_detail_row_view(host_rows, 12);
+        int d_f3 = settings_detail_row_view(host_rows, 14), d_f3i = settings_detail_row_view(host_rows, 15);
+        int act_r = settings_detail_row_view(host_rows, 17);
+        int d_hint = settings_detail_row_view(host_rows, 19);
+
+        if (d_title > 0)
+            pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[038;2;121;192;255;1m■ 菜单项详细配置: [%d] %s\x1b[0m",
+                            d_title, main_left, item_idx + 1, g_chooser_items[item_idx].name);
 
         int input_w = right_max_w - 4;
         if (input_w > 50) input_w = 50;
         if (input_w < 20) input_w = 20;
 
         int f0_sel = (g_settings_field == 0);
-        int f0_hover = (g_mouse_y == 5 && g_mouse_x >= main_left - 1 && g_mouse_x <= main_left + input_w + 2);
+        int f0_hover = (d_f0i > 0 && g_mouse_y + 1 == d_f0i && g_mouse_x >= main_left - 1 && g_mouse_x <= main_left + input_w + 2);
         const char *f0_bg = f0_sel ? "\x1b[048;2;038;060;088m" : (f0_hover ? "\x1b[048;2;033;038;045m" : "\x1b[048;2;022;027;034m");
-        settings_line_begin(out, bs, &pos, 5, main_left, host_cols, "\x1b[038;2;230;237;243;1m");
-        settings_line_text(out, bs, &pos, "1. 显示名称 (Display Name):");
-        settings_line_end(out, bs, &pos);
-        pos += snprintf(out + pos, bs - pos, "\x1b[6;%dH\x1b[048;2;033;038;045m│\x1b[0m%s ", main_left, f0_bg);
-        render_scrollable_input(out, bs, &pos, g_edit_name, g_edit_name_len, g_edit_name_pos, input_w, f0_bg, NULL);
-        pos += snprintf(out + pos, bs - pos, "%s \x1b[0m\x1b[048;2;033;038;045m│\x1b[0m", f0_bg);
+        if (d_f0 > 0) {
+            settings_line_begin(out, bs, &pos, d_f0, main_left, host_cols, "\x1b[038;2;230;237;243;1m");
+            settings_line_text(out, bs, &pos, "1. 显示名称 (Display Name):");
+            settings_line_end(out, bs, &pos);
+        }
+        if (d_f0i > 0) {
+            pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[048;2;033;038;045m│\x1b[0m%s ", d_f0i, main_left, f0_bg);
+            render_scrollable_input(out, bs, &pos, g_edit_name, g_edit_name_len, g_edit_name_pos, input_w, f0_bg, NULL);
+            pos += snprintf(out + pos, bs - pos, "%s \x1b[0m\x1b[048;2;033;038;045m│\x1b[0m", f0_bg);
+        }
 
         int f1_sel = (g_settings_field == 1);
-        int f1_hover = (g_mouse_y == 8 && g_mouse_x >= main_left - 1 && g_mouse_x <= main_left + input_w + 2);
+        int f1_hover = (d_f1i > 0 && g_mouse_y + 1 == d_f1i && g_mouse_x >= main_left - 1 && g_mouse_x <= main_left + input_w + 2);
         const char *f1_bg = f1_sel ? "\x1b[048;2;038;060;088m" : (f1_hover ? "\x1b[048;2;033;038;045m" : "\x1b[048;2;022;027;034m");
-        settings_line_begin(out, bs, &pos, 8, main_left, host_cols, "\x1b[038;2;230;237;243;1m");
-        settings_line_text(out, bs, &pos, "2. 启动命令行 (Command Line):");
-        settings_line_end(out, bs, &pos);
-        pos += snprintf(out + pos, bs - pos, "\x1b[9;%dH\x1b[048;2;033;038;045m│\x1b[0m%s ", main_left, f1_bg);
-        render_scrollable_input(out, bs, &pos, g_edit_cmd, g_edit_cmd_len, g_edit_cmd_pos, input_w, f1_bg, NULL);
-        pos += snprintf(out + pos, bs - pos, "%s \x1b[0m\x1b[048;2;033;038;045m│\x1b[0m", f1_bg);
+        if (d_f1 > 0) {
+            settings_line_begin(out, bs, &pos, d_f1, main_left, host_cols, "\x1b[038;2;230;237;243;1m");
+            settings_line_text(out, bs, &pos, "2. 启动命令行 (Command Line):");
+            settings_line_end(out, bs, &pos);
+        }
+        if (d_f1i > 0) {
+            pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[048;2;033;038;045m│\x1b[0m%s ", d_f1i, main_left, f1_bg);
+            render_scrollable_input(out, bs, &pos, g_edit_cmd, g_edit_cmd_len, g_edit_cmd_pos, input_w, f1_bg, NULL);
+            pos += snprintf(out + pos, bs - pos, "%s \x1b[0m\x1b[048;2;033;038;045m│\x1b[0m", f1_bg);
+        }
 
         int f2_sel = (g_settings_field == 2);
-        int f2_hover = (g_mouse_y == 11 && g_mouse_x >= main_left - 1 && g_mouse_x <= main_left + input_w + 2);
+        int f2_hover = (d_f2i > 0 && g_mouse_y + 1 == d_f2i && g_mouse_x >= main_left - 1 && g_mouse_x <= main_left + input_w + 2);
         const char *f2_bg = f2_sel ? "\x1b[048;2;038;060;088m" : (f2_hover ? "\x1b[048;2;033;038;045m" : "\x1b[048;2;022;027;034m");
-        pos += snprintf(out + pos, bs - pos, "\x1b[11;%dH\x1b[038;2;230;237;243;1m3. 启动目录 (Working Directory) \x1b[038;2;139;148;158m[留空为当前目录，支持 %%USERPROFILE%%]:\x1b[0m", main_left);
-        pos += snprintf(out + pos, bs - pos, "\x1b[12;%dH\x1b[048;2;033;038;045m│\x1b[0m%s ", main_left, f2_bg);
-        render_scrollable_input(out, bs, &pos, g_edit_dir, g_edit_dir_len, g_edit_dir_pos, input_w, f2_bg, NULL);
-        pos += snprintf(out + pos, bs - pos, "%s \x1b[0m\x1b[048;2;033;038;045m│\x1b[0m", f2_bg);
+        if (d_f2 > 0)
+            pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[038;2;230;237;243;1m3. 启动目录 (Working Directory) \x1b[038;2;139;148;158m[留空为当前目录，支持 %%USERPROFILE%%]:\x1b[0m",
+                            d_f2, main_left);
+        if (d_f2i > 0) {
+            pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[048;2;033;038;045m│\x1b[0m%s ", d_f2i, main_left, f2_bg);
+            render_scrollable_input(out, bs, &pos, g_edit_dir, g_edit_dir_len, g_edit_dir_pos, input_w, f2_bg, NULL);
+            pos += snprintf(out + pos, bs - pos, "%s \x1b[0m\x1b[048;2;033;038;045m│\x1b[0m", f2_bg);
+        }
 
         /* v1.8.9: 第 4 个字段 —— 这个菜单项启动出来的标签页默认用什么颜色。 */
         int f3_sel = (g_settings_field == 3);
-        pos += snprintf(out + pos, bs - pos,
-                        "\x1b[14;%dH\x1b[038;2;230;237;243;1m4. 启动默认颜色 (Tab Color) "
-                        "\x1b[038;2;139;148;158m[用此项新建标签页时的颜色，默认=蓝]:\x1b[0m", main_left);
-        render_item_color_row(out, bs, &pos, 15, main_left, g_edit_color, f3_sel);
+        if (d_f3 > 0)
+            pos += snprintf(out + pos, bs - pos,
+                            "\x1b[%d;%dH\x1b[038;2;230;237;243;1m4. 启动默认颜色 (Tab Color) "
+                            "\x1b[038;2;139;148;158m[用此项新建标签页时的颜色，默认=蓝]:\x1b[0m", d_f3, main_left);
+        if (d_f3i > 0)
+            render_item_color_row(out, bs, &pos, d_f3i, main_left, g_edit_color, f3_sel);
 
-        int act_r = 17;
-        int h_apply = (g_mouse_y == act_r - 1 && g_mouse_x >= main_left - 1 && g_mouse_x < main_left + 17);
-        int h_imp = (g_mouse_y == act_r - 1 && g_mouse_x >= main_left + 19 && g_mouse_x < main_left + 35);
-        int h_del = (g_mouse_y == act_r - 1 && g_mouse_x >= main_left + 37 && g_mouse_x < main_left + 49);
+        int h_apply = (act_r > 0 && g_mouse_y == act_r - 1 && g_mouse_x >= main_left - 1 && g_mouse_x < main_left + 17);
+        int h_imp = (act_r > 0 && g_mouse_y == act_r - 1 && g_mouse_x >= main_left + 19 && g_mouse_x < main_left + 35);
+        int h_del = (act_r > 0 && g_mouse_y == act_r - 1 && g_mouse_x >= main_left + 37 && g_mouse_x < main_left + 49);
 
-        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH", act_r, main_left);
-        pos += snprintf(out + pos, bs - pos, "%s [保存并应用此项] \x1b[0m  ", h_apply ? "\x1b[048;2;121;192;255m\x1b[038;2;013;017;023;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;121;192;255;1m");
-        pos += snprintf(out + pos, bs - pos, "%s [从预设库导入] \x1b[0m  ", h_imp ? "\x1b[048;2;031;136;061m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;031;136;061;1m");
-        pos += snprintf(out + pos, bs - pos, "%s [删除此项] \x1b[0m", h_del ? "\x1b[048;2;248;081;073m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;248;081;073;1m");
+        if (act_r > 0) {
+            pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH", act_r, main_left);
+            pos += snprintf(out + pos, bs - pos, "%s [保存并应用此项] \x1b[0m  ", h_apply ? "\x1b[048;2;121;192;255m\x1b[038;2;013;017;023;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;121;192;255;1m");
+            pos += snprintf(out + pos, bs - pos, "%s [从预设库导入] \x1b[0m  ", h_imp ? "\x1b[048;2;031;136;061m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;031;136;061;1m");
+            pos += snprintf(out + pos, bs - pos, "%s [删除此项] \x1b[0m", h_del ? "\x1b[048;2;248;081;073m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;248;081;073;1m");
+        }
 
-        settings_line_begin(out, bs, &pos, 19, main_left, host_cols, "\x1b[038;2;139;148;158m");
-        settings_line_text(out, bs, &pos, "提示: Tab 切换字段, ←/→ 选颜色, Enter 保存应用, Ctrl+P 导入预设, Ctrl+D 删除, Esc 返回");
-        settings_line_end(out, bs, &pos);
+        if (d_hint > 0) {
+            settings_line_begin(out, bs, &pos, d_hint, main_left, host_cols, "\x1b[038;2;139;148;158m");
+            settings_line_text(out, bs, &pos, "提示: Tab 切换字段, ←/→ 选颜色, Enter 保存应用, Ctrl+P 导入预设, Ctrl+D 删除, Esc 返回");
+            settings_line_end(out, bs, &pos);
+            settings_page_mark(out, bs, &pos, d_hint, host_cols, host_rows,
+                               SETTINGS_DETAIL_FIRST, SETTINGS_DETAIL_LAST, &g_settings_detail_scroll);
+        }
     }
 
     if (g_settings_show_presets) {
         render_settings_presets(out, bs, &pos, host_rows, host_cols);
     }
+    if (g_settings_show_pane_schemes) {
+        render_pane_scheme_picker(out, bs, &pos, host_rows, host_cols);
+    }
+    render_settings_tooltip(out, bs, &pos, host_rows, host_cols);
 
     *posp = pos;
 }
@@ -3813,10 +4259,14 @@ void render_screen(void) {
                 else
                     pos += snprintf(out + pos, bs - pos, "\x1b[?25l");   /* 1 基：'#' 在 col+VALUE_OFF-1，光标停在已输入字符之后 */
             } else {
+                /* 外观页也能纵向滚动（v2.1.0），光标必须跟着同一套行号换算 */
                 int role_col = settings_role_col(main_left, g_hex_edit_role);
-                pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[?25h",
-                                settings_role_row(g_hex_edit_role),
-                                role_col + 21 + g_hex_edit_len);
+                int crow = settings_appearance_row_view(g_mux.host_rows, settings_role_row(g_hex_edit_role));
+                if (crow > 0)
+                    pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[?25h",
+                                    crow, role_col + 21 + g_hex_edit_len);
+                else
+                    pos += snprintf(out + pos, bs - pos, "\x1b[?25l");
             }
         } else if (g_settings_nav >= 1 && g_settings_nav <= g_chooser_item_count && !g_settings_show_presets) {
             int sb_w = SETTINGS_SIDEBAR_W;
@@ -3831,15 +4281,19 @@ void render_screen(void) {
             if (input_w > 50) input_w = 50;
             if (input_w < 20) input_w = 20;
 
-            if (g_settings_field == 0) {
-                int scr_off = get_input_screen_offset(g_edit_name, g_edit_name_len, g_edit_name_pos, input_w);
-                pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[?25h", 6, main_left + 2 + scr_off);
-            } else if (g_settings_field == 1) {
-                int scr_off = get_input_screen_offset(g_edit_cmd, g_edit_cmd_len, g_edit_cmd_pos, input_w);
-                pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[?25h", 9, main_left + 2 + scr_off);
-            } else if (g_settings_field == 2) {
-                int scr_off = get_input_screen_offset(g_edit_dir, g_edit_dir_len, g_edit_dir_pos, input_w);
-                pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[?25h", 12, main_left + 2 + scr_off);
+            /* v2.1.0：详情页整页可滚，光标行号同样经 settings_detail_row_view() 换算 */
+            static const int d_field_nat[3] = { 6, 9, 12 };
+            int d_field = g_settings_field;
+            int d_row = (d_field >= 0 && d_field <= 2)
+                            ? settings_detail_row_view(g_mux.host_rows, d_field_nat[d_field]) : 0;
+            if (d_field >= 0 && d_field <= 2 && d_row > 0) {
+                const char *dbuf = (d_field == 0) ? g_edit_name : (d_field == 1) ? g_edit_cmd : g_edit_dir;
+                int dlen = (d_field == 0) ? g_edit_name_len : (d_field == 1) ? g_edit_cmd_len : g_edit_dir_len;
+                int dpos = (d_field == 0) ? g_edit_name_pos : (d_field == 1) ? g_edit_cmd_pos : g_edit_dir_pos;
+                int scr_off = get_input_screen_offset(dbuf, dlen, dpos, input_w);
+                pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[?25h", d_row, main_left + 2 + scr_off);
+            } else if (d_field >= 0 && d_field <= 2) {
+                pos += snprintf(out + pos, bs - pos, "\x1b[?25l");   /* 输入框滚出可见区 */
             } else {
                 /* v1.8.9: 颜色选择行不是输入框，别留下闪烁光标。 */
                 pos += snprintf(out + pos, bs - pos, "\x1b[?25l");

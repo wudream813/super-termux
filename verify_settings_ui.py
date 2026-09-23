@@ -177,9 +177,12 @@ check('", color=%d"' in CONFIG_C and 'if (_strnicmp(ctext, "color", 5) == 0)' in
 check("int item_color_hit(int left, int col);" in RENDER_H and
       "void render_item_color_row(" in RENDER_H,
       "颜色选择条的几何/渲染没有在 render.h 公开")
-check("render_item_color_row(out, bs, &pos, 15, main_left, g_edit_color, f3_sel);" in RENDER,
+# v2.1.0：详情页整页可滚，行号一律经 settings_detail_row_view() 换算 —— 颜色条与
+# 按钮行的锚点因此改成「视图行 + 命中反查」成对出现，任一侧退回裸行号就红。
+check("render_item_color_row(out, bs, &pos, d_f3i, main_left, g_edit_color, f3_sel);" in RENDER,
       "设置页菜单项详情页缺少启动默认颜色选择条")
-check("int act_r = 17;" in RENDER and "r == 17" in INPUT,
+check("int act_r = settings_detail_row_view(host_rows, 17);" in RENDER and
+      "nat == 17" in INPUT and "nat == 15" in INPUT,
       "详情页操作按钮行没有随颜色行下移到第 17 行")
 check("item_color_hit(main_left, c)" in INPUT,
       "详情页颜色选择条没有鼠标热区")
@@ -212,6 +215,38 @@ check("g_edit_color = (g_edit_color + 1) % 9" in INPUT and
 check("g_mux.panes[p].color = (c >= 1 && c <= 8) ? c : 0;" in
       (ROOT / "src/pane.c").read_text(encoding="utf-8"),
       "create_pane_from_item 没有把菜单项颜色应用到新标签页")
+
+# ===========================================================================
+# v2.1.0：矮终端整页滚动 / 侧栏自适应 / 窄屏截断悬停气泡 / 方案选择浮层
+# ===========================================================================
+check("int d_title = settings_detail_row_view(host_rows, 3);" in RENDER and
+      "int nat = settings_detail_natural_at(host_rows, r);" in INPUT,
+      "v2.1.0：详细配置页滚动行号未做到渲染/命中同源")
+check("int s0 = settings_startup_row_view(host_rows, 3);" in RENDER and
+      "int snat = settings_startup_natural_at(host_rows, r);" in INPUT,
+      "v2.1.0：启动项页滚动行号未做到渲染/命中同源")
+check("settings_appearance_row_view(host_rows, settings_theme_row(i))" in RENDER and
+      "settings_appearance_row_view(host_rows, settings_theme_row(i))" in INPUT,
+      "v2.1.0：外观页主题行在渲染与鼠标命中用了不同行号")
+check("settings_behavior_row_view(host_rows, SETTINGS_BEHAVIOR_ROW0 + i)" in RENDER and
+      "settings_behavior_row_view(host_rows, SETTINGS_BEHAVIOR_ROW0 + i)" in INPUT,
+      "v2.1.0：行为页行号在渲染与鼠标命中用了不同来源")
+check("SettingsSidebarGeom sbg;" in RENDER and "SettingsSidebarGeom sbg;" in INPUT and
+      "int cap = host_rows - 1 - fixed_below - g->items_row0 + 1;" in RENDER,
+      "v2.1.0：侧栏自适应几何没有渲染/命中共用（矮终端下入口会被挤出屏幕）")
+check("if (row < 0) { g_sl_hidden = 1; g_sl_left = 0; g_sl_row = 0; return; }" in RENDER and
+      "if (g_sl_left <= 0 || g_sl_hidden) return;" in RENDER,
+      "v2.1.0：滚出可见区的行仍会发出 CUP（会画到非法行）")
+check("out[(*posp)++]='.'; out[(*posp)++]='.'; out[(*posp)++]='.';" in RENDER and
+      "render_settings_tooltip(out, bs, &pos, host_rows, host_cols);" in RENDER,
+      "v2.1.0：窄屏截断没有补「...」或没有画悬停气泡")
+check("t->row = g_sl_row; t->col = g_sl_col0; t->len = w;" in RENDER and
+      "void settings_tip_reset(void) { g_tip_n = 0; g_sl_row = 0; }" in RENDER,
+      "v2.1.0：截断行未登记进气泡表（或表未按帧重置）")
+check("if (g_settings_show_pane_schemes) {\n        render_pane_scheme_picker(out, bs, &pos, host_rows, host_cols);" in RENDER and
+      "g_settings_show_pane_schemes = 1;" in INPUT and
+      "pane_scheme_picker_geom(host_rows, host_cols, &top, &left, &pw, &ph);" in INPUT,
+      "v2.1.0：窗格配色方案选择浮层没接上（渲染或键盘/鼠标命中缺失）")
 
 if errors:
     print(f"\n设置页 UI 验证失败：{len(errors)} 项", file=sys.stderr)

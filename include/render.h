@@ -139,6 +139,56 @@ void render_settings_presets(char *out, int bs, int *posp, int host_rows, int ho
 void presets_geom(int host_rows, int host_cols, int *top, int *left, int *w, int *h, int *max_nw, int *max_cw);
 void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host_cols);
 void settings_sidebar_extra_rows(int *appearance_r, int *keys_r, int *behavior_r);
+
+/* ===========================================================================
+ * v2.1.0：矮终端纵向滚动 + 窄屏截断的悬停气泡
+ *
+ * 两件事都是「屏幕不够就把内容丢掉」的后遗症：太矮时外观页 13 行之后的语义色区、
+ * 行为页末尾、菜单项详细配置的按钮和提示行全都画到屏幕外；侧栏更糟——[A]/[K]/
+ * [B]/[W] 四个入口被挤掉，鼠标根本进不去子页。现在：
+ *   - 侧栏按 host_rows 自适应（先省表头与分隔行，再省 [P] 行，菜单项列表截断），
+ *     四个入口与 [Ctrl+S] 永远在屏内；
+ *   - 外观 / 行为 / 菜单项详细配置三页各自持有一个滚动量，行号一律由
+ *     settings_*_row_view() 换算，渲染与命中判定同源；
+ *   - 横向装不下的文字截到边界并补「...」，鼠标停在上面时以浮层气泡给出全文。
+ * ========================================================================= */
+#define SETTINGS_TIP_MAX  24           /* 每帧登记的截断行上限 */
+#define SETTINGS_TIP_TEXT 512
+typedef struct {
+    int row;                            /* 1 基终端行 */
+    int col;                            /* 该行文字起始列（1 基） */
+    int len;                            /* 全文显示宽度（列） */
+    char full[SETTINGS_TIP_TEXT];
+} SettingsTip;
+void settings_tip_reset(void);
+int  settings_tip_count(void);
+const SettingsTip *settings_tip_at(int row, int col);   /* 命中返回登记项，否则 NULL */
+/* 有滚动时在行右端画 (first-last/total) 位置指示 */
+void settings_scroll_mark(char *out, int bs, int *posp, int row, int right_col,
+                          int first_vis, int last_vis, int total);
+void settings_page_mark(char *out, int bs, int *posp, int row, int right_col, int host_rows,
+                        int first, int last, int *scroll);
+
+int  settings_page_row(int host_rows, int natural, int first, int last,
+                       int *scroll, int sel_natural);
+int  settings_page_natural_at(int host_rows, int row, int first, int last, int *scroll, int sel_natural);
+int  settings_appearance_row_view(int host_rows, int natural);
+int  settings_appearance_sel_natural(int host_rows);
+int  settings_appearance_natural_at(int host_rows, int row);
+int  settings_behavior_row_view(int host_rows, int natural);
+int  settings_behavior_sel_natural(int host_rows);
+int  settings_behavior_natural_at(int host_rows, int row);
+int  settings_detail_row_view(int host_rows, int natural);
+int  settings_startup_row_view(int host_rows, int natural);
+int  settings_startup_natural_at(int host_rows, int row);
+int  settings_detail_natural_at(int host_rows, int row);
+typedef struct {
+    int hdr, nav_label, sep1, start, sep2;
+    int items_row0, items_cap, add, presets;   /* presets = 0 表示隐藏 */
+    int app, keys, beh, pane, save;
+    int compact, hide_presets;
+} SettingsSidebarGeom;
+void settings_sidebar_geom(int host_rows, int item_count, SettingsSidebarGeom *g);
 int settings_theme_row(int idx);
 int settings_role_row(int role);
 int settings_role_col(int main_left, int role);
@@ -161,6 +211,10 @@ int settings_keys_prefix_col(int host_cols, int main_left);
 int settings_keys_edit_col(int host_cols, int main_left);
 int settings_keys_reset_col(int host_cols, int main_left);
 int settings_keys_show_reset(int host_cols, int main_left);
+/* v2.1.0：窗格配色页顶部的「预设方案」行按 Enter / 点击打开的方案列表浮层。 */
+void pane_scheme_picker_geom(int host_rows, int host_cols, int *top, int *left, int *w, int *h);
+void render_pane_scheme_picker(char *out, int bs, int *posp, int host_rows, int host_cols);
+int  pane_scheme_picker_swatches(int pw);
 /* v2.0.9：菜单项管理页（启动页下半部分）每行的 [↑][↓][改][删] 按钮列同样随宽度收缩：
  * 先压「启动命令行」列（30 → 8），极窄时只留 [改][删]（调序用 Ctrl+↑/↓）。
  * 渲染与鼠标命中共用。 */

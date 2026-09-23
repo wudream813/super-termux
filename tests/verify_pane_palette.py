@@ -319,12 +319,16 @@ int main(int argc, char **argv) {
 """
 
 
-def capture_page_keys(rows, cols, keys):
-    """起 termux(rows x cols)，依次发 keys，返回收到的全部字节。"""
+def capture_page_keys(rows, cols, keys, ini=None):
+    """起 termux(rows x cols)，依次发 keys，返回收到的全部字节。
+    ini 非空时先写 termux.ini（用来造出「5 个菜单项」这类需要配置的场景）。"""
     td = tempfile.mkdtemp(prefix="termux_palette_keys_")
     exe = os.path.join(td, "termux")
     shutil.copy2(EXE, exe)
     os.chmod(exe, 0o755)
+    if ini is not None:
+        with open(os.path.join(td, "termux.ini"), "w", encoding="utf-8") as f:
+            f.write(ini)
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(td)
@@ -594,7 +598,8 @@ def main():
 
     # H. (v2.0.9) 预设方案 / 窄终端单列 / 编辑时光标位置
     #   H1 方案行 →×5 = GitHub Light，Enter 应用：ini 出现 20 个 pane_ 键，窗格文字白底
-    h1, inih = run_settings_ui([(b"\x1b[C", 0.2)] * 5 + [(b"\r", 0.8)], "UI_H1")
+    #   v2.1.0：方案行 Enter = 打开方案列表，列表里 Enter = 应用，所以是两次 Enter
+    h1, inih = run_settings_ui([(b"\x1b[C", 0.2)] * 5 + [(b"\r", 0.6), (b"\r", 0.8)], "UI_H1")
     ck("H1 应用「GitHub Light」方案 → ini 写入全部 20 个 pane_* 键", len(ini_pane_lines(inih)) == 20, "pane 行=%r" % ini_pane_lines(inih))
     ck("H1 方案里 pane_background = #ffffff", "pane_background = #ffffff" in ini_pane_lines(inih))
     sh = sgr_before(h1, b"UI_H1")   # sgr_before 排除回显字面量与 RED_ 前缀，取程序输出那行
@@ -676,6 +681,150 @@ def main():
         shutil.rmtree(td, ignore_errors=True)
     else:
         print("  [SKIP] I 组 —— 本机没有 libvterm-dev")
+
+
+    # ======================= J 组：方案选择浮层（v2.1.0）=======================
+    # 用户反馈「窗格配色要可以选择」：方案行 Enter 弹出完整列表（8 项 + 色块预览），
+    # ↑/↓ 选、数字键直达、Enter 应用、Esc 只关浮层。
+    VTERM_TEXT_C = r"""
+#include <vterm.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    int R = atoi(argv[1]), C = atoi(argv[2]);
+    VTerm *vt = vterm_new(R, C); vterm_set_utf8(vt, 1);
+    VTermScreen *scr = vterm_obtain_screen(vt); vterm_screen_reset(scr, 1);
+    FILE *f = fopen(argv[3], "rb"); char buf[65536]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) vterm_input_write(vt, buf, n);
+    for (int r = 0; r < R; r++) {
+        for (int c = 0; c < C; c++) {
+            VTermScreenCell cell; VTermPos p = {r, c};
+            vterm_screen_get_cell(scr, p, &cell);
+            if (cell.width == 0 || cell.chars[0] == (uint32_t)-1) continue;
+            unsigned ch = cell.chars[0] ? cell.chars[0] : ' ';
+            if (ch < 0x80) putchar(ch);
+            else if (ch < 0x800) { putchar(0xC0|(ch>>6)); putchar(0x80|(ch&0x3F)); }
+            else { putchar(0xE0|(ch>>12)); putchar(0x80|((ch>>6)&0x3F)); putchar(0x80|(ch&0x3F)); }
+        }
+        putchar('\n');
+    }
+    return 0;
+}
+"""
+
+    def vt_text(rows, cols, data, _cache={}):
+        """把一段宿主字节流回放进 libvterm，返回屏幕文本行列表（宽字符后半格跳过）。"""
+        if os.environ.get("TERMUX_NO_VTERM"): return None
+        if "bin" not in _cache:
+            td = tempfile.mkdtemp(prefix="termux_palette_txt_")
+            src = os.path.join(td, "vtext.c"); exe = os.path.join(td, "vtext")
+            with open(src, "w") as f: f.write(VTERM_TEXT_C)
+            r = subprocess.run(["gcc", "-O1", src, "-o", exe, "-lvterm"], capture_output=True, text=True)
+            _cache["bin"] = exe if r.returncode == 0 else ""
+            if not _cache["bin"]:
+                print("  [SKIP] J/K/L 组 —— vterm 文本 dump 编译失败：%s" % r.stderr.strip()[:160])
+        if not _cache["bin"]: return None
+        dump = os.path.join(tempfile.mkdtemp(prefix="termux_palette_d_"), "s.bin")
+        with open(dump, "wb") as f: f.write(data)
+        out = subprocess.run([_cache["bin"], str(rows), str(cols), dump], capture_output=True, text=True).stdout
+        os.remove(dump)
+        return out.splitlines()
+
+    j1 = capture_page_keys(24, 100, [b"\x02s", b"W", b"\r"])
+    tj1 = vt_text(24, 100, j1)
+    if tj1 is None:
+        print("  [SKIP] J/K/L 组 —— 本机没有 libvterm-dev")
+    else:
+        joined = "\n".join(tj1)
+        ck("J1 窗格配色页按 Enter → 弹出方案列表浮层（标题 + 8 个方案名）",
+           "窗格配色方案" in joined and all(n in joined for n in
+               ["Campbell", "One Half Light", "One Half Dark", "Solarized Light",
+                "Solarized Dark", "GitHub Light", "Dracula", "Nord"]),
+           "")
+        ck("J1 浮层带方框（顶边/底边都在）", "┌" in joined and "└" in joined, "")
+        ck("J1 方案行文案提示 Enter 打开列表", "Enter 打开方案列表" in joined, "")
+        # 浮层每行要有真实色块预览（append_swatch 的形状：底色 SGR + 两空格 + 复位）。
+        # 配置全空时窗格页本身不画色块，所以「标题之后」出现的色块只可能来自浮层。
+        pi = j1.find("┌─ 窗格配色方案".encode())
+        nsw = len(re.findall(rb"\x1b\[48;2;\d+;\d+;\d+m  \x1b\[0m", j1[pi:])) if pi >= 0 else 0
+        ck("J1 浮层每行带色块预览（方案的实际颜色，不是空框）", nsw >= 32, "色块 %d 个" % nsw)
+        #   J2：数字键 6 = 直接选第 6 个方案并应用（GitHub Light）
+        _, inj2 = run_settings_ui([(b"\r", 0.6), (b"6", 0.9)], "UI_J2")
+        pj2 = ini_pane_lines(inj2)
+        ck("J2 浮层里按数字 6 → 应用 GitHub Light（ini 写满 20 键、背景 #ffffff）",
+           len(pj2) == 20 and "pane_background = #ffffff" in pj2, "pane 行=%r" % (pj2[:2],))
+        #   J3：Esc 只关浮层，不改配置
+        _, inj3 = run_settings_ui([(b"\r", 0.6), (b"\x1b", 0.6)], "UI_J3")
+        ck("J3 浮层按 Esc → 关浮层且不写配置", len(ini_pane_lines(inj3)) == 0,
+           "pane 行=%r" % ini_pane_lines(inj3)[:2])
+        #   J4：浮层打开时吞掉其它键（不能顺手改到窗格槽位选择）
+        _, inj4 = run_settings_ui([(b"\r", 0.6), (b"\x1b[B", 0.4), (b"\x1b", 0.6)], "UI_J4")
+        ck("J4 浮层里按 ↓ 只移动高亮，不落到槽位表", len(ini_pane_lines(inj4)) == 0, "")
+
+        # ======================= K 组：矮终端整页滚动（v2.1.0）=======================
+        # 终端只有 12 行时，v2.0.9 的外观页从第 13 行起整片画到屏幕外；侧栏的四个子页
+        # 入口也会被挤掉。现在：侧栏自适应 + 每页可滚，↑/↓ 越界自动翻页。
+        many_items = ("[menu]\r\n"
+                      "1 = one, /bin/sh\r\n2 = two, /bin/sh\r\n3 = three, /bin/sh\r\n"
+                      "4 = four, /bin/sh\r\n5 = five, /bin/sh\r\n")
+        k1 = capture_page_keys(12, 100, [b"\x02s"], ini=many_items)
+        tk1 = vt_text(12, 100, k1) or []
+        jk1 = "\n".join(tk1)
+        ck("K1 12 行终端：侧栏 [A]/[K]/[B]/[W] 四个入口与 [Ctrl+S] 都在屏内",
+           all(x in jk1 for x in ["[A] 外观", "[K] 键位", "[B] 行为", "[W] 窗格配色", "[Ctrl+S] 保存配置"]),
+           "")
+        ck("K1 12 行 × 5 个菜单项：列表被截断时说明还有多少项（数字键 1-9 仍可选）",
+           "添加(共5项)" in jk1 and "导航选项" not in jk1, jk1[:400])
+        # 一整串 ↓ 一次写入：31 个动作全部滚一遍，比逐键 0.4s 快两个数量级
+        k2 = capture_page_keys(12, 100, [b"\x02s", b"\x1bOQ", b"\x1b[B" * 24])
+        tk2 = vt_text(12, 100, k2) or []
+        jk2 = "\n".join(tk2)
+        ck("K2 12 行 × 外观页：连续 ↓ 后语义色区滚进可见区（background 行可见）",
+           "background" in jk2 and "语义颜色" in jk2, jk2[:200])
+        ck("K2 有滚动时提示行右端标出行窗口 (a-b/20)", "/20)" in jk2, "")
+        # 键位页：先从 40 行的完整截图里取出动作名序列的首/尾两项，再回看 12 行下
+        # 滚到底的画面 —— 断言与动作表顺序无关（加动作不会误报）。
+        tall = vt_text(40, 100, capture_page_keys(40, 100, [b"\x02s", b"\x1bOR"])) or []
+        names = []
+        for line in tall:
+            l = line.split("│")[-1]     # 只取右侧内容区，别把侧栏文字当成行首
+            m = re.match(r"^\s*(?:▶)?\s*([a-z][a-z0-9-]{2,})\s{2,}", l)
+            if m and m.group(1) not in names:
+                names.append(m.group(1))
+        ck("K3 前置：40 行下键位页能列出全部动作名", len(names) >= 20, "%d 个" % len(names))
+        if len(names) >= 2:
+            k3 = capture_page_keys(12, 100, [b"\x02s", b"\x1bOR", b"\x1b[B" * 60])
+            jk3 = "\n".join(vt_text(12, 100, k3) or [])
+            ck("K3 12 行 × 键位页：滚到底能看到最后一个动作，且第 2 个动作已滚出",
+               names[-1] in jk3 and names[1] not in jk3,
+               "first=%s last=%s" % (names[1], names[-1]))
+
+        # ======================= L 组：窄屏截断 + 悬停气泡（v2.1.0）=======================
+        # 装不下时行尾留「...」；鼠标停在被截断的行上，以跟随鼠标的浮层给出全文。
+        hint_full = "Ctrl+S 保存, Esc 返回"     # 提示行末尾那段，截断后看不见
+        l0 = capture_page_keys(24, 60, [b"\x02s", b"\x1bOQ"])
+        tl0 = vt_text(24, 60, l0) or []
+        joined0 = "\n".join(tl0)
+        row_hint = next((i + 1 for i, l in enumerate(tl0) if "提示: ↑/↓ 选择" in l), 0)
+        ck("L1 60 列 × 外观页：提示行确实被截断（行尾出现 ...，尾部文字不可见）",
+           row_hint > 0 and "..." in tl0[row_hint - 1] and hint_full not in joined0,
+           "row=%d" % row_hint)
+        if row_hint:
+            l1 = capture_page_keys(24, 60, [b"\x02s", b"\x1bOQ",
+                                           ("\x1b[<32;%d;%dM" % (40, row_hint)).encode()])
+            tl1 = vt_text(24, 60, l1) or []
+            joined1 = "\n".join(tl1)
+            ck("L2 鼠标悬停在被截断的行上 → 浮层气泡出现（含框线）",
+               "┌" in joined1 and "└" in joined1, "")
+            ck("L2 气泡里能看到被截掉的尾部文字", hint_full in joined1, "")
+            ck("L2 气泡跟随鼠标：出现在悬停行附近（不超过上下 4 行）",
+               any(abs((i + 1) - row_hint) <= 4 and ("│" in tl1[i] or "┌" in tl1[i] or "└" in tl1[i])
+                   for i in range(len(tl1))), "")
+        #   L3：没被截断的行不该冒出气泡
+        l2 = capture_page_keys(24, 100, [b"\x02s", b"\x1bOQ", b"\x1b[<32;30;3M"])
+        tl2 = "\n".join(vt_text(24, 100, l2) or [])
+        ck("L3 100 列下提示行没被截断 → 不画气泡（无框线）", "┌─" not in tl2, "")
 
     print()
     if FAILS:

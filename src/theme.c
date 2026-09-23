@@ -367,6 +367,13 @@ int theme_pane_scheme_count(void) { return (int)(sizeof(g_pane_schemes) / sizeof
 const char *theme_pane_scheme_name(int i) {
     return (i >= 0 && i < theme_pane_scheme_count()) ? g_pane_schemes[i].name : "";
 }
+static void pane_scheme_slots(int i, ThemeRGB out[THEME_PANE_SLOTS]);   /* 定义在下方 */
+
+void theme_pane_scheme_preview(int i, ThemeRGB out[THEME_PANE_SLOTS]) {
+    if (i < 0 || i >= theme_pane_scheme_count()) { for (int k = 0; k < THEME_PANE_SLOTS; k++) { out[k].r = 0; out[k].g = 0; out[k].b = 0; } return; }
+    pane_scheme_slots(i, out);
+}
+
 static void pane_scheme_slots(int i, ThemeRGB out[THEME_PANE_SLOTS]) {
     for (int k = 0; k < 18; k++) parse_hex6(g_pane_schemes[i].hex[k], &out[k]);
     out[THEME_PANE_SB_THUMB] = out[8];              /* 亮黑：在深浅底上都是中灰 */

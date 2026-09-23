@@ -502,6 +502,31 @@ static void test_pane_palette(void) {
         check(theme_pane_any() == 0, "Ctrl+R 清除全部后回到「跟随终端」");
     }
     {
+        /* v2.1.0：方案列表浮层用 preview 取色（只读，不改当前配置）。 */
+        ThemeRGB pv[THEME_PANE_SLOTS];
+        ThemeRGB pv2[THEME_PANE_SLOTS];
+        theme_pane_scheme_preview(0, pv);            /* Campbell（默认控制台色） */
+        theme_pane_scheme_preview(5, pv2);           /* GitHub Light */
+        check(pv[THEME_PANE_BG].r == 0x0c && pv[THEME_PANE_BG].g == 0x0c && pv[THEME_PANE_BG].b == 0x0c &&
+              pv[THEME_PANE_FG].r == 0xcc && pv[THEME_PANE_FG].g == 0xcc && pv[THEME_PANE_FG].b == 0xcc,
+              "方案 preview 给出背景/前景实际颜色（浮层色块用）");
+        check(pv2[THEME_PANE_BG].r == 0xff && pv2[THEME_PANE_BG].g == 0xff && pv2[THEME_PANE_BG].b == 0xff,
+              "preview 按方案取色（GitHub Light 背景 = #ffffff）");
+        check(theme_pane_any() == 0, "preview 是只读的：不会把方案写进当前配置");
+        ThemeRGB zero[THEME_PANE_SLOTS];
+        zero[0].r = 123;
+        theme_pane_scheme_preview(-1, zero);
+        check(zero[0].r == 0 && zero[0].g == 0 && zero[0].b == 0, "越界下标返回全黑而不是留着旧值");
+        int same = 1;
+        theme_pane_scheme_apply(0);
+        for (int k = 0; k < THEME_PANE_SLOTS; k++) {
+            int r = -1, g = -1, b = -1;
+            if (!theme_pane_rgb(k, &r, &g, &b) || r != pv[k].r) same = 0;
+        }
+        check(same, "preview(0) 的颜色与 apply(0) 后逐项一致（浮层预览不会骗人）");
+        theme_clear_pane_all();
+    }
+    {
         int all_named = 1;
         for (int i = 0; i < THEME_PANE_SLOTS; i++)
             if (!theme_pane_slot_name(i)[0] || !theme_pane_slot_label(i)[0]) all_named = 0;

@@ -2079,8 +2079,8 @@ static void handle_settings_pane_key(WORD vk, WCHAR uc, BOOL is_ctrl) {
         if (vk == VK_DOWN)  { g_settings_pane_sel = settings_pane_order_slot(0); g_mux.needs_redraw = 1; return; }
         if (vk == VK_UP)    { return; }
         if (vk == VK_RETURN || vk == VK_SPACE) {
-            theme_pane_scheme_apply(g_settings_pane_scheme);
-            save_config();
+            /* v2.1.0：Enter 打开方案列表（「窗格配色要可以选择」），在列表里 Enter 应用 */
+            g_settings_show_pane_schemes = 1;
             g_mux.needs_redraw = 1;
             return;
         }
@@ -2216,6 +2216,33 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
     /* 录制键位 / 编辑十六进制时独占键盘 */
     if (g_key_capture_active) { handle_key_capture(vk, ctrl, uc); return; }
     if (g_hex_edit_active) { handle_hex_edit_key(vk, uc); return; }
+
+    if (g_settings_show_pane_schemes) {
+        int nn = theme_pane_scheme_count();
+        if (nn <= 0) { g_settings_show_pane_schemes = 0; return; }
+        if (vk == VK_ESCAPE) { g_settings_show_pane_schemes = 0; g_mux.needs_redraw = 1; return; }
+        if (vk == VK_UP)   { g_settings_pane_scheme = (g_settings_pane_scheme + nn - 1) % nn; g_mux.needs_redraw = 1; return; }
+        if (vk == VK_DOWN) { g_settings_pane_scheme = (g_settings_pane_scheme + 1) % nn; g_mux.needs_redraw = 1; return; }
+        if (vk == VK_RETURN || vk == VK_SPACE) {
+            theme_pane_scheme_apply(g_settings_pane_scheme);
+            save_config();
+            g_settings_show_pane_schemes = 0;
+            g_mux.needs_redraw = 1;
+            return;
+        }
+        if (uc >= '1' && uc <= '9') {
+            int idx = uc - '1';
+            if (idx < nn) {
+                g_settings_pane_scheme = idx;
+                theme_pane_scheme_apply(idx);
+                save_config();
+                g_settings_show_pane_schemes = 0;
+                g_mux.needs_redraw = 1;
+            }
+            return;
+        }
+        return;     /* 浮层打开时吞掉其余按键，避免误改页面上的选择 */
+    }
 
     if (g_settings_show_presets) {
         if (vk == VK_ESCAPE) {
@@ -2594,6 +2621,25 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
     if (input_w < 20) input_w = 20;
     int r = my + 1, c = mx + 1;
 
+    if (g_settings_show_pane_schemes) {
+        int top, left, pw, ph;
+        pane_scheme_picker_geom(host_rows, host_cols, &top, &left, &pw, &ph);
+        if (r > top && r <= top + ph - 2 && c >= left && c < left + pw) {
+            int idx = r - top - 1;
+            if (idx >= 0 && idx < theme_pane_scheme_count()) {
+                g_settings_pane_scheme = idx;
+                theme_pane_scheme_apply(idx);
+                save_config();
+                g_settings_show_pane_schemes = 0;
+                g_mux.needs_redraw = 1;
+            }
+            return;
+        }
+        g_settings_show_pane_schemes = 0;   /* 点框外只关浮层 */
+        g_mux.needs_redraw = 1;
+        return;
+    }
+
     if (g_settings_show_presets) {
         int top, left, pw, ph, mnw, mcw;
         presets_geom(host_rows, host_cols, &top, &left, &pw, &ph, &mnw, &mcw);
@@ -2634,20 +2680,22 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
     /* The divider itself is ANSI column sb_w and is still part of the
      * sidebar hit region rendered above. */
     if (c <= sb_w) {
-        if (r == 5) {
+        SettingsSidebarGeom sbg;
+        settings_sidebar_geom(host_rows, g_chooser_item_count, &sbg);
+        if (r == sbg.start) {
             g_settings_nav = 0;
             g_mux.needs_redraw = 1;
             return;
         }
-        for (int i = 0; i < g_chooser_item_count; i++) {
-            if (r == 7 + i) {
+        for (int i = 0; i < g_chooser_item_count && i < sbg.items_cap; i++) {
+            if (r == sbg.items_row0 + i) {
                 g_settings_nav = i + 1;
                 load_item_to_editor(i);
                 g_mux.needs_redraw = 1;
                 return;
             }
         }
-        if (r == 7 + g_chooser_item_count) {
+        if (r == sbg.add) {
             if (g_chooser_item_count < MAX_CHOOSER_ITEMS) {
                 int idx = g_chooser_item_count++;
                 snprintf(g_chooser_items[idx].name, sizeof(g_chooser_items[0].name), "新终端");
@@ -2661,7 +2709,7 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                 return;
             }
         }
-        if (r == 8 + g_chooser_item_count) {
+        if (sbg.presets && r == sbg.presets) {
             g_settings_show_presets = 1;
             g_preset_sel = 0;
             g_mux.needs_redraw = 1;
@@ -2670,12 +2718,13 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
         {
             int app_r, keys_r, beh_r;
             settings_sidebar_extra_rows(&app_r, &keys_r, &beh_r);
-            if (r == app_r || r == keys_r || r == beh_r || r == beh_r + 1) {
+            if (r == app_r || r == keys_r || r == beh_r || r == sbg.pane) {
                 g_key_capture_active = 0;
                 g_hex_edit_active = 0;
                 g_settings_nav = (r == app_r) ? SETTINGS_NAV_APPEARANCE
                                : (r == keys_r) ? SETTINGS_NAV_KEYS
                                : (r == beh_r) ? SETTINGS_NAV_BEHAVIOR : SETTINGS_NAV_PANE;
+                g_settings_show_pane_schemes = 0;
                 g_mux.needs_redraw = 1;
                 return;
             }
@@ -2695,7 +2744,7 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
         if (g_settings_nav == SETTINGS_NAV_APPEARANCE) {
             int tc = theme_count();
             for (int i = 0; i < tc; i++) {
-                if (r == settings_theme_row(i)) {
+                if (r == settings_appearance_row_view(host_rows, settings_theme_row(i))) {
                     g_settings_theme_sel = i;
                     theme_set_by_name(theme_name_at(i));
                     theme_apply();
@@ -2705,9 +2754,9 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                 }
             }
             for (int role = 0; role < TH_ROLE_COUNT; role++) {
-                int row = settings_role_row(role);
+                int row = settings_appearance_row_view(host_rows, settings_role_row(role));
                 int col = settings_role_col(main_left, role);
-                if (r == row && c >= col && c < col + SETTINGS_ROLE_COL_W - 1) {
+                if (row > 0 && r == row && c >= col && c < col + SETTINGS_ROLE_COL_W - 1) {
                     g_settings_theme_sel = tc + role;
                     settings_hex_edit_begin(role);
                     g_mux.needs_redraw = 1;
@@ -2718,9 +2767,16 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
         }
         if (g_settings_nav == SETTINGS_NAV_PANE) {
             if (r == SETTINGS_PANE_SCHEME_ROW && c >= main_left) {
-                /* 点方案行：点在「‹」左半边换上一个，其余换下一个；已经选中时再点 = 应用 */
-                if (g_settings_pane_sel == -1) { theme_pane_scheme_apply(g_settings_pane_scheme); save_config(); }
-                else g_settings_pane_sel = -1;
+                /* v2.1.0：点方案行 = 选中并弹出方案列表；点「‹」「›」箭头仍是上一个/下一个 */
+                int half = main_left + 12;
+                if (g_settings_pane_sel == -1 && c != main_left) {
+                    if (c < half) g_settings_pane_scheme = (g_settings_pane_scheme + theme_pane_scheme_count() - 1) % theme_pane_scheme_count();
+                    else if (c < main_left + 34) g_settings_pane_scheme = (g_settings_pane_scheme + 1) % theme_pane_scheme_count();
+                    else { g_settings_show_pane_schemes = 1; g_mux.needs_redraw = 1; return; }
+                } else {
+                    g_settings_pane_sel = -1;
+                    g_settings_show_pane_schemes = 1;
+                }
                 g_hex_edit_active = 0;
                 g_mux.needs_redraw = 1;
                 return;
@@ -2758,13 +2814,13 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
         }
         if (g_settings_nav == SETTINGS_NAV_BEHAVIOR) {
             for (int i = 0; i < SETTINGS_BEHAVIOR_TOGGLES; i++) {
-                if (r == SETTINGS_BEHAVIOR_ROW0 + i) {
+                if (r == settings_behavior_row_view(host_rows, SETTINGS_BEHAVIOR_ROW0 + i)) {
                     g_settings_behavior_sel = i;
                     settings_behavior_toggle(i);
                     return;
                 }
             }
-            if (r == SETTINGS_BEHAVIOR_ROW0 + SETTINGS_BEHAVIOR_TOGGLES) {
+            if (r == settings_behavior_row_view(host_rows, SETTINGS_BEHAVIOR_ROW0 + SETTINGS_BEHAVIOR_TOGGLES)) {
                 g_settings_behavior_sel = SETTINGS_BEHAVIOR_TOGGLES;
                 if (c >= main_left + SETTINGS_SB_MINUS_COL && c < main_left + SETTINGS_SB_MINUS_COL + 3)
                     settings_scrollback_step(-1000);
@@ -2776,7 +2832,8 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             return;
         }
         if (g_settings_nav == 0) {
-            if (r == 5) {
+            int snat = settings_startup_natural_at(host_rows, r);
+            if (snat == 5) {
                 if (c >= main_left && c < main_left + 26) {
                     g_default_startup = 0;
                     save_config();
@@ -2791,7 +2848,7 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                 }
             }
             for (int i = 0; i < g_chooser_item_count; i++) {
-                if (r == 10 + i) {
+                if (snat == 10 + i) {
                     int mbtn = settings_menu_btn_col(host_cols, main_left);
                     int mud = settings_menu_show_ud(host_cols, main_left);
                     int ecol = mbtn + (mud ? 6 : 0);
@@ -2847,7 +2904,7 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                 }
             }
             int btn_r = 10 + g_chooser_item_count + 1;
-            if (r == btn_r) {
+            if (snat == btn_r) {
                 if (c >= main_left && c < main_left + 14) {
                     if (g_chooser_item_count < MAX_CHOOSER_ITEMS) {
                         int idx = g_chooser_item_count++;
@@ -2871,22 +2928,24 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             }
         } else {
             int item_idx = g_settings_nav - 1;
-            if (r == 6 && c >= main_left && c < main_left + input_w + 4) {
+            /* v2.1.0：本页会纵向滚动，先把屏幕行反查成「自然行」再比较 */
+            int nat = settings_detail_natural_at(host_rows, r);
+            if (nat == 6 && c >= main_left && c < main_left + input_w + 4) {
                 g_settings_field = 0;
                 g_mux.needs_redraw = 1;
                 return;
             }
-            if (r == 9 && c >= main_left && c < main_left + input_w + 4) {
+            if (nat == 9 && c >= main_left && c < main_left + input_w + 4) {
                 g_settings_field = 1;
                 g_mux.needs_redraw = 1;
                 return;
             }
-            if (r == 12 && c >= main_left && c < main_left + input_w + 4) {
+            if (nat == 12 && c >= main_left && c < main_left + input_w + 4) {
                 g_settings_field = 2;
                 g_mux.needs_redraw = 1;
                 return;
             }
-            if (r == 15) {   /* v1.8.9: 启动默认颜色选择条 */
+            if (nat == 15) {   /* v1.8.9: 启动默认颜色选择条 */
                 int hit = item_color_hit(main_left, c);
                 if (hit >= 0) {
                     g_settings_field = 3;
@@ -2895,7 +2954,7 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                     return;
                 }
             }
-            if (r == 17) {
+            if (nat == 17) {
                 if (c >= main_left && c < main_left + 18) {
                     save_editor_to_item(item_idx);
                     g_mux.needs_redraw = 1;

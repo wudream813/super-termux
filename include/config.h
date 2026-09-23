@@ -34,7 +34,12 @@ extern int g_preset_sel;
 /* 外观页 / 键位页 / 行为页的光标与编辑状态 */
 extern int g_settings_pane_sel;     /* 窗格配色页：当前选中的 pane_* 槽位；-1 = 方案行 */
 extern int g_settings_pane_scheme;  /* 窗格配色页：方案行当前指向的预设下标 */
+extern int g_settings_show_pane_schemes;  /* v2.1.0：方案选择浮层（预设方案列表）是否打开 */
 extern int g_settings_pane_scroll;  /* 窗格配色页：单列模式下的行滚动（矮终端） */
+extern int g_settings_appear_scroll;    /* v2.1.0：外观页纵向滚动（终端太矮时） */
+extern int g_settings_behavior_scroll;  /* v2.1.0：行为页纵向滚动 */
+extern int g_settings_detail_scroll;    /* v2.1.0：菜单项详细配置页纵向滚动 */
+extern int g_settings_startup_scroll;    /* v2.1.0：默认启动项页纵向滚动 */
 extern int g_settings_theme_sel;    /* 0..theme_count-1 = 主题行；之后 = 语义色行 */
 extern int g_settings_keys_sel;     /* 0 = 前缀键行；1..N = 动作行 */
 extern int g_settings_keys_scroll;

@@ -26,7 +26,12 @@ int g_preset_sel = 0;
 int g_settings_theme_sel = 0;
 int g_settings_pane_sel = -1;        /* -1 = 方案行（最上面，最快上手）；槽位见 THEME_PANE_* */
 int g_settings_pane_scheme = 0;
+int g_settings_show_pane_schemes = 0;
 int g_settings_pane_scroll = 0;
+int g_settings_appear_scroll = 0;
+int g_settings_behavior_scroll = 0;
+int g_settings_detail_scroll = 0;
+int g_settings_startup_scroll = 0;
 int g_settings_keys_sel = 0;
 int g_settings_keys_scroll = 0;
 int g_settings_behavior_sel = 0;
