@@ -78,6 +78,28 @@ int theme_count(void);
 const char *theme_name_at(int idx);
 /* 存在 [theme] 覆盖项时为 1（保存配置时需要原样写回）。 */
 int theme_has_overrides(void);
+
+/* ---- 窗格 16 色 palette（v2.0.6）----------------------------------------
+ * 上面 16 个角色只管 termux 自己的 UI（标签栏 / 面板 / 边框）。窗格里 cmd 的
+ * 普通文字是 16 色索引属性（0x07 = 灰字黑底），渲染时原样发 \x1b[37;40m，
+ * 由宿主终端按它自己的 palette 画 —— 所以改 background 对 cmd 背景无效。
+ * 这组配置像 Windows Terminal 的 color scheme：把窗格的默认前景 / 默认背景 /
+ * 16 个索引色各映射到一个 RGB，渲染时改发真彩色。【一项都没设时完全透传】，
+ * 现有行为零改变（identity 断言仍成立）。
+ *   pane_foreground / pane_background     默认前后景（SGR 39 / 49 与 0x07）
+ *   pane_black … pane_white               索引 0..7
+ *   pane_bright_black … pane_bright_white 索引 8..15 */
+#define THEME_PANE_FG   16
+#define THEME_PANE_BG   17
+#define THEME_PANE_SLOTS 18
+/* 名字 -> 槽位（0..15 索引色，16 fg，17 bg）；不是 pane_* 返回 -1。 */
+int  theme_pane_slot_index(const char *name);
+const char *theme_pane_slot_name(int slot);
+int  theme_set_pane_hex(const char *name, const char *hex);
+/* 该槽位有映射时返回 1 并填 RGB；否则 0（渲染方应原样发 16 色索引）。 */
+int  theme_pane_rgb(int slot, int *r, int *g, int *b);
+int  theme_pane_any(void);
+void theme_pane_get(int slot, char *hex_out, int cap);   /* 无映射写空串 */
 int theme_role_is_overridden(int role);
 void theme_clear_overrides(void);
 void theme_clear_role_override(int role);

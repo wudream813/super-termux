@@ -470,7 +470,36 @@ static void test_keymap_noprefix(void) {
     check(keymap_action_uses_prefix(ACT_COPY_MODE) == 1, "keymap_init 复位直接键标记");
 }
 
+static void test_pane_palette(void) {
+    printf("theme: 窗格 16 色 palette（pane_*）\n");
+    theme_init();
+    check(!theme_pane_any(), "初始没有任何 pane_* 映射");
+    check(theme_pane_slot_index("pane_background") == THEME_PANE_BG, "pane_background -> 17");
+    check(theme_pane_slot_index("pane_foreground") == THEME_PANE_FG, "pane_foreground -> 16");
+    check(theme_pane_slot_index("pane_red") == 1 && theme_pane_slot_index("pane_bright_blue") == 12,
+          "索引色按 ANSI 编号（red=1, bright_blue=12）");
+    check(theme_pane_slot_index("background") == -1, "UI 角色名不是 pane 槽位（两套键不串）");
+    check(theme_set_pane_hex("pane_background", "#ffffff") == 1, "设 pane_background");
+    check(theme_set_pane_hex("pane_background", "#fffff") == 0, "5 位 hex 拒绝");
+    check(theme_set_pane_hex("nope", "#ffffff") == 0, "未知键拒绝");
+    int r = -1, g = -1, b = -1;
+    check(theme_pane_rgb(THEME_PANE_BG, &r, &g, &b) == 1 && r == 255 && g == 255 && b == 255, "读回 #ffffff");
+    check(theme_pane_rgb(THEME_PANE_FG, &r, &g, &b) == 0, "没设的槽位返回 0（渲染方原样透传）");
+    char hex[16];
+    theme_pane_get(THEME_PANE_BG, hex, sizeof(hex));
+    check_str(hex, "#ffffff", "theme_pane_get 写回配置用的 hex");
+    /* pane_* 是窗格正文的事，不能把 UI 的 identity 打破（theme_remap 一个字节都不该改） */
+    theme_apply();
+    char buf[] = "\x1b[048;2;013;017;023m";
+    char before[sizeof(buf)]; memcpy(before, buf, sizeof(buf));
+    theme_remap(buf, (int)sizeof(buf) - 1);
+    check(memcmp(buf, before, sizeof(buf)) == 0, "设了 pane_* 后 UI remap 仍是 identity");
+    theme_init();
+    check(!theme_pane_any(), "theme_init 清空 pane_* 映射");
+}
+
 int main(void) {
+    test_pane_palette();
     test_theme_identity();
     test_theme_remap();
     test_theme_override();

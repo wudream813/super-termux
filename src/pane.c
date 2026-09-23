@@ -523,18 +523,29 @@ void close_pane(int idx) {
     pane->active = 0;
     LeaveCriticalSection(&g_mux.cs);
 
-#ifndef _WIN32
+#ifdef _WIN32
+    /* bug #32（v2.0.6）：Windows 点 × 永久卡死。移植时这里被改成
+     *   join(read_thread, 2000) → CloseHandle(pipes) → hpc = NULL
+     * 丢了两件事：① ClosePseudoConsole 再也没被调用 —— conhost 一直活着、
+     * pipe_out 的写端一直被它持有，读线程的 ReadFile 永远不返回；② 顺序反了，
+     * 先 join 必定白等 2 秒，然后 CloseHandle 一个正被别的线程阻塞 ReadFile 的
+     * 管道句柄 —— 这在 Windows 上会把 CloseHandle 自己也挂住，主线程就此卡死。
+     * 恢复移植前的顺序：先关伪控制台（conhost 退出、关它那端管道）→ 关本端
+     * 管道（ReadFile 立即失败返回）→ 这时再 join 读线程才有意义。
+     * hpc 是 HPCON（void*），必须用 NULL；NULL_HANDLE 在 clang 下报
+     * -Wnon-literal-null-conversion（只有 macOS 作业能抓到）。 */
+    if (pane->hpc) { conpty_close(pane->hpc); pane->hpc = NULL; }
+    plat_proc_close(&pane->process, &pane->pipe_in, &pane->pipe_out);
+    plat_thread_join(&pane->read_thread, 2000);
+    if (pane->thread != NULL_HANDLE) CloseHandle(pane->thread);   /* pi.hThread，原来只置空不关：句柄泄漏 */
+#else
     /* POSIX：读线程阻塞在 pty 的 read 上，只有 shell 真的退了才拿得到 EOF，
-     * 所以必须【先杀进程再等线程】，否则 join 必然白等满 2000ms。
-     * Windows 侧不需要：CloseHandle 会让阻塞中的 ReadFile 立刻失败返回。 */
+     * 所以必须【先杀进程再等线程】，否则 join 必然白等满 2000ms。 */
     if (pane->process != NULL_HANDLE) plat_proc_kill(pane->process);
-#endif
     plat_thread_join(&pane->read_thread, 2000);
     plat_proc_close(&pane->process, &pane->pipe_in, &pane->pipe_out);
-    /* hpc 是 HPCON（void*），必须用 NULL。写 NULL_HANDLE（= (HANDLE)0，整数 0）
-     * 在 clang 下会触发 -Wnon-literal-null-conversion；gcc 不报，所以这个警告
-     * 只有 macOS 作业能抓到。 */
     pane->hpc = NULL;
+#endif
     pane->thread = NULL_HANDLE;
 
     EnterCriticalSection(&g_mux.cs);

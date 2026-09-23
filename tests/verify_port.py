@@ -171,10 +171,22 @@ print("=== 7) POSIX 后端的关键语义 ===")
 ck("plat_thread_join 会提前返回（不是无条件睡满超时）",
    "done" in PLAT_POSIX and "pthread_join" in PLAT_POSIX,
    "关 4 个窗格会白等 4×2000ms，退出一次 8 秒")
+# v2.0.6 起 close_pane 是 #ifdef _WIN32 / #else 两个完整分支（bug #32），
+# 这里只看 #else（POSIX）分支内部：kill 必须出现在 join 之前。
+_cp = re.search(r"void close_pane\(int idx\).*?\n}\n", PANE, re.S)
+_posix_branch = re.search(r"#else(.*?)#endif", _cp.group(0), re.S) if _cp else None
+_pb = _posix_branch.group(1) if _posix_branch else ""
 ck("close_pane 在 POSIX 上先杀进程再 join",
-   re.search(r"#ifndef _WIN32.*?plat_proc_kill.*?#endif\s*\n\s*plat_thread_join",
-             PANE, re.S) is not None,
+   "plat_proc_kill" in _pb and "plat_thread_join" in _pb
+   and _pb.index("plat_proc_kill") < _pb.index("plat_thread_join"),
    "读线程阻塞在 pty read 上，不先杀 shell 就永远等不到 EOF")
+# bug #32：Windows 分支必须 ClosePseudoConsole → 关管道 → 再 join（顺序反了主线程卡死）
+_win_branch = re.search(r"#ifdef _WIN32(.*?)#else", _cp.group(0), re.S) if _cp else None
+_wb = _win_branch.group(1) if _win_branch else ""
+ck("close_pane 在 Windows 上先 conpty_close 再关管道再 join（bug #32）",
+   all(k in _wb for k in ("conpty_close", "plat_proc_close", "plat_thread_join"))
+   and _wb.index("conpty_close") < _wb.index("plat_proc_close") < _wb.index("plat_thread_join"),
+   "移植时顺序反了 + 漏了 ClosePseudoConsole ⇒ 点 × 永久卡死")
 ck("termios 关掉了 OPOST（Windows 侧设了 DISABLE_NEWLINE_AUTO_RETURN）",
    "OPOST" in PLAT_POSIX)
 ck("进入时打开 SGR 鼠标模式 1006",

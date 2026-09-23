@@ -5,7 +5,7 @@
 终端复用器（Terminal Multiplexer）—— 模块化 C 架构，单文件可执行。
 在一个终端窗口里管理多个 shell 会话，像 tmux 一样分标签页、分屏、搜历史。
 
-当前版本：**v2.0.5**（正式支持 Windows / Linux / macOS 三个系统）
+当前版本：**v2.0.6**（正式支持 Windows / Linux / macOS 三个系统）
 
 ## 平台支持
 
@@ -300,6 +300,24 @@ python3 verify_config_theme.py     # 配置体系：主题参考色板完整性 
 
 
 ## 版本历史
+
+**v2.0.6** —— 修 **bug #32**（Windows 点 × 关标签永久卡死）+ 新增窗格 16 色 palette（`[theme] pane_*`）。
+
+| # | 内容 |
+|---|---|
+| bug #32 | **现象**：Windows 上点标签的 × / `Ctrl+B x` 后整个 termux 无响应。**根因**：跨平台移植（`16a38b9`）改写 `close_pane()` 时把顺序弄反、还漏掉了 `ClosePseudoConsole`：变成 `join(读线程, 2000ms) → CloseHandle(管道) → hpc = NULL`。读线程阻塞在 `ReadFile(pipe_out)` 上，conhost 没被关、写端一直被它持有 ⇒ join 必白等 2 秒；随后对**正被另一线程阻塞读的管道句柄** `CloseHandle`，在 Windows 上会把 `CloseHandle` 自己也挂住 ⇒ 主线程永久卡死。**修法**：恢复移植前顺序 `ClosePseudoConsole → CloseHandle(管道) → join`，并补关 `pi.hThread`（原来只置空，句柄泄漏）。POSIX 分支不变。**限制**：本机无 Windows、CI runner 上 ConPTY 子进程活不下来（见 v2.0.3），此修复**只有代码推理与移植前版本的对照**，没有运行期证据，需真机确认 |
+| 窗格 palette | **现象**：改 `[theme] background` 后 cmd 背景仍是黑的。**原因**：`background` 等 16 个角色只管 termux 自己的 UI；cmd 的普通文字是 16 色索引属性（`0x07`），渲染时原样发 `\x1b[0;37;40m`，宿主终端按自己的 palette 画 `40` = 黑，termux 的主题根本看不到它。**新增**：`[theme]` 段的 `pane_foreground` / `pane_background` / `pane_black` … `pane_white` / `pane_bright_black` … `pane_bright_white` 共 18 个键（像 Windows Terminal 的 color scheme），渲染 16 色属性时改发真彩色；**一项都不设时输出一字节不变**。`Ctrl+B r` 热重载生效，`Ctrl+S` 保存不丢。设置页暂无编辑器（角色编辑器绑死在 16 个 UI 角色上），下一版补 |
+| 判据 | `tests/verify_pane_palette.py`（`make palette-posix`，进 `check-posix`）真 PTY 起 termux：A 无配置时仍发 `;37;40`；B 配白底深字后发 `48;2;255;255;255` / `38;2;36;41;47`；C `pane_red` 让 SGR 31 发 `38;2;255;0;0`；D libvterm 回放那一行背景真的是 `(255,255,255)`。修前二进制 B/C/D 五条全红。**C 项在开发中抓到一个真 bug**：屏幕属性存的是 Win32 位标志（RED=4）而 `pane_*` 按 ANSI 编号（red=1），第一版没换算，`pane_red` 落到了 `pane_blue`。`make unittest` +13 条覆盖 theme 层 API 与 identity 不被打破 |
+
+浅色窗格示例（写进 `termux.ini`，`Ctrl+B r` 重载）：
+
+```ini
+[theme]
+pane_background = #ffffff
+pane_foreground = #24292f
+pane_black = #24292f
+pane_bright_black = #57606a
+```
 
 **v2.0.5** —— 修 **bug #31**：alt 屏全屏程序（nano / vim）铺满整宽时最后一列显示为空白（Linux 真机报告）。
 

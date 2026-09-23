@@ -244,7 +244,7 @@ void load_config(void) {
         trim_tail(val);
 
         if (section == SEC_IGNORE) continue;
-        if (section == SEC_THEME) { theme_set_role_hex(key, val); continue; }
+        if (section == SEC_THEME) { if (!theme_set_pane_hex(key, val)) theme_set_role_hex(key, val); continue; }
         if (section == SEC_KEYS) {
             if (_stricmp(key, "prefix") == 0) keymap_set_prefix(val);
             else keymap_bind(key, val);
@@ -373,6 +373,21 @@ void save_config(void) {
     } else {
         const char *sample = "# accent = #58a6ff\r\n# background = #0d1117\r\n";
         fwrite(sample, 1, strlen(sample), f);
+    }
+    /* 窗格 palette：上面的 background 只管 termux 自己的 UI；cmd 里的文字是
+     * 16 色索引，要改它的底色 / 字色 / 16 色得用这组（像 Windows Terminal 的
+     * color scheme）。一项都不设 = 原样透传给宿主终端。 */
+    const char *pane_hdr =
+        "# 窗格 16 色 palette：改 cmd / shell 里文字的默认前后景与 16 个索引色\r\n"
+        "# （pane_foreground / pane_background / pane_black … pane_bright_white）\r\n"
+        "# 例：浅色窗格  pane_background = #ffffff  pane_foreground = #24292f\r\n";
+    fwrite(pane_hdr, 1, strlen(pane_hdr), f);
+    for (int i = 0; i < THEME_PANE_SLOTS; i++) {
+        char hex[16];
+        theme_pane_get(i, hex, sizeof(hex));
+        if (!hex[0]) continue;
+        len = snprintf(buf, sizeof(buf), "%s = %s\r\n", theme_pane_slot_name(i), hex);
+        if (len > 0) fwrite(buf, 1, len, f);
     }
     fwrite("\r\n", 1, 2, f);
 

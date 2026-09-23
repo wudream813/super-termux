@@ -659,7 +659,7 @@ static void render_settings_appearance(char *out, int bs, int *posp, int host_ro
         "\x1b[%d;%dH\x1b[038;2;121;192;255;1m■ 语义颜色 (Palette)\x1b[038;2;139;148;158m   Enter 编辑十六进制, R 复位当前项, Ctrl+R 清除全部\x1b[0m",
         title_r, main_left);
     pos += snprintf(out + pos, bs - pos,
-        "\x1b[%d;%dH\x1b[038;2;139;148;158m界面里所有派生色都由这 16 个角色混合得出，改一个即可成套生效。\x1b[0m",
+        "\x1b[%d;%dH\x1b[038;2;139;148;158m界面里所有派生色都由这 16 个角色混合得出，改一个即可成套生效。窗格内 cmd 的底色/字色见 termux.ini 的 pane_*。\x1b[0m",
         title_r + 1, main_left);
 
     for (int role = 0; role < TH_ROLE_COUNT; role++) {
@@ -2440,6 +2440,40 @@ static void cell_diag(const char *fmt, ...) {
     fclose(f);
 }
 
+
+/* v2.0.6：16 色索引属性 → SGR。设了窗格 palette（[theme] pane_*）时改发真彩色，
+ * 像 Windows Terminal 的 color scheme 那样让 cmd 的默认前后景 / 16 色跟主题走；
+ * 一项都没设时和以前一字节不差（\x1b[0;37;40m 这种）。
+ * 0x07 的 fg=7/bg=0 是 cmd 的「默认属性」（SGR 39/49 也归到这里，见 vt.c:102），
+ * 有 pane_foreground / pane_background 时优先用它们，没有再落到索引 7 / 0。 */
+static int emit_attr16(char *out, int bs, WORD attr, const char *ul) {
+    static const int m8[8] = {0,4,2,6,1,5,3,7};
+    int fg = attr & 0x0F, bg = (attr >> 4) & 0x0F;
+    if (theme_pane_any()) {
+        /* attr 里存的是 Win32 位标志（RED=4/GREEN=2/BLUE=1，见 screen.c build_attr
+         * 的 ctab），pane_* 槽位按 ANSI 索引编号（red=1/green=2/blue=4）—— m8 就是
+         * 这张位标志→ANSI 的换算表，查槽位前必须先换算（第一版直接拿 fg 当索引，
+         * pane_red 落到了 pane_blue，verify_pane_palette.py C 项验红抓到）。 */
+        int fr, fgc, fb, br, bgc, bb, have_f = 0, have_b = 0;
+        int fg_ansi = m8[fg & 7] | (fg & 8), bg_ansi = m8[bg & 7] | (bg & 8);
+        if (fg == 7 && theme_pane_rgb(THEME_PANE_FG, &fr, &fgc, &fb)) have_f = 1;
+        else have_f = theme_pane_rgb(fg_ansi, &fr, &fgc, &fb);
+        if (bg == 0 && theme_pane_rgb(THEME_PANE_BG, &br, &bgc, &bb)) have_b = 1;
+        else have_b = theme_pane_rgb(bg_ansi, &br, &bgc, &bb);
+        if (have_f || have_b) {
+            int pos = snprintf(out, bs, "\x1b[0%s", ul);
+            if (have_f) pos += snprintf(out + pos, bs - pos, ";38;2;%d;%d;%d", fr, fgc, fb);
+            else        pos += snprintf(out + pos, bs - pos, ";%d", (fg & 8) ? 90 + m8[fg & 7] : 30 + m8[fg & 7]);
+            if (have_b) pos += snprintf(out + pos, bs - pos, ";48;2;%d;%d;%d", br, bgc, bb);
+            else        pos += snprintf(out + pos, bs - pos, ";%d", (bg & 8) ? 100 + m8[bg & 7] : 40 + m8[bg & 7]);
+            pos += snprintf(out + pos, bs - pos, "m");
+            return pos;
+        }
+    }
+    if (fg & 8) return snprintf(out, bs, "\x1b[0%s;1;%d;%dm", ul, 90 + m8[fg & 7], (bg & 8) ? 100 + m8[bg & 7] : 40 + m8[bg & 7]);
+    return snprintf(out, bs, "\x1b[0%s;%d;%dm", ul, 30 + m8[fg & 7], 40 + m8[bg & 7]);
+}
+
 static void render_split_cell(char *out, int bs, int *posp, ScreenBuffer *s,
                               Pane *pane, int leaf, int px, int py, int rr, int cc,
                               int use_rf) {
@@ -2491,10 +2525,7 @@ static void render_split_cell(char *out, int bs, int *posp, ScreenBuffer *s,
         else
             pos += snprintf(out + pos, bs - pos, "\x1b[0%s;48;2;%d;%d;%dm", ul, br2, bg2, bb);
     } else {
-        static const int m8[8] = {0,4,2,6,1,5,3,7};
-        int fg = attr & 0x0F, bg = (attr >> 4) & 0x0F;
-        if (fg & 8) pos += snprintf(out + pos, bs - pos, "\x1b[0%s;1;%d;%dm", ul, 90 + m8[fg & 7], (bg & 8) ? 100 + m8[bg & 7] : 40 + m8[bg & 7]);
-        else        pos += snprintf(out + pos, bs - pos, "\x1b[0%s;%d;%dm", ul, 30 + m8[fg & 7], 40 + m8[bg & 7]);
+        pos += emit_attr16(out + pos, bs - pos, attr, ul);
     }
     (void)active;
 
@@ -3186,10 +3217,7 @@ void render_screen(void) {
                             else
                                 pos += snprintf(out + pos, bs - pos, "\x1b[0%s;48;2;%d;%d;%dm", ul, br2, bg2, bb);
                         } else {
-                            static const int m[8] = {0,4,2,6,1,5,3,7};
-                            int fg = attr & 0x0F, bg = (attr >> 4) & 0x0F;
-                            if (fg & 8) pos += snprintf(out + pos, bs - pos, "\x1b[0%s;1;%d;%dm", ul, (fg & 8) ? 90 + m[fg & 7] : 30 + m[fg & 7], (bg & 8) ? 100 + m[bg & 7] : 40 + m[bg & 7]);
-                            else pos += snprintf(out + pos, bs - pos, "\x1b[0%s;%d;%dm", ul, 30 + m[fg & 7], 40 + m[bg & 7]);
+                            pos += emit_attr16(out + pos, bs - pos, attr, ul);
                         }
                         la_attr = attr; la_fr = frgb; la_br = brgb; la_fv = fgv; la_bv = bgv;
                     }

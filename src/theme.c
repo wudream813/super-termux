@@ -108,6 +108,8 @@ static int g_theme_idx = 0;
 static ThemeRGB g_roles[TH_ROLE_COUNT];
 static unsigned char g_override_set[TH_ROLE_COUNT];
 static ThemeRGB g_override_val[TH_ROLE_COUNT];
+static unsigned char g_pane_set[THEME_PANE_SLOTS];
+static ThemeRGB g_pane_val[THEME_PANE_SLOTS];
 static ThemeMapEntry g_map[sizeof(g_theme_refs) / sizeof(g_theme_refs[0])];
 static int g_map_count = 0;
 static int g_identity = 1;
@@ -123,6 +125,7 @@ void theme_init(void) {
     g_theme_idx = 0;
     memset(g_override_set, 0, sizeof(g_override_set));
     memset(g_override_val, 0, sizeof(g_override_val));
+    memset(g_pane_set, 0, sizeof(g_pane_set));
     theme_apply();
 }
 
@@ -257,6 +260,70 @@ int theme_role_is_overridden(int role) {
 void theme_clear_overrides(void) {
     memset(g_override_set, 0, sizeof(g_override_set));
     memset(g_override_val, 0, sizeof(g_override_val));
+    memset(g_pane_set, 0, sizeof(g_pane_set));
+}
+
+/* ---- 窗格 palette（见 theme.h）---- */
+static const char *const g_pane_slot_names[THEME_PANE_SLOTS] = {
+    "pane_black", "pane_red", "pane_green", "pane_yellow",
+    "pane_blue", "pane_magenta", "pane_cyan", "pane_white",
+    "pane_bright_black", "pane_bright_red", "pane_bright_green", "pane_bright_yellow",
+    "pane_bright_blue", "pane_bright_magenta", "pane_bright_cyan", "pane_bright_white",
+    "pane_foreground", "pane_background",
+};
+
+int theme_pane_slot_index(const char *name) {
+    if (!name) return -1;
+    for (int i = 0; i < THEME_PANE_SLOTS; i++)
+        if (_stricmp(name, g_pane_slot_names[i]) == 0) return i;
+    return -1;
+}
+
+const char *theme_pane_slot_name(int slot) {
+    if (slot < 0 || slot >= THEME_PANE_SLOTS) return "";
+    return g_pane_slot_names[slot];
+}
+
+static int parse_hex6(const char *hex, ThemeRGB *out) {
+    if (!hex) return 0;
+    while (*hex == ' ' || *hex == '\t' || *hex == '#') hex++;
+    int v[6];
+    for (int i = 0; i < 6; i++) { v[i] = hex_nib((unsigned char)hex[i]); if (v[i] < 0) return 0; }
+    if (hex[6] && hex[6] != ' ' && hex[6] != '\t' && hex[6] != '\r' && hex[6] != '\n') return 0;
+    out->r = (unsigned char)(v[0] * 16 + v[1]);
+    out->g = (unsigned char)(v[2] * 16 + v[3]);
+    out->b = (unsigned char)(v[4] * 16 + v[5]);
+    return 1;
+}
+
+int theme_set_pane_hex(const char *name, const char *hex) {
+    int slot = theme_pane_slot_index(name);
+    if (slot < 0) return 0;
+    ThemeRGB c;
+    if (!parse_hex6(hex, &c)) return 0;
+    g_pane_val[slot] = c;
+    g_pane_set[slot] = 1;
+    return 1;
+}
+
+int theme_pane_rgb(int slot, int *r, int *g, int *b) {
+    if (slot < 0 || slot >= THEME_PANE_SLOTS || !g_pane_set[slot]) return 0;
+    if (r) *r = g_pane_val[slot].r;
+    if (g) *g = g_pane_val[slot].g;
+    if (b) *b = g_pane_val[slot].b;
+    return 1;
+}
+
+int theme_pane_any(void) {
+    for (int i = 0; i < THEME_PANE_SLOTS; i++) if (g_pane_set[i]) return 1;
+    return 0;
+}
+
+void theme_pane_get(int slot, char *hex_out, int cap) {
+    if (!hex_out || cap <= 0) return;
+    hex_out[0] = 0;
+    if (slot < 0 || slot >= THEME_PANE_SLOTS || !g_pane_set[slot]) return;
+    snprintf(hex_out, cap, "#%02x%02x%02x", g_pane_val[slot].r, g_pane_val[slot].g, g_pane_val[slot].b);
 }
 
 void theme_clear_role_override(int role) {
