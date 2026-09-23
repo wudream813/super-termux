@@ -774,13 +774,15 @@ void execute_palette_command(int item_index) {
             break;
         case PALETTE_ACTION_OPEN_APPEARANCE:
         case PALETTE_ACTION_OPEN_KEYS:
-        case PALETTE_ACTION_OPEN_BEHAVIOR: {
+        case PALETTE_ACTION_OPEN_BEHAVIOR:
+        case PALETTE_ACTION_OPEN_PANE_PALETTE: {
             palette_close();
             g_key_capture_active = 0;
             g_hex_edit_active = 0;
             open_settings_pane();
             g_settings_nav = (item.action == PALETTE_ACTION_OPEN_APPEARANCE) ? SETTINGS_NAV_APPEARANCE
                            : (item.action == PALETTE_ACTION_OPEN_KEYS) ? SETTINGS_NAV_KEYS
+                           : (item.action == PALETTE_ACTION_OPEN_PANE_PALETTE) ? SETTINGS_NAV_PANE
                            : SETTINGS_NAV_BEHAVIOR;
             g_mux.needs_redraw = 1;
             break;
@@ -1917,6 +1919,8 @@ static void settings_leave_subpage(void) {
     g_mux.needs_redraw = 1;
 }
 
+static int g_hex_edit_pristine = 0;   /* 1 = 缓冲区还是进入时的预填值 */
+
 static void settings_hex_edit_begin(int role) {
     int r, g, b;
     theme_role_rgb(role, &r, &g, &b);
@@ -1924,6 +1928,17 @@ static void settings_hex_edit_begin(int role) {
     g_hex_edit_len = (int)strlen(g_hex_edit_buf);
     g_hex_edit_role = role;
     g_hex_edit_active = 1;
+    g_hex_edit_pristine = 1;
+}
+
+static void settings_pane_hex_edit_begin(int slot) {
+    int r, g, b;
+    if (!theme_pane_rgb(slot, &r, &g, &b)) theme_pane_fallback_rgb(slot, &r, &g, &b);
+    snprintf(g_hex_edit_buf, sizeof(g_hex_edit_buf), "%02x%02x%02x", r, g, b);
+    g_hex_edit_len = (int)strlen(g_hex_edit_buf);
+    g_hex_edit_role = -(slot + 1);
+    g_hex_edit_active = 1;
+    g_hex_edit_pristine = 1;
 }
 
 static int is_hex_char(WCHAR uc) {
@@ -1940,12 +1955,15 @@ static void handle_hex_edit_key(WORD vk, WCHAR uc) {
     }
     if (vk == VK_BACK) {
         if (g_hex_edit_len > 0) g_hex_edit_buf[--g_hex_edit_len] = 0;
+        g_hex_edit_pristine = 0;     /* 用户开始手动删改，保留剩余位 */
         g_mux.needs_redraw = 1;
         return;
     }
     if (vk == VK_RETURN) {
         if (g_hex_edit_len == 6 && g_hex_edit_role >= 0)
             theme_set_role_hex(theme_role_name(g_hex_edit_role), g_hex_edit_buf);
+        else if (g_hex_edit_len == 6 && g_hex_edit_role < 0)   /* 窗格配色页：-(slot+1) */
+            theme_set_pane_hex(theme_pane_slot_name(-g_hex_edit_role - 1), g_hex_edit_buf);
         theme_apply();
         save_config();
         g_hex_edit_active = 0;
@@ -1953,6 +1971,11 @@ static void handle_hex_edit_key(WORD vk, WCHAR uc) {
         g_mux.needs_redraw = 1;
         return;
     }
+    if (is_hex_char(uc) && g_hex_edit_pristine) {   /* 预填值只是占位：一开始打字就整段替换 */
+        g_hex_edit_len = 0;
+        g_hex_edit_buf[0] = 0;
+    }
+    g_hex_edit_pristine = 0;
     if (is_hex_char(uc) && g_hex_edit_len < 6) {
         g_hex_edit_buf[g_hex_edit_len++] = (char)tolower((unsigned char)uc);
         g_hex_edit_buf[g_hex_edit_len] = 0;
@@ -2034,6 +2057,34 @@ static void handle_settings_appearance_key(WORD vk, WCHAR uc, BOOL is_ctrl) {
             save_config();
             g_mux.needs_redraw = 1;
         }
+        return;
+    }
+}
+
+/* v2.0.7：窗格配色页键盘。排布见 render.c 的 g_pane_order（两列各 9 行）。 */
+static void handle_settings_pane_key(WORD vk, WCHAR uc, BOOL is_ctrl) {
+    if (vk == VK_ESCAPE) { settings_leave_subpage(); return; }
+    int p = settings_pane_order_pos(g_settings_pane_sel);
+    if (p < 0) p = 0;
+    if (vk == VK_UP)   { if (p % SETTINGS_PANE_ROWS > 0) p--; g_settings_pane_sel = settings_pane_order_slot(p); g_mux.needs_redraw = 1; return; }
+    if (vk == VK_DOWN) { if (p % SETTINGS_PANE_ROWS < SETTINGS_PANE_ROWS - 1 && p + 1 < THEME_PANE_SLOTS) p++; g_settings_pane_sel = settings_pane_order_slot(p); g_mux.needs_redraw = 1; return; }
+    if (vk == VK_LEFT || vk == VK_RIGHT) {
+        int t = vk == VK_RIGHT ? p + SETTINGS_PANE_ROWS : p - SETTINGS_PANE_ROWS;
+        if (t >= 0 && t < THEME_PANE_SLOTS) g_settings_pane_sel = settings_pane_order_slot(t);
+        g_mux.needs_redraw = 1;
+        return;
+    }
+    if (vk == VK_RETURN || vk == VK_SPACE) { settings_pane_hex_edit_begin(g_settings_pane_sel); g_mux.needs_redraw = 1; return; }
+    if (is_ctrl && (vk == 'R' || uc == 0x12)) {
+        theme_clear_pane_all();
+        save_config();
+        g_mux.needs_redraw = 1;
+        return;
+    }
+    if (uc == 'r' || uc == 'R') {
+        theme_clear_pane_slot(g_settings_pane_sel);
+        save_config();
+        g_mux.needs_redraw = 1;
         return;
     }
 }
@@ -2261,6 +2312,7 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
     if (g_settings_nav == SETTINGS_NAV_APPEARANCE) { handle_settings_appearance_key(vk, uc, is_ctrl); return; }
     if (g_settings_nav == SETTINGS_NAV_KEYS) { handle_settings_keys_key(vk, uc, is_ctrl); return; }
     if (g_settings_nav == SETTINGS_NAV_BEHAVIOR) { handle_settings_behavior_key(vk, uc); return; }
+    if (g_settings_nav == SETTINGS_NAV_PANE) { handle_settings_pane_key(vk, uc, is_ctrl); return; }
 
     if (g_settings_nav == 0) {
         if (vk == VK_ESCAPE) {
@@ -2347,6 +2399,7 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
         if (vk == VK_F2) { g_settings_nav = SETTINGS_NAV_APPEARANCE; g_mux.needs_redraw = 1; return; }
         if (vk == VK_F3 || uc == 'k' || uc == 'K') { g_settings_nav = SETTINGS_NAV_KEYS; g_mux.needs_redraw = 1; return; }
         if (vk == VK_F4 || uc == 'b' || uc == 'B') { g_settings_nav = SETTINGS_NAV_BEHAVIOR; g_mux.needs_redraw = 1; return; }
+        if (vk == VK_F5 || uc == 'w' || uc == 'W') { g_settings_nav = SETTINGS_NAV_PANE; g_mux.needs_redraw = 1; return; }
 
         if ((uc >= '1' && uc <= '9') || (vk >= '1' && vk <= '9') || (vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9)) {
             int num = (uc >= '1' && uc <= '9') ? (uc - '0') : ((vk >= '1' && vk <= '9') ? (vk - '0') : (vk - VK_NUMPAD1 + 1));
@@ -2593,11 +2646,12 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
         {
             int app_r, keys_r, beh_r;
             settings_sidebar_extra_rows(&app_r, &keys_r, &beh_r);
-            if (r == app_r || r == keys_r || r == beh_r) {
+            if (r == app_r || r == keys_r || r == beh_r || r == beh_r + 1) {
                 g_key_capture_active = 0;
                 g_hex_edit_active = 0;
                 g_settings_nav = (r == app_r) ? SETTINGS_NAV_APPEARANCE
-                               : (r == keys_r) ? SETTINGS_NAV_KEYS : SETTINGS_NAV_BEHAVIOR;
+                               : (r == keys_r) ? SETTINGS_NAV_KEYS
+                               : (r == beh_r) ? SETTINGS_NAV_BEHAVIOR : SETTINGS_NAV_PANE;
                 g_mux.needs_redraw = 1;
                 return;
             }
@@ -2632,6 +2686,19 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                 if (r == row && c >= col && c < col + SETTINGS_ROLE_COL_W - 1) {
                     g_settings_theme_sel = tc + role;
                     settings_hex_edit_begin(role);
+                    g_mux.needs_redraw = 1;
+                    return;
+                }
+            }
+            return;
+        }
+        if (g_settings_nav == SETTINGS_NAV_PANE) {
+            for (int slot = 0; slot < THEME_PANE_SLOTS; slot++) {
+                int row = settings_pane_row(slot);
+                int col = settings_pane_col(main_left, slot);
+                if (r == row && c >= col && c < col + SETTINGS_PANE_COL_W - 1) {
+                    g_settings_pane_sel = slot;
+                    settings_pane_hex_edit_begin(slot);
                     g_mux.needs_redraw = 1;
                     return;
                 }

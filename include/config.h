@@ -14,6 +14,7 @@ extern int g_chooser_item_count;
 #define SETTINGS_NAV_APPEARANCE 100
 #define SETTINGS_NAV_KEYS       101
 #define SETTINGS_NAV_BEHAVIOR   102
+#define SETTINGS_NAV_PANE       103   /* v2.0.7：窗格配色（pane_*） */
 
 extern int g_settings_nav;
 extern int g_settings_field;
@@ -31,6 +32,7 @@ extern int g_settings_show_presets;
 extern int g_preset_sel;
 
 /* 外观页 / 键位页 / 行为页的光标与编辑状态 */
+extern int g_settings_pane_sel;     /* 窗格配色页：当前选中的 pane_* 槽位 */
 extern int g_settings_theme_sel;    /* 0..theme_count-1 = 主题行；之后 = 语义色行 */
 extern int g_settings_keys_sel;     /* 0 = 前缀键行；1..N = 动作行 */
 extern int g_settings_keys_scroll;

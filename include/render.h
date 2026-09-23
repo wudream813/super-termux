@@ -16,6 +16,10 @@
 #define SETTINGS_ROLE_ROW0      13
 #define SETTINGS_ROLE_ROWS      8
 #define SETTINGS_ROLE_COL_W     34
+/* 窗格配色页（v2.0.7）：18 个 pane_* 槽位，两列各 9 行 */
+#define SETTINGS_PANE_ROW0      6
+#define SETTINGS_PANE_ROWS      9
+#define SETTINGS_PANE_COL_W     36
 #define SETTINGS_KEYS_ROW0      6
 #define SETTINGS_BEHAVIOR_ROW0  6
 #define SETTINGS_BEHAVIOR_TOGGLES 5   /* mouse / copy_move_deselect / confirm_on_exit / confirm_on_close / search_case_sensitive */
@@ -94,6 +98,7 @@ typedef enum {
     PALETTE_ACTION_OPEN_APPEARANCE,
     PALETTE_ACTION_OPEN_KEYS,
     PALETTE_ACTION_OPEN_BEHAVIOR,
+    PALETTE_ACTION_OPEN_PANE_PALETTE,
     PALETTE_ACTION_SPLIT_VERTICAL,    /* 分屏：左右切分 */
     PALETTE_ACTION_SPLIT_HORIZONTAL,  /* 分屏：上下切分 */
     PALETTE_ACTION_SPLIT_NEXT,        /* 分屏：切换到下一个窗格 */
@@ -131,6 +136,11 @@ void settings_sidebar_extra_rows(int *appearance_r, int *keys_r, int *behavior_r
 int settings_theme_row(int idx);
 int settings_role_row(int role);
 int settings_role_col(int main_left, int role);
+int settings_pane_row(int slot);
+int settings_pane_col(int main_left, int slot);
+int settings_pane_order_slot(int pos);
+int settings_pane_order_pos(int slot);
+int settings_sidebar_pane_row(void);
 int settings_keys_rows(void);
 int settings_keys_visible(int host_rows);
 int settings_keys_row_at(int host_rows, int entry);

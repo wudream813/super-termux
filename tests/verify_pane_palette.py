@@ -14,6 +14,8 @@ v2.0.6 加了 pane_foreground / pane_background / pane_black … pane_bright_whi
      同样的文字必须发 48;2;255;255;255 与 38;2;36;41;47，且不再出现 ;40m 底色。
   C. 配 pane_red = #ff0000：shell 里 printf '\\033[31m' 的红字发 38;2;255;0;0。
   D. libvterm 回放 B：正文行的背景格真的是白的（有 libvterm 时）。
+  E. (v2.0.7) 走设置页「窗格配色」子页 (Ctrl+B s → W) 改默认背景/红色/复位，
+     验证 ini 落盘与窗格字节都变。
 
 修前二进制跑本脚本：A 过，B/C 必红（那时根本没有这些键）。
 """
@@ -85,6 +87,78 @@ def run(ini_text, marker):
         pass
     shutil.rmtree(td, ignore_errors=True)
     return bytes(got)
+
+
+def run_settings_ui(keys_after_open, marker):
+    """E 组（v2.0.7）：不写 ini，改走设置页 UI ——
+    Ctrl+B s 进设置 → W 进「窗格配色」子页 → 按 keys_after_open 操作 →
+    Esc Esc 出子页 → Ctrl+B n 回 shell 窗格 → printf 一行普通文字 + 红字。
+    返回 (宿主收到的字节, termux.ini 内容)。"""
+    td = tempfile.mkdtemp(prefix="termux_palette_ui_")
+    exe = os.path.join(td, "termux")
+    shutil.copy2(EXE, exe)
+    os.chmod(exe, 0o755)
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(td)
+        os.environ["TERM"] = "xterm-256color"; os.environ["SHELL"] = "/bin/sh"; os.environ["PS1"] = "$ "
+        try:
+            os.execv(exe, ["termux"])
+        finally:
+            os._exit(127)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+    os.kill(pid, signal.SIGWINCH)
+    got = bytearray()
+
+    def drain(t):
+        end = time.time() + t
+        while time.time() < end:
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    got.extend(os.read(fd, 65536))
+                except OSError:
+                    break
+
+    def send(b, t=0.5):
+        os.write(fd, b)
+        drain(t)
+
+    drain(1.5)
+    send(b"\x02s", 0.8)            # 设置页
+    send(b"W", 0.5)                 # 窗格配色子页
+    for k, t in keys_after_open:
+        send(k, t)
+    send(b"\x1b", 0.4); send(b"\x1b", 0.4)   # 出子页（两次 Esc）
+    send(b"\x02n", 0.8)            # 回 shell 窗格
+    send(("printf '%s\\n'; printf '\\033[31mRED_%s\\033[0m\\n'\r" % (marker, marker)).encode(), 2.0)
+    ini = ""
+    try:
+        with open(os.path.join(td, "termux.ini"), encoding="utf-8") as f:
+            ini = f.read()
+    except OSError:
+        pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    shutil.rmtree(td, ignore_errors=True)
+    return bytes(got), ini
+
+
+def ini_pane_lines(ini):
+    """ini 里真正生效的 pane_* 行（注释行里也有 pane_background 字样，不能直接 in）。"""
+    return [l.strip() for l in ini.splitlines() if l.strip().startswith("pane_")]
+
+
+def sgr_last_before(data, needle):
+    """最后一个 needle 前最近的 SGR（设置页 UI 流程里回显被重绘打碎，只有输出行完整）。"""
+    hits = [m.start() for m in re.finditer(re.escape(needle), data)]
+    if not hits:
+        return None
+    seg = data[max(0, hits[-1] - 200):hits[-1]]
+    m = list(re.finditer(rb"\x1b\[([0-9;]*)m", seg))
+    return m[-1].group(1).decode() if m else ""
 
 
 def sgr_before(data, needle, nth=0):
@@ -183,6 +257,28 @@ def main():
         shutil.rmtree(td, ignore_errors=True)
     else:
         print("  [SKIP] libvterm 语义级回放 —— 本机没有 libvterm-dev")
+
+    # E. 设置页 UI（v2.0.7）：不用手改 ini，在「窗格配色」子页里改
+    #   E1 默认选中「默认背景」：Enter → 打 ffffff → Enter
+    e1, ini1 = run_settings_ui([(b"\r", 0.4), (b"ffffff\r", 0.6)], "UI_E1")
+    ck("E1 设置页改默认背景 → termux.ini 写入 pane_background = #ffffff",
+       "pane_background = #ffffff" in ini_pane_lines(ini1), "pane 行=%r" % ini_pane_lines(ini1))
+    se1 = sgr_last_before(e1, b"UI_E1")
+    ck("E1 设置页改完立即生效：窗格普通文字底色发 48;2;255;255;255",
+       se1 is not None and "48;2;255;255;255" in se1, "实际 SGR=%r" % se1)
+    #   E2 左列往下 3 行 = 「红色」(索引 1)：Enter → ff0000 → Enter；再 R 复位默认背景？不，
+    #      这里只验证红色：ini 只应有 pane_red，不应有 pane_background
+    e2, ini2 = run_settings_ui([(b"\x1b[B", 0.2)] * 3 + [(b"\r", 0.4), (b"ff0000\r", 0.6)], "UI_E2")
+    ck("E2 设置页改「红色」→ termux.ini 写入 pane_red = #ff0000",
+       ini_pane_lines(ini2) == ["pane_red = #ff0000"], "pane 行=%r" % ini_pane_lines(ini2))
+    se2 = sgr_last_before(e2, b"RED_UI_E2")
+    ck("E2 SGR 31 红字发 38;2;255;0;0",
+       se2 is not None and "38;2;255;0;0" in se2, "实际 SGR=%r" % se2)
+    #   E3 改完再按 R 复位当前项：ini 里不应再有该键
+    e3, ini3 = run_settings_ui([(b"\r", 0.4), (b"ffffff\r", 0.6), (b"r", 0.5)], "UI_E3")
+    ck("E3 R 复位当前项 → ini 不再含 pane_background", ini_pane_lines(ini3) == [], "pane 行=%r" % ini_pane_lines(ini3))
+    se3 = sgr_last_before(e3, b"UI_E3")
+    ck("E3 复位后普通文字回到 16 色 ;40", se3 is not None and re.search(r"(^|;)40$", se3) is not None, "实际 SGR=%r" % se3)
 
     print()
     if FAILS:

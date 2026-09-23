@@ -314,6 +314,30 @@ int theme_pane_rgb(int slot, int *r, int *g, int *b) {
     return 1;
 }
 
+static const char *const g_pane_slot_labels[THEME_PANE_SLOTS] = {
+    "黑色", "红色", "绿色", "黄色", "蓝色", "紫色", "青色", "白色",
+    "亮黑(灰)", "亮红", "亮绿", "亮黄", "亮蓝", "亮紫", "亮青", "亮白",
+    "默认前景(字色)", "默认背景",
+};
+const char *theme_pane_slot_label(int slot) {
+    if (slot < 0 || slot >= THEME_PANE_SLOTS) return "";
+    return g_pane_slot_labels[slot];
+}
+void theme_clear_pane_slot(int slot) { if (slot >= 0 && slot < THEME_PANE_SLOTS) g_pane_set[slot] = 0; }
+void theme_clear_pane_all(void) { memset(g_pane_set, 0, sizeof(g_pane_set)); }
+void theme_pane_fallback_rgb(int slot, int *r, int *g, int *b) {
+    /* xterm 默认 16 色；fg 默认 = 索引 7，bg 默认 = 索引 0 */
+    static const unsigned char x16[16][3] = {
+        {0,0,0},{205,0,0},{0,205,0},{205,205,0},{0,0,238},{205,0,205},{0,205,205},{229,229,229},
+        {127,127,127},{255,0,0},{0,255,0},{255,255,0},{92,92,255},{255,0,255},{0,255,255},{255,255,255},
+    };
+    int i = slot == THEME_PANE_FG ? 7 : slot == THEME_PANE_BG ? 0 : slot;
+    if (i < 0 || i > 15) i = 0;
+    if (r) *r = x16[i][0];
+    if (g) *g = x16[i][1];
+    if (b) *b = x16[i][2];
+}
+
 int theme_pane_any(void) {
     for (int i = 0; i < THEME_PANE_SLOTS; i++) if (g_pane_set[i]) return 1;
     return 0;

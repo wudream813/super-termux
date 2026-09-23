@@ -100,6 +100,11 @@ int  theme_set_pane_hex(const char *name, const char *hex);
 int  theme_pane_rgb(int slot, int *r, int *g, int *b);
 int  theme_pane_any(void);
 void theme_pane_get(int slot, char *hex_out, int cap);   /* 无映射写空串 */
+const char *theme_pane_slot_label(int slot);              /* 设置页显示用的中文名 */
+void theme_clear_pane_slot(int slot);
+void theme_clear_pane_all(void);
+/* 没设映射时设置页也要给用户看个色块：返回 xterm 默认 16 色近似值 */
+void theme_pane_fallback_rgb(int slot, int *r, int *g, int *b);
 int theme_role_is_overridden(int role);
 void theme_clear_overrides(void);
 void theme_clear_role_override(int role);

@@ -581,6 +581,18 @@ int settings_role_col(int main_left, int role) {
     return role < SETTINGS_ROLE_ROWS ? main_left : main_left + SETTINGS_ROLE_COL_W;
 }
 
+/* 窗格配色页的排布：左列 = 默认背景 / 默认前景 + 索引 0..6，右列 = 索引 7..15。
+ * 最常改的两项放最上面。 */
+static const int g_pane_order[THEME_PANE_SLOTS] = {
+    THEME_PANE_BG, THEME_PANE_FG, 0, 1, 2, 3, 4, 5, 6,
+    7, 8, 9, 10, 11, 12, 13, 14, 15,
+};
+int settings_pane_order_slot(int pos) { return (pos >= 0 && pos < THEME_PANE_SLOTS) ? g_pane_order[pos] : -1; }
+int settings_pane_order_pos(int slot) { for (int i = 0; i < THEME_PANE_SLOTS; i++) if (g_pane_order[i] == slot) return i; return -1; }
+int settings_pane_row(int slot) { int p = settings_pane_order_pos(slot); return SETTINGS_PANE_ROW0 + (p % SETTINGS_PANE_ROWS); }
+int settings_pane_col(int main_left, int slot) { int p = settings_pane_order_pos(slot); return p < SETTINGS_PANE_ROWS ? main_left : main_left + SETTINGS_PANE_COL_W; }
+int settings_sidebar_pane_row(void) { int a, k, b; settings_sidebar_extra_rows(&a, &k, &b); return b + 1; }
+
 int settings_keys_rows(void) { return 1 + keymap_action_count(); }
 
 int settings_keys_visible(int host_rows) {
@@ -696,6 +708,59 @@ static void render_settings_appearance(char *out, int bs, int *posp, int host_ro
         pos += snprintf(out + pos, bs - pos,
             "\x1b[%d;%dH\x1b[038;2;139;148;158m提示: ↑/↓ 选择, ←/→ 换列, Enter 应用/编辑, R 复位, Ctrl+R 清除全部自定义, Ctrl+S 保存, Esc 返回\x1b[0m",
             hint_r, main_left);
+    }
+    *posp = pos;
+}
+
+/* v2.0.7：窗格配色页 —— cmd / shell 文字的默认前后景与 16 色（[theme] pane_*）。
+ * 与外观页的 UI 角色分开：那 16 个只管 termux 自己的界面。
+ * hex 编辑框复用外观页的 g_hex_edit_*：g_hex_edit_role >= 0 是 UI 角色，
+ * < 0 是 pane 槽位（编码 -(slot+1)），两页不会同时开。 */
+static void render_settings_pane(char *out, int bs, int *posp, int host_rows, int host_cols, int main_left) {
+    int pos = *posp;
+    (void)host_cols;
+    pos += snprintf(out + pos, bs - pos,
+        "\x1b[3;%dH\x1b[038;2;121;192;255;1m■ 窗格配色 (Pane Palette)\x1b[0m", main_left);
+    pos += snprintf(out + pos, bs - pos,
+        "\x1b[4;%dH\x1b[038;2;139;148;158m窗格里 cmd / shell 文字的默认背景、字色与 16 个索引色（像 Windows Terminal 的配色方案）。\x1b[0m", main_left);
+    for (int p = 0; p < THEME_PANE_SLOTS; p++) {
+        int slot = settings_pane_order_slot(p);
+        int row = settings_pane_row(slot);
+        int col = settings_pane_col(main_left, slot);
+        if (row > host_rows) continue;
+        int selected = (g_settings_pane_sel == slot);
+        int hovered = (g_mouse_y == row - 1 && g_mouse_x >= col - 1 && g_mouse_x <= col + SETTINGS_PANE_COL_W - 3);
+        int r, g, b;
+        int set = theme_pane_rgb(slot, &r, &g, &b);
+        if (!set) theme_pane_fallback_rgb(slot, &r, &g, &b);
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH%s %-16s\x1b[0m ",
+                        row, col, settings_row_style(selected, hovered), theme_pane_slot_label(slot));
+        append_swatch(out, bs, &pos, r, g, b);
+        if (g_hex_edit_active && g_hex_edit_role == -(slot + 1)) {
+            char shown[16];
+            snprintf(shown, sizeof(shown), "#%s", g_hex_edit_buf);
+            pos += snprintf(out + pos, bs - pos, " \x1b[048;2;038;060;088m\x1b[038;2;255;255;255;1m%-8s\x1b[0m", shown);
+        } else if (set) {
+            pos += snprintf(out + pos, bs - pos, " \x1b[038;2;139;148;158m#%02x%02x%02x\x1b[0m\x1b[038;2;210;153;034m*\x1b[0m", r, g, b);
+        } else {
+            pos += snprintf(out + pos, bs - pos, " \x1b[038;2;110;118;129m(跟随终端)\x1b[0m");
+        }
+    }
+    int hint_r = SETTINGS_PANE_ROW0 + SETTINGS_PANE_ROWS + 1;
+    if (hint_r > host_rows) hint_r = host_rows;
+    if (g_hex_edit_active && g_hex_edit_role < 0) {
+        pos += snprintf(out + pos, bs - pos,
+            "\x1b[%d;%dH\x1b[038;2;210;153;034;1m正在编辑 %s：输入 6 位十六进制，Enter 确认，Esc 取消\x1b[0m",
+            hint_r, main_left, theme_pane_slot_label(-g_hex_edit_role - 1));
+    } else {
+        pos += snprintf(out + pos, bs - pos,
+            "\x1b[%d;%dH\x1b[038;2;139;148;158m提示: ↑/↓ 选择, ←/→ 换列, Enter 编辑, R 复位当前项(跟随终端), Ctrl+R 清除全部, Esc 返回\x1b[0m",
+            hint_r, main_left);
+        int ex_r = hint_r + 1;
+        if (ex_r <= host_rows)
+            pos += snprintf(out + pos, bs - pos,
+                "\x1b[%d;%dH\x1b[038;2;110;118;129m例：浅色窗格 → 默认背景 ffffff、默认前景 24292f。改完立即生效并写入 termux.ini。\x1b[0m",
+                ex_r, main_left);
     }
     *posp = pos;
 }
@@ -944,12 +1009,13 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
 
     int app_r, keys_r, beh_r;
     settings_sidebar_extra_rows(&app_r, &keys_r, &beh_r);
-    const struct { int row; const char *label; int nav; } extra_nav[3] = {
+    const struct { int row; const char *label; int nav; } extra_nav[4] = {
         {app_r,  "  [A] 外观 / 主题   ", SETTINGS_NAV_APPEARANCE},
         {keys_r, "  [K] 键位设置      ", SETTINGS_NAV_KEYS},
         {beh_r,  "  [B] 行为开关      ", SETTINGS_NAV_BEHAVIOR},
+        {beh_r + 1, "  [W] 窗格配色      ", SETTINGS_NAV_PANE},
     };
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         int row = extra_nav[i].row;
         if (row > host_rows - 1) break;
         int is_sel = (g_settings_nav == extra_nav[i].nav);
@@ -972,6 +1038,8 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
         render_settings_keys(out, bs, &pos, host_rows, host_cols, main_left);
     } else if (g_settings_nav == SETTINGS_NAV_BEHAVIOR) {
         render_settings_behavior(out, bs, &pos, host_rows, host_cols, main_left);
+    } else if (g_settings_nav == SETTINGS_NAV_PANE) {
+        render_settings_pane(out, bs, &pos, host_rows, host_cols, main_left);
     } else if (g_settings_nav == 0) {
         pos += snprintf(out + pos, bs - pos, "\x1b[3;%dH\x1b[038;2;121;192;255;1m■ 默认启动项设置 (Default Startup Item)\x1b[0m", main_left);
         pos += snprintf(out + pos, bs - pos, "\x1b[4;%dH\x1b[038;2;139;148;158m选择每次打开 termux 窗口时默认显示的界面 (按 ←/→/Space/T/H 切换)：\x1b[0m", main_left);
@@ -1471,6 +1539,7 @@ static const PaletteStaticItem g_palette_setting_items[] = {
     { "appearance",         "外观 / 主题",    "设置页：选择主题、编辑 16 个语义色",  "Enter 打开", PALETTE_ACTION_OPEN_APPEARANCE,   0, 7, 6 },
     { "key-bindings",       "键位设置",       "设置页：前缀键与全部动作键位录制",    "Enter 打开", PALETTE_ACTION_OPEN_KEYS,         0, 8, 1 },
     { "behavior",           "行为开关",       "设置页：鼠标、自动复制、退出确认、滚动行数", "Enter 打开", PALETTE_ACTION_OPEN_BEHAVIOR, 0, 9, 2 },
+    { "pane-palette",       "窗格配色",       "设置页：cmd / shell 的默认背景、字色与 16 个索引色", "Enter 打开", PALETTE_ACTION_OPEN_PANE_PALETTE, 0, 10, 2 },
 };
 
 static const PaletteStaticItem g_palette_startup_items[] = {

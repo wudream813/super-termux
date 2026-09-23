@@ -24,6 +24,7 @@ int g_settings_show_presets = 0;
 int g_preset_sel = 0;
 
 int g_settings_theme_sel = 0;
+int g_settings_pane_sel = 17;        /* = THEME_PANE_BG，默认停在「默认背景」——用户最常改的 */
 int g_settings_keys_sel = 0;
 int g_settings_keys_scroll = 0;
 int g_settings_behavior_sel = 0;
