@@ -161,13 +161,17 @@ def sgr_last_before(data, needle):
     return m[-1].group(1).decode() if m else ""
 
 
-def sgr_before(data, needle, nth=0):
-    """第 nth 个 needle 前最近的一个 SGR 序列（就是画它用的属性）。
-    注意命令行回显里也含 needle（printf 的字面量），程序输出是【之后】那个。"""
-    hits = [m.start() for m in re.finditer(re.escape(needle), data)]
-    if len(hits) <= nth:
+def sgr_before(data, needle, nth=None):
+    """画 needle 那一行用的 SGR（最近的一个 SGR 序列）。
+    命令行回显里也含 needle（printf 的字面量 `PLAIN\\n'` / `RED_X\\033[0m`），
+    但字面量后面紧跟着反斜杠，程序输出后面不会 —— 用这个区分，并取最后一个
+    非回显命中。早先按「第 nth 个」数，CI 慢机器上回显行被重绘两次就数错了
+    （v2.0.7 CI 上 C 项因此假红：拿到的是回显的 0;37;40）。nth 参数保留只为兼容。"""
+    del nth
+    hits = [m.start() for m in re.finditer(rb"(?<![A-Z_])" + re.escape(needle) + rb"(?!\\)", data)]   # 也排除 RED_PLAIN_x 里的子串
+    if not hits:
         return None
-    i = hits[nth]
+    i = hits[-1]
     seg = data[max(0, i - 200):i]
     m = list(re.finditer(rb"\x1b\[([0-9;]*)m", seg))
     return m[-1].group(1).decode() if m else ""
