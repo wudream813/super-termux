@@ -91,7 +91,11 @@ int theme_has_overrides(void);
  *   pane_bright_black … pane_bright_white 索引 8..15 */
 #define THEME_PANE_FG   16
 #define THEME_PANE_BG   17
-#define THEME_PANE_SLOTS 18
+/* v2.0.8：滚动条颜色。thumb = 滑块、track = 轨道底色。不设时用内置渐变
+ * （深色系，浅色 pane_background 下会和背景融为一体——用户反馈）。 */
+#define THEME_PANE_SB_THUMB 18
+#define THEME_PANE_SB_TRACK 19
+#define THEME_PANE_SLOTS 20
 /* 名字 -> 槽位（0..15 索引色，16 fg，17 bg）；不是 pane_* 返回 -1。 */
 int  theme_pane_slot_index(const char *name);
 const char *theme_pane_slot_name(int slot);

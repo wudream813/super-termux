@@ -381,7 +381,8 @@ void save_config(void) {
     const char *pane_hdr =
         "# 窗格 16 色 palette：改 cmd / shell 里文字的默认前后景与 16 个索引色\r\n"
         "# （pane_foreground / pane_background / pane_black … pane_bright_white）\r\n"
-        "# 例：浅色窗格  pane_background = #ffffff  pane_foreground = #24292f\r\n";
+        "# 例：浅色窗格  pane_background = #ffffff  pane_foreground = #24292f\r\n"
+        "# 滚动条：pane_scrollbar = 滑块色，pane_scrollbar_track = 轨道底色（浅色窗格建议设，否则和背景同色）\r\n";
     fwrite(pane_hdr, 1, strlen(pane_hdr), f);
     for (int i = 0; i < THEME_PANE_SLOTS; i++) {
         char hex[16];

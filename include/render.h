@@ -18,7 +18,7 @@
 #define SETTINGS_ROLE_COL_W     34
 /* 窗格配色页（v2.0.7）：18 个 pane_* 槽位，两列各 9 行 */
 #define SETTINGS_PANE_ROW0      6
-#define SETTINGS_PANE_ROWS      9
+#define SETTINGS_PANE_ROWS      10
 #define SETTINGS_PANE_COL_W     36
 #define SETTINGS_KEYS_ROW0      6
 #define SETTINGS_BEHAVIOR_ROW0  6

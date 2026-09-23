@@ -479,6 +479,20 @@ static void test_pane_palette(void) {
     check(theme_pane_slot_index("pane_red") == 1 && theme_pane_slot_index("pane_bright_blue") == 12,
           "索引色按 ANSI 编号（red=1, bright_blue=12）");
     check(theme_pane_slot_index("background") == -1, "UI 角色名不是 pane 槽位（两套键不串）");
+    check(theme_pane_slot_index("pane_scrollbar") == THEME_PANE_SB_THUMB
+          && theme_pane_slot_index("pane_scrollbar_track") == THEME_PANE_SB_TRACK, "v2.0.8 滚动条两个槽位");
+    check(THEME_PANE_SLOTS == 20, "共 20 个槽位（16 索引 + fg/bg + 滚动条滑块/轨道）");
+    {
+        int all_named = 1;
+        for (int i = 0; i < THEME_PANE_SLOTS; i++)
+            if (!theme_pane_slot_name(i)[0] || !theme_pane_slot_label(i)[0]) all_named = 0;
+        check(all_named, "每个槽位都有 ini 键名与中文标签（设置页不会出现空行）");
+    }
+    {
+        int r = -1, g = -1, b = -1;
+        theme_pane_fallback_rgb(THEME_PANE_SB_THUMB, &r, &g, &b);
+        check(r >= 0 && g >= 0 && b >= 0, "滚动条槽位有 fallback 色（设置页色块用）");
+    }
     check(theme_set_pane_hex("pane_background", "#ffffff") == 1, "设 pane_background");
     check(theme_set_pane_hex("pane_background", "#fffff") == 0, "5 位 hex 拒绝");
     check(theme_set_pane_hex("nope", "#ffffff") == 0, "未知键拒绝");

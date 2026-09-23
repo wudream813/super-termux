@@ -270,6 +270,7 @@ static const char *const g_pane_slot_names[THEME_PANE_SLOTS] = {
     "pane_bright_black", "pane_bright_red", "pane_bright_green", "pane_bright_yellow",
     "pane_bright_blue", "pane_bright_magenta", "pane_bright_cyan", "pane_bright_white",
     "pane_foreground", "pane_background",
+    "pane_scrollbar", "pane_scrollbar_track",
 };
 
 int theme_pane_slot_index(const char *name) {
@@ -318,6 +319,7 @@ static const char *const g_pane_slot_labels[THEME_PANE_SLOTS] = {
     "黑色", "红色", "绿色", "黄色", "蓝色", "紫色", "青色", "白色",
     "亮黑(灰)", "亮红", "亮绿", "亮黄", "亮蓝", "亮紫", "亮青", "亮白",
     "默认前景(字色)", "默认背景",
+    "滚动条滑块", "滚动条轨道",
 };
 const char *theme_pane_slot_label(int slot) {
     if (slot < 0 || slot >= THEME_PANE_SLOTS) return "";
@@ -331,6 +333,8 @@ void theme_pane_fallback_rgb(int slot, int *r, int *g, int *b) {
         {0,0,0},{205,0,0},{0,205,0},{205,205,0},{0,0,238},{205,0,205},{0,205,205},{229,229,229},
         {127,127,127},{255,0,0},{0,255,0},{255,255,0},{92,92,255},{255,0,255},{0,255,255},{255,255,255},
     };
+    if (slot == THEME_PANE_SB_THUMB) { if (r) *r = 105; if (g) *g = 125; if (b) *b = 150; return; }  /* g_sb_grad 中段 */
+    if (slot == THEME_PANE_SB_TRACK) { if (r) *r = 23;  if (g) *g = 27;  if (b) *b = 33;  return; }
     int i = slot == THEME_PANE_FG ? 7 : slot == THEME_PANE_BG ? 0 : slot;
     if (i < 0 || i > 15) i = 0;
     if (r) *r = x16[i][0];

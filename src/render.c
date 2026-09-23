@@ -584,8 +584,8 @@ int settings_role_col(int main_left, int role) {
 /* 窗格配色页的排布：左列 = 默认背景 / 默认前景 + 索引 0..6，右列 = 索引 7..15。
  * 最常改的两项放最上面。 */
 static const int g_pane_order[THEME_PANE_SLOTS] = {
-    THEME_PANE_BG, THEME_PANE_FG, 0, 1, 2, 3, 4, 5, 6,
-    7, 8, 9, 10, 11, 12, 13, 14, 15,
+    THEME_PANE_BG, THEME_PANE_FG, THEME_PANE_SB_THUMB, THEME_PANE_SB_TRACK, 0, 1, 2, 3, 4, 5,
+    6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 };
 int settings_pane_order_slot(int pos) { return (pos >= 0 && pos < THEME_PANE_SLOTS) ? g_pane_order[pos] : -1; }
 int settings_pane_order_pos(int slot) { for (int i = 0; i < THEME_PANE_SLOTS; i++) if (g_pane_order[i] == slot) return i; return -1; }
@@ -722,7 +722,7 @@ static void render_settings_pane(char *out, int bs, int *posp, int host_rows, in
     pos += snprintf(out + pos, bs - pos,
         "\x1b[3;%dH\x1b[038;2;121;192;255;1m■ 窗格配色 (Pane Palette)\x1b[0m", main_left);
     pos += snprintf(out + pos, bs - pos,
-        "\x1b[4;%dH\x1b[038;2;139;148;158m窗格里 cmd / shell 文字的默认背景、字色与 16 个索引色（像 Windows Terminal 的配色方案）。\x1b[0m", main_left);
+        "\x1b[4;%dH\x1b[038;2;139;148;158m窗格里 cmd / shell 文字的默认背景、字色、滚动条与 16 个索引色（像 Windows Terminal 的配色方案）。\x1b[0m", main_left);
     for (int p = 0; p < THEME_PANE_SLOTS; p++) {
         int slot = settings_pane_order_slot(p);
         int row = settings_pane_row(slot);
@@ -733,8 +733,10 @@ static void render_settings_pane(char *out, int bs, int *posp, int host_rows, in
         int r, g, b;
         int set = theme_pane_rgb(slot, &r, &g, &b);
         if (!set) theme_pane_fallback_rgb(slot, &r, &g, &b);
-        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH%s %-16s\x1b[0m ",
-                        row, col, settings_row_style(selected, hovered), theme_pane_slot_label(slot));
+        /* 标签按【显示宽度】补齐到 16 列（%-16s 按字节补，中文标签会错位——用户反馈「没对齐」） */
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH%s ", row, col, settings_row_style(selected, hovered));
+        append_padded_utf8(out, bs, &pos, NULL, theme_pane_slot_label(slot), 16);
+        pos += snprintf(out + pos, bs - pos, "\x1b[0m ");
         append_swatch(out, bs, &pos, r, g, b);
         if (g_hex_edit_active && g_hex_edit_role == -(slot + 1)) {
             char shown[16];
@@ -743,7 +745,8 @@ static void render_settings_pane(char *out, int bs, int *posp, int host_rows, in
         } else if (set) {
             pos += snprintf(out + pos, bs - pos, " \x1b[038;2;139;148;158m#%02x%02x%02x\x1b[0m\x1b[038;2;210;153;034m*\x1b[0m", r, g, b);
         } else {
-            pos += snprintf(out + pos, bs - pos, " \x1b[038;2;110;118;129m(跟随终端)\x1b[0m");
+            pos += snprintf(out + pos, bs - pos, " \x1b[038;2;110;118;129m%s\x1b[0m",
+                            (slot == THEME_PANE_SB_THUMB || slot == THEME_PANE_SB_TRACK) ? "(内置渐变)" : "(跟随终端)");
         }
     }
     int hint_r = SETTINGS_PANE_ROW0 + SETTINGS_PANE_ROWS + 1;
@@ -2303,6 +2306,22 @@ static const struct {
     {  30,  35,  42,  10, 13, 16,   20,  24,  30 }
 };
 
+/* v2.0.8：[theme] pane_scrollbar / pane_scrollbar_track 设了就覆盖内置渐变
+ * （渐变按鼠标距离变深，只为「不悬停时淡出」；用户自定义时保持恒定色）。
+ * 轨道的「│」字色取轨道底色与滑块色的中间值，保证在任何底色上都看得见。 */
+static void sb_custom_thumb(int *r, int *g, int *b) {
+    int cr, cg, cb;
+    if (theme_pane_rgb(THEME_PANE_SB_THUMB, &cr, &cg, &cb)) { *r = cr; *g = cg; *b = cb; }
+}
+static void sb_custom_track(int *br, int *bg, int *bb, int *fr, int *fg, int *fb) {
+    int cr, cg, cb;
+    if (!theme_pane_rgb(THEME_PANE_SB_TRACK, &cr, &cg, &cb)) return;
+    *br = cr; *bg = cg; *bb = cb;
+    int tr = 105, tg = 125, tb = 150;
+    sb_custom_thumb(&tr, &tg, &tb);
+    *fr = (cr + tr) / 2; *fg = (cg + tg) / 2; *fb = (cb + tb) / 2;
+}
+
 static int terminal_cursor_position(const ScreenBuffer *s, int scroll_offset,
                                      int host_rows, int host_cols, int *out_row, int *out_col) {
     if (!s || scroll_offset != 0 || !s->cursor_visible || host_rows < 1 || host_cols < 1)
@@ -2967,13 +2986,17 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
                 if (in_thumb) {
                     if (mouse_on_thumb)
                         pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[0;048;2;225;235;250m \x1b[0m", term_row, term_col);
-                    else
-                        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[0;48;2;%d;%d;%dm \x1b[0m", term_row, term_col,
-                                        g_sb_grad[gi].thumb_r, g_sb_grad[gi].thumb_g, g_sb_grad[gi].thumb_b);
+                    else {
+                        int tr = g_sb_grad[gi].thumb_r, tg = g_sb_grad[gi].thumb_g, tb = g_sb_grad[gi].thumb_b;
+                        sb_custom_thumb(&tr, &tg, &tb);
+                        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[0;48;2;%d;%d;%dm \x1b[0m", term_row, term_col, tr, tg, tb);
+                    }
                 } else {
+                    int br = g_sb_grad[gi].track_bg_r, bg = g_sb_grad[gi].track_bg_g, bb = g_sb_grad[gi].track_bg_b;
+                    int fr = g_sb_grad[gi].track_fg_r, fg = g_sb_grad[gi].track_fg_g, fb = g_sb_grad[gi].track_fg_b;
+                    sb_custom_track(&br, &bg, &bb, &fr, &fg, &fb);
                     pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[0;48;2;%d;%d;%dm\x1b[38;2;%d;%d;%dm│\x1b[0m", term_row, term_col,
-                                    g_sb_grad[gi].track_bg_r, g_sb_grad[gi].track_bg_g, g_sb_grad[gi].track_bg_b,
-                                    g_sb_grad[gi].track_fg_r, g_sb_grad[gi].track_fg_g, g_sb_grad[gi].track_fg_b);
+                                    br, bg, bb, fr, fg, fb);
                 }
             }
         }
@@ -3338,13 +3361,16 @@ void render_screen(void) {
                         if (mouse_on_thumb) {
                             pos += snprintf(out + pos, bs - pos, "\x1b[0;048;2;225;235;250m \x1b[0m");
                         } else {
-                            pos += snprintf(out + pos, bs - pos, "\x1b[0;48;2;%d;%d;%dm \x1b[0m",
-                                            g_sb_grad[dist].thumb_r, g_sb_grad[dist].thumb_g, g_sb_grad[dist].thumb_b);
+                            int tr = g_sb_grad[dist].thumb_r, tg = g_sb_grad[dist].thumb_g, tb = g_sb_grad[dist].thumb_b;
+                            sb_custom_thumb(&tr, &tg, &tb);
+                            pos += snprintf(out + pos, bs - pos, "\x1b[0;48;2;%d;%d;%dm \x1b[0m", tr, tg, tb);
                         }
                     } else {
+                        int br = g_sb_grad[dist].track_bg_r, bg = g_sb_grad[dist].track_bg_g, bb = g_sb_grad[dist].track_bg_b;
+                        int fr = g_sb_grad[dist].track_fg_r, fg = g_sb_grad[dist].track_fg_g, fb = g_sb_grad[dist].track_fg_b;
+                        sb_custom_track(&br, &bg, &bb, &fr, &fg, &fb);
                         pos += snprintf(out + pos, bs - pos, "\x1b[0;48;2;%d;%d;%dm\x1b[38;2;%d;%d;%dm│\x1b[0m",
-                                        g_sb_grad[dist].track_bg_r, g_sb_grad[dist].track_bg_g, g_sb_grad[dist].track_bg_b,
-                                        g_sb_grad[dist].track_fg_r, g_sb_grad[dist].track_fg_g, g_sb_grad[dist].track_fg_b);
+                                        br, bg, bb, fr, fg, fb);
                     }
                     la_attr = 0xFFFF;
                 }
