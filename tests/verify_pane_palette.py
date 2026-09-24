@@ -138,7 +138,7 @@ def run_settings_ui(keys_after_open, marker):
     send(("printf '%s\\n'; printf '\\033[31mRED_%s\\033[0m\\n'\r" % (marker, marker)).encode(), 2.0)
     ini = ""
     try:
-        with open(os.path.join(td, "termux.ini"), encoding="utf-8") as f:
+        with open(os.path.join(td, "termux.ini"), encoding="utf-8", errors="replace") as f:
             ini = f.read()
     except OSError:
         pass
@@ -319,7 +319,7 @@ int main(int argc, char **argv) {
 """
 
 
-def capture_page_keys(rows, cols, keys, ini=None):
+def capture_page_keys(rows, cols, keys, ini=None, keep_ini=False):
     """起 termux(rows x cols)，依次发 keys，返回收到的全部字节。
     ini 非空时先写 termux.ini（用来造出「5 个菜单项」这类需要配置的场景）。"""
     td = tempfile.mkdtemp(prefix="termux_palette_keys_")
@@ -359,8 +359,15 @@ def capture_page_keys(rows, cols, keys, ini=None):
         os.kill(pid, signal.SIGKILL)
     except OSError:
         pass
+    ini_txt = None
+    if keep_ini:                    # v2.1.2：要核对 ini 落盘内容（长名字是否被截）时读回来
+        try:
+            with open(os.path.join(td, "termux.ini"), encoding="utf-8", errors="replace") as f:
+                ini_txt = f.read()
+        except OSError:
+            ini_txt = ""
     shutil.rmtree(td, ignore_errors=True)
-    return bytes(got)
+    return (bytes(got), ini_txt) if keep_ini else bytes(got)
 
 
 # argv[4] = 要找的文字。若它以 '#' 开头：找到含它的行，要求光标在同一行且列 = 该串末尾之后 → "ok"；
@@ -471,6 +478,41 @@ int main(int argc, char **argv) {
     printf("notfound\n"); return 1;
 }
 """
+
+
+VTERM_MEAS_C = r'''
+/* v2.1.2：把一段宿主字节流回放成屏幕，按行打印所有制表符边框字符所在的【1 基显示列】。
+ * 浮层「右侧没对齐」这类问题，光看文本行看不出来（宽字符/尾随空格会骗人），
+ * 必须拿到真实的屏幕列号。argv: rows cols file */
+#include <vterm.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    int R = atoi(argv[1]), C = atoi(argv[2]);
+    VTerm *vt = vterm_new(R, C); vterm_set_utf8(vt, 1);
+    VTermScreen *scr = vterm_obtain_screen(vt); vterm_screen_reset(scr, 1);
+    FILE *f = fopen(argv[3], "rb"); if (!f) return 2;
+    char buf[65536]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) vterm_input_write(vt, buf, n);
+    for (int r = 0; r < R; r++) {
+        char mark[512]; int mk = 0, lastn = 0;
+        for (int c = 0; c < C; c++) {
+            VTermScreenCell cell; VTermPos p = { r, c };
+            vterm_screen_get_cell(scr, p, &cell);
+            unsigned ch = cell.chars[0];
+            if (cell.width != 0 && ch && ch != ' ') lastn = c + 1;
+            if (ch == 0x2502 || ch == 0x250c || ch == 0x2510 || ch == 0x2514 || ch == 0x2518)
+                mk += snprintf(mark + mk, sizeof(mark) - mk, " %c@%d",
+                               ch == 0x2502 ? '|' : (ch == 0x250c ? 'L' : (ch == 0x2510 ? 'R'
+                                                  : (ch == 0x2514 ? 'l' : 'J'))), c + 1);
+        }
+        if (!mk) continue;
+        printf("r%-2d last=%d%s\n", r + 1, lastn, mark);
+    }
+    return 0;
+}
+'''
 
 
 def main():
@@ -774,8 +816,11 @@ int main(int argc, char **argv) {
         ck("K1 12 行终端：侧栏 [A]/[K]/[B]/[W] 四个入口与 [Ctrl+S] 都在屏内",
            all(x in jk1 for x in ["[A] 外观", "[K] 键位", "[B] 行为", "[W] 窗格配色", "[Ctrl+S] 保存配置"]),
            "")
-        ck("K1 12 行 × 5 个菜单项：列表被截断时说明还有多少项（数字键 1-9 仍可选）",
-           "添加(共5项)" in jk1 and "导航选项" not in jk1, jk1[:400])
+        # v2.1.2 起侧栏列表是「可滚动的窗口」，不再用「添加(共5项)」这种死提示；
+        # 还剩几项由表头/提示行的 (a-b/N) 说明。这里改判：[+] 行回到普通的「添加新条目」，
+        # 第 4/5 项能不能滚进来看 N1。
+        ck("K1 12 行 × 5 个菜单项：不再出现「添加(共N项)」死提示，[+] 行是普通的添加条目",
+           "添加(共" not in jk1 and "[+] 添加新条目" in jk1, jk1[:400])
         # 一整串 ↓ 一次写入：31 个动作全部滚一遍，比逐键 0.4s 快两个数量级
         k2 = capture_page_keys(12, 100, [b"\x02s", b"\x1bOQ", b"\x1b[B" * 24])
         tk2 = vt_text(12, 100, k2) or []
@@ -902,6 +947,146 @@ int main(int argc, char **argv) {
         ck("M7 60 列 × 详情页：8 格刚好放得下 → 不标 +N",
            "N" not in r60 and "8" in r60, "60列=%r" % r60[-40:])
         ck("M7 100 列 × 详情页：8 格全在（值 8 可见），色块不越界", "8" in r100, "100列=%r" % r100[-40:])
+
+    # ======================= N 组：侧栏滚动 / 窄页省略 / 侧栏气泡 / 长名字（v2.1.2）=======================
+    # 用户反馈 5 条：①导航选项要能滚，而不是省略成「添加(共4项)」②「启动默认颜色」这类
+    # 标签过窄时没有 … ③光标在导航选项里应能触发旁边的悬停提示 ④配色方案浮层右框不齐
+    # ⑤颜色编辑浮层右框不齐。前四条判据在下面，浮层右框（④⑤）用真实屏幕列号判。
+    def dispw(t):
+        import unicodedata
+        w = 0
+        for ch in t:
+            if unicodedata.combining(ch):
+                continue
+            w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        return w
+
+    def border_pos(rows, cols, data, _c={}):
+        """返回 [(行号, 最后一个非空列, {'L':列,'R':列,'|':[列...]})]；没有 libvterm 时 None。"""
+        if os.environ.get("TERMUX_NO_VTERM"):
+            return None
+        if "exe" not in _c:
+            td = tempfile.mkdtemp(prefix="termux_meas_")
+            cs = os.path.join(td, "meas.c"); ex = os.path.join(td, "meas")
+            with open(cs, "w") as f:
+                f.write(VTERM_MEAS_C)
+            r = subprocess.run(["gcc", "-O1", cs, "-o", ex, "-lvterm"], capture_output=True, text=True)
+            _c["exe"] = ex if r.returncode == 0 else ""
+            if not _c["exe"]:
+                print("  [SKIP] N5 —— 边框列号 dump 编译失败：%s" % r.stderr.strip()[:160])
+        if not _c["exe"]:
+            return None
+        dp = os.path.join(tempfile.mkdtemp(prefix="termux_meas_d_"), "s.bin")
+        with open(dp, "wb") as f:
+            f.write(data)
+        out = subprocess.run([_c["exe"], str(rows), str(cols), dp], capture_output=True, text=True).stdout
+        os.remove(dp)
+        res = []
+        for line in out.splitlines():
+            m = re.match(r"^r(\d+)\s+last=(\d+)\s*(.*)$", line)
+            if not m:
+                continue
+            pos = {}
+            for kind, col in re.findall(r"([LRlJ|])@(\d+)", m.group(3)):
+                pos.setdefault(kind, []).append(int(col))
+            res.append((int(m.group(1)), int(m.group(2)), pos))
+        return res
+
+    nini5 = ("[menu]\n1 = sh, /bin/sh\n2 = 一个非常长的菜单项名字用来验证截断, /bin/bash\n"
+             "3 = three, /bin/sh\n4 = four, /bin/sh\n5 = five, /bin/sh\n")
+    nlong = "一" * 20                       # 60 字节：老结构体（32 字节）装不下，会被从中间切断
+    nini_long = "[menu]\n1 = sh, /bin/sh\n2 = %s, /bin/bash\n" % nlong
+
+    n1a = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s"], ini=nini5)) or [])
+    n1b = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", wheel(60, 6, 3)], ini=nini5)) or [])
+    ck("N1 12 行 × 侧栏列表是窗口：滚轮能把第 4/5 项滚进来（不再写死成「添加(共N项)」）",
+       "  [1] sh" in n1a and "  [4] four" not in n1a and "  [4] four" in n1b and "  [1] sh" not in n1b
+       and "添加(共" not in n1a, "")
+    n1c = "\n".join(vt_text(13, 100, capture_page_keys(13, 100, [b"\x02s", wheel(60, 6, 2)], ini=nini5)) or [])
+    n1d = "\n".join(vt_text(13, 100, capture_page_keys(13, 100, [b"\x02s", wheel(60, 6, 2),
+                                                                  wheel(60, 6, 4, down=False)], ini=nini5)) or [])
+    ck("N1 13 行 × 滚轮向下换窗口、向上能滚回第 1 项",
+       "  [3] three" in n1c and "  [5] five" in n1c and "  [1] sh" not in n1c
+       and "  [1] sh" in n1d and "  [2] 一" in n1d, "")
+    n1h = vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s"], ini=nini5)) or []
+    n1col = [l.split("│")[0] for l in n1h]          # 只看侧栏那一列，右侧画什么不影响判据
+    n1last = max(i for i, l in enumerate(n1col) if re.search(r"\[\d\]", l))
+    n1add = next((i for i, l in enumerate(n1col) if "[+] 添加新条目" in l), -1)
+    ck("N1 24 行 × 条目全都放得下 → 表头不带 (a-b/N)，[+] 紧贴列表末行（侧栏不空出一段）",
+       any("导航选项" in l and "(" not in l for l in n1col)
+       and n1add == n1last + 1 and "  [5] five" in "\n".join(n1col),
+       "末项行=%d [+]行=%d" % (n1last + 1, n1add + 1))
+
+    n2 = vt_text(24, 50, capture_page_keys(24, 50, [b"\x02s", b"\r"], ini=nini5)) or []
+    n2j = "\n".join(n2)
+    ck("N2 50 列 × 详情页：四个字段标签都在（不再被硬切掉）",
+       all(k in n2j for k in ["2. 启动命令行", "3. 启动目录", "4. 启动默认颜色"]), n2j[:200])
+    ck("N2 50 列 × 详情页：放不下的行以 ... 结尾，且没有一行越过 50 列",
+       n2j.count("...") >= 3 and all(dispw(l) <= 50 for l in n2),
+       "%d 处 ...，最长 %d 列" % (n2j.count("..."), max([dispw(l) for l in n2] or [0])))
+
+    nhov_base = vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s"], ini=nini5)) or []
+    nhov = vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s", b"\x1b[<35;12;8M"], ini=nini5)) or []
+    nhovj = "\n".join(nhov)
+    ck("N3 鼠标停在被截断的菜单项名上 → 气泡给出全文（老版：光标在侧栏时压根不弹）",
+       "一个非常长的菜单项名字用来验证截断" in nhovj and "┌" in nhovj, "")
+    ck("N3 气泡落在分隔线右侧，不盖住侧栏，也不把侧栏各行顶掉",
+       "\n".join(nhov_base) != nhovj
+       and all(l.split("│")[0] == b.split("│")[0] for l, b in zip(nhov, nhov_base))
+       and max(l.index("┌") for l in nhov if "┌" in l) > 20, "")
+    nk = "\n".join(vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s", b"\x1bOB", b"\x1b[<35;12;7M"],
+                                                       ini=nini5)) or [])
+    ck("N4 选中项挪到「启动」行、鼠标停在侧栏空白处 → 不该弹出邻居条目的气泡", "┌─" not in nk, "")
+
+    def popup_right_frame(rows, cols, keys):
+        """浮层右框是否齐：┐ / ┘ / 正文右 │ 必须同列。返回 (右列, 例外) 或 None。"""
+        bp = border_pos(rows, cols, capture_page_keys(rows, cols, keys, ini=None))
+        if not bp:
+            return None
+        tops = [r for r in bp if "L" in r[2]]
+        bots = [r for r in bp if "J" in r[2]]
+        if not tops:
+            return None
+        tr, _l, m = tops[0]
+        if "R" not in m:
+            return None
+        L, R = m["L"][0], m["R"][0]
+        if R <= L:
+            return None
+        bad = []
+        br = max(r[0] for r in bots) if bots else 0
+        for r in bp:
+            if "J" in r[2] and r[2]["J"][-1] != R:
+                bad.append(("┘@%d!=%d" % (r[2]["J"][-1], R)))
+            if r[0] <= tr or (br and r[0] >= br) or "L" in r[2] or "J" in r[2]:
+                continue
+            right = [x for x in r[2].get("|", []) if x > L]
+            if right and right[-1] != R:
+                bad.append("r%d 右│@%d!=%d" % (r[0], right[-1], R))
+        return (R, bad)
+
+    for nrow, ncol, ntag, nkeys in [(30, 100, "配色方案浮层 100 列", [b"\x02s", b"W", b"\r"]),
+                                    (30, 60, "配色方案浮层 60 列", [b"\x02s", b"W", b"\r"]),
+                                    (24, 100, "颜色编辑浮层 100 列",
+                                     [b"\x02s", b"W", wheel(50, 8, 6), b"\r", b"ab"]),
+                                    (12, 30, "颜色编辑浮层 30 列",
+                                     [b"\x02s", b"W", wheel(15, 8, 6), b"\r", b"ab"])]:
+        pr = popup_right_frame(nrow, ncol, nkeys)
+        if pr is None:
+            print("  [SKIP] N5 %s —— 没抓到浮层框" % ntag)
+            continue
+        ck("N5 %s：顶框 ┐ / 底框 ┘ / 正文右 │ 同列（右框不短一格）" % ntag,
+           not pr[1], "右框应=%d 例外=%r" % (pr[0], pr[1]))
+
+    nraw, nini = capture_page_keys(24, 100, [b"\x02s", b"\x13"], ini=nini_long, keep_ini=True)
+    nline = [l for l in (nini or "").splitlines() if l.startswith("2 =")]
+    ck("N7 60 字节长名字：Ctrl+S 落盘后 ini 里仍是完整的 20 个字（老结构体只有 32 字节）",
+       nline and nlong in nline[0], repr(nline))
+    nlt = "\n".join(vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s", b"\x1b[<35;12;8M"],
+                                                        ini=nini_long)) or [])
+    ck("N7 长名字悬停：气泡是全文，且没有半个 UTF-8 字符留下的 '?'",
+       nlong in nlt and "?" not in nlt, "")
+
 
     print()
     if FAILS:

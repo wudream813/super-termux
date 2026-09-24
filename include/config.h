@@ -37,6 +37,7 @@ extern int g_settings_pane_scheme;  /* 窗格配色页：方案行当前指向�
 extern int g_settings_show_pane_schemes;  /* v2.1.0：方案选择浮层（预设方案列表）是否打开 */
 extern int g_settings_pane_scroll;  /* 窗格配色页：单列模式下的行滚动（矮终端） */
 extern int g_settings_appear_scroll;    /* v2.1.0：外观页纵向滚动（终端太矮时） */
+extern int g_settings_sidebar_scroll;     /* v2.1.2：设置页侧栏菜单项列表的滚动量 */
 extern int g_settings_behavior_scroll;  /* v2.1.0：行为页纵向滚动 */
 extern int g_settings_detail_scroll;    /* v2.1.0：菜单项详细配置页纵向滚动 */
 extern int g_settings_startup_scroll;    /* v2.1.0：默认启动项页纵向滚动 */
@@ -48,7 +49,7 @@ extern int g_key_capture_active;    /* 1 = 正在等待用户按下新键位 */
 extern char g_hex_edit_buf[8];      /* 语义色十六进制输入 */
 extern int g_hex_edit_len, g_hex_edit_active, g_hex_edit_role;
 
-extern char g_edit_name[32];
+extern char g_edit_name[sizeof(g_chooser_items[0].name)];
 extern int g_edit_name_len, g_edit_name_pos;
 extern char g_edit_cmd[256];
 extern int g_edit_cmd_len, g_edit_cmd_pos;

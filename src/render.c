@@ -606,8 +606,25 @@ void render_settings_presets(char *out, int bs, int *posp, int host_rows, int ho
 /* v2.1.0：侧栏自适应。原布局固定要 13+菜单项数 行，终端一矮 [A]/[K]/[B]/[W] 四个
  * 入口就被挤到屏幕外（用户报「终端太矮时设置显示不全」——连子页都进不去）。
  * 规则：① 先省掉「导航选项」表头与两条分隔行（省 3 行）；② 再省 [P] 快速预设库行
- * （P 键仍可）；③ 菜单项列表按剩余空间截断（数字键 1-9 仍能选）。四个入口和
- * [Ctrl+S] 保存行永远留在屏内。 */
+ * （P 键仍可）；③ 菜单项列表变成一个可滚动的窗口（v2.1.2：原先是「只画前 N 个」，
+ * 第 N+1 项起永远看不见，用户报「导航选项要可以滚动，而不是省略成 添加(共4项)」）。
+ * 四个入口和 [Ctrl+S] 保存行永远留在屏内。 */
+int settings_sidebar_sel_natural(void);
+int settings_sidebar_geom_cap(int host_rows, int item_count) {
+    SettingsSidebarGeom g;
+    settings_sidebar_geom(host_rows, item_count, &g);
+    return g.items_cap;      /* 复用同一份几何，免得两处各写一遍算错的 cap */
+}
+
+void settings_sidebar_clamp_sel(int host_rows, int item_count) {
+    SettingsSidebarGeom g;
+    settings_sidebar_geom(host_rows, item_count, &g);
+    int sel = settings_sidebar_sel_natural();
+    if (sel < 1 || g.items_cap <= 0) return;
+    if (g_settings_sidebar_scroll > sel - 1) g_settings_sidebar_scroll = sel - 1;
+    if (g_settings_sidebar_scroll < sel - g.items_cap) g_settings_sidebar_scroll = sel - g.items_cap;
+}
+
 void settings_sidebar_geom(int host_rows, int item_count, SettingsSidebarGeom *g) {
     memset(g, 0, sizeof(*g));
     int want = 13 + item_count;          /* [W] 落在 host_rows-1 所需的最小高度 */
@@ -622,13 +639,36 @@ void settings_sidebar_geom(int host_rows, int item_count, SettingsSidebarGeom *g
     int fixed_below = g->hide_presets ? 5 : 6;    /* [+] (+ [P]) + [A][K][B][W] */
     int cap = host_rows - 1 - fixed_below - g->items_row0 + 1;
     if (cap < 0) cap = 0;
-    if (cap > item_count) cap = item_count;
     g->items_cap = cap;
+    /* v2.1.2：菜单项列表变成「窗口」而不是「截断」。原先只画前 cap 个，第 cap+1 个
+     * 起就永远看不见（用户报「设置中导航选项要可以滚动，而不是省略成 添加(共4项)」）；
+     * 现在窗口随选中项夹动（和右侧窗格同一套规则），滚轮/↑/↓ 都能把它挪。 */
+    int maxs = item_count - cap;
+    if (maxs < 0) maxs = 0;
+    if (g_settings_sidebar_scroll > maxs) g_settings_sidebar_scroll = maxs;
+    if (g_settings_sidebar_scroll < 0) g_settings_sidebar_scroll = 0;
+    /* 选中项【不能】每帧来夹窗口 —— 那样窗口永远被拽回「第 1 项可见」，滚轮滚不动
+     * （v2.1.2 第一版就踩了这个坑）。夹窗口只在「选中项刚变化」时由
+     * settings_sidebar_clamp_sel() 主动做一次。 */
+    g->items_scroll = g_settings_sidebar_scroll;
+    /* 窗口开不了这么大时按条目数收窄：右侧/下方的 [+] [P] [A]… 必须紧贴窗口末行，
+     * 否则条目少于窗口容量时侧栏会空出一段（v2.1.2 一度写成用未收窄的 cap ⇒ 2 项时
+     * [+] 掉到第 17 行）。 */
+    if (g->items_cap > item_count) g->items_cap = item_count;
+    if (cap > item_count) cap = item_count;
     g->add = g->items_row0 + cap;
     g->presets = g->hide_presets ? 0 : g->add + 1;
     int nav0 = g->hide_presets ? g->add + 1 : g->add + 2;
     g->app = nav0; g->keys = nav0 + 1; g->beh = nav0 + 2; g->pane = nav0 + 3;
     g->save = host_rows;
+}
+
+/* 侧栏列表里当前该被看见的那一行：1..item_count = 第 n 个菜单项，0 = 无选中。
+ * 「启动 (Startup)」页的 ▶ 在右侧表格里（g_settings_table_sel），夹窗口时也要跟着它，
+ * 否则右侧换行、侧栏不动，第 4/5 项就永远看不到。 */
+int settings_sidebar_sel_natural(void) {
+    if (g_settings_nav >= 1) return g_settings_nav;
+    return 0;
 }
 
 void settings_sidebar_extra_rows(int *appearance_r, int *keys_r, int *behavior_r) {
@@ -693,7 +733,7 @@ void settings_scroll_mark(char *out, int bs, int *posp, int row, int right_col,
  * 改成居中浮层：色块 + 完整 6 位 + 提示，宽度按需收缩，任何尺寸都不截断。 */
 void hex_edit_popup_geom(int host_rows, int host_cols, int *top, int *left, int *w, int *h);
 static int hex_edit_popup_w(int host_cols);
-static int settings_host_sidebar_w(int host_cols);
+int settings_host_sidebar_w(int host_cols);
 
 /* 浮层是否会盖在这一行上：会 ⇒ 表行不再重复画编辑框（避免同一个值出现两份）。
  * 另一个浮层（预设 / 方案列表）打开时 hex 编辑其实已被打断，此时仍画表行内的框。 */
@@ -791,7 +831,11 @@ static void render_settings_tooltip(char *out, int bs, int *posp, int host_rows,
     const SettingsTip *t = settings_tip_at(g_mouse_y + 1, g_mouse_x + 1);
     if (!t || !t->full[0]) return;
 
-    int bw = t->len + 4;                       /* │ 空格 内容 空格 │ */
+    /* v2.1.2：框宽按【折行后每行的实际显示列】算。原先直接拿登记的 len（侧栏那条登记
+     * 记的是「从起点到行尾」的列数，比正文短）当宽度 ⇒ 框比正文窄，右边框连同剩下的
+     * 字一起被顶到行尾之外。 */
+    int fullw = utf8_cols(t->full, (int)strlen(t->full));
+    int bw = fullw + 4;                         /* │ 空格 内容 空格 │ */
     if (bw > host_cols) bw = host_cols;
     int cap = bw - 4;
     if (cap < 6) { cap = 6; bw = cap + 4; if (bw > host_cols) return; }
@@ -821,6 +865,16 @@ static void render_settings_tooltip(char *out, int bs, int *posp, int host_rows,
     }
     int clipped = (i < slen);
     int bh = nl + 2;
+    {
+        int maxline = 0;
+        for (int k = 0; k < nl; k++) {
+            int lw = utf8_cols(t->full + lstart[k], llen[k]);
+            if (k == nl - 1 && clipped) lw += 3;          /* 末行还要放「...」 */
+            if (lw > maxline) maxline = lw;
+        }
+        if (maxline > 0 && maxline + 4 < bw) bw = maxline + 4;
+        cap = bw - 4;
+    }
 
     int top = g_mouse_y + 2;                   /* 鼠标行的下一行 */
     if (top + bh - 1 > host_rows) top = (g_mouse_y + 1) - bh;   /* 放不下就翻到上方 */
@@ -828,6 +882,14 @@ static void render_settings_tooltip(char *out, int bs, int *posp, int host_rows,
     int left = g_mouse_x + 1;
     if (left + bw - 1 > host_cols) left = host_cols - bw + 1;
     if (left < 1) left = 1;
+    /* v2.1.2：气泡不许盖住来触发它的那一行 —— 鼠标在侧栏时（用户就是在那儿看被截断的
+     * 菜单项名），把气泡整体推到分隔线右侧的正文区去。 */
+    int sbw = settings_host_sidebar_w(host_cols);
+    if (g_mouse_x < sbw && left < sbw + 3) {
+        left = sbw + 3;
+        if (left + bw - 1 > host_cols) left = host_cols - bw + 1;
+        if (left < 1) left = 1;
+    }
 
     const char *BG = "\x1b[048;2;022;027;034m";   /* 与其它浮层同色：不引入新用色 */
     const char *BR = "\x1b[038;2;121;192;255m";
@@ -959,14 +1021,15 @@ static int g_tip_n;
 void settings_tip_reset(void) { g_tip_n = 0; g_sl_row = 0; }
 int settings_tip_count(void) { return g_tip_n; }
 const SettingsTip *settings_tip_at(int row, int col) {
-    const SettingsTip *fallback = NULL;
+    /* v2.1.2：不再「同一行随便挑一个气泡」兜底。用户报「光标在导航选项中，可以触发
+     * 旁边的悬停提示」：侧栏那一行和右侧窗格同一行，兜底把右侧被截断的行拽出来弹在
+     * 侧栏上。现在必须鼠标确实停在被截断那一段的列区间内才弹。 */
     for (int i = 0; i < g_tip_n; i++) {
         const SettingsTip *t = &g_tips[i];
         if (t->row != row) continue;
-        if (!fallback) fallback = t;
-        if (col >= t->col && col < t->col + t->len) return t;   /* 优先鼠标所在的那一段 */
+        if (col >= t->col && col < t->col + t->len) return t;
     }
-    return fallback;
+    return NULL;
 }
 
 static void settings_line_begin(char *out, int bs, int *posp, int row, int main_left, int host_cols, const char *sgr) {
@@ -983,7 +1046,10 @@ static void settings_line_sgr(char *out, int bs, int *posp, const char *sgr) {
     if (g_sl_hidden) return;
     *posp += snprintf(out + *posp, bs - *posp, "%s", sgr);
 }
-static void settings_line_text(char *out, int bs, int *posp, const char *text) {
+/* ellip=1（默认用法）：放不下就切到行尾补「...」并把全文登记进悬停气泡。
+ * ellip=0：一行里有多段（如详情页的三个按钮）时用 —— 前面的段静默丢掉自己的尾部，
+ * 最后一段才带「...」，否则每段都补省略号会看起来像被切了三刀。 */
+static void settings_line_text_e(char *out, int bs, int *posp, const char *text, int ellip) {
     if (g_sl_left <= 0 || g_sl_hidden) return;
     int w = utf8_cols(text, (int)strlen(text));
     if (w <= g_sl_left) {
@@ -992,14 +1058,15 @@ static void settings_line_text(char *out, int bs, int *posp, const char *text) {
     } else {
         /* 横向装不下：截到行尾并补「...」，同时把全文登记进气泡表，
          * 鼠标停在这一行上时以浮层给出完整内容。 */
-        int budget = g_sl_left - 3;
+        int budget = ellip ? g_sl_left - 3 : g_sl_left;
         if (budget < 1) budget = 1;
         int before = *posp;
         append_padded_utf8(out, bs, posp, NULL, text, budget);
         /* 去掉 append_padded_utf8 尾部补的空格 */
         int slen = (int)strlen(text);
         while (*posp > before + slen && *posp > before && out[*posp - 1] == ' ') (*posp)--;
-        if (g_sl_left > 3 && *posp < bs - 4) { out[(*posp)++]='.'; out[(*posp)++]='.'; out[(*posp)++]='.'; }
+        if (ellip && g_sl_left > 3 && *posp < bs - 4) { out[(*posp)++]='.'; out[(*posp)++]='.'; out[(*posp)++]='.'; }
+        if (!ellip) return;          /* 预算已用完 ⇒ 后面的段自动写不进去 */
         g_sl_left = 0;
         if (g_sl_row > 0 && g_tip_n < SETTINGS_TIP_MAX) {
             SettingsTip *t = &g_tips[g_tip_n++];
@@ -1008,6 +1075,10 @@ static void settings_line_text(char *out, int bs, int *posp, const char *text) {
         }
     }
 }
+static void settings_line_text(char *out, int bs, int *posp, const char *text) {
+    settings_line_text_e(out, bs, posp, text, 1);
+}
+
 static void settings_line_end(char *out, int bs, int *posp) {
     if (g_sl_hidden) return;
     *posp += snprintf(out + *posp, bs - *posp, "\x1b[0m");
@@ -1184,7 +1255,9 @@ void render_pane_scheme_picker(char *out, int bs, int *posp, int host_rows, int 
         pos += snprintf(out + pos, bs - pos, "%s%s", fg, bg);
         append_padded_utf8(out, bs, &pos, &ccols, theme_pane_scheme_name(i), name_w);
         pos += snprintf(out + pos, bs - pos, "\x1b[0m%s", bg);
-        ccols += 1;
+        /* 注意：append_padded_utf8 已经把 cols 加成了「名字宽度 + 尾部补的空格」，
+         * 这里不能再 +1，否则 pad_to_right_border 少补一格 ⇒ 右边框比上下边框短 1 列
+         * （用户报「窗格选择的配色方案右侧没有对齐」）。 */
         ThemeRGB prev[THEME_PANE_SLOTS];
         theme_pane_scheme_preview(i, prev);
         for (int k = 0; k < nsw; k++) {
@@ -1223,9 +1296,10 @@ void render_pane_scheme_picker(char *out, int bs, int *posp, int host_rows, int 
  * 只画「色块 + 完整 6 位 + 提示」三行，宽度按需收缩到终端宽；表行此时不重复画框。
  * 因为框宽 = min(需要, 终端宽) 且值段固定排在左 + 6，任何宽度下都不会截断。 */
 #define HEX_EDIT_POPUP_W 50
-/* 侧栏宽度（与 render_settings_panel / handle_settings_mouse 同式）：浮层必须整体
- * 待在右侧正文区里，否则会切掉侧栏菜单（分隔线在 sb_w + 2）。 */
-static int settings_host_sidebar_w(int host_cols) {
+/* 侧栏宽度单一来源：渲染 / 命中 / 光标 / 浮层都调它（浮层必须整体待在右侧正文区里，
+ * 否则会切掉侧栏菜单，分隔线在 sb_w + 2）。v2.1.2 起 render_settings_panel 与
+ * handle_settings_mouse 不再各自抄一遍公式。 */
+int settings_host_sidebar_w(int host_cols) {
     int sb_w = SETTINGS_SIDEBAR_W;
     if (sb_w > host_cols / 2) sb_w = host_cols / 2;
     if (sb_w < 15) sb_w = 15;
@@ -1337,9 +1411,13 @@ void render_hex_edit_popup(char *out, int bs, int *posp, int host_rows, int host
     }
     pad_to_right_border(out, bs, &pos, &cols, pw);
 
-    cols = 1;
+    cols = 0;                                  /* └/┘ 之外的一格都不属于这个计数 */
     HEX_POPUP_FILL(top + 2);
     pos += snprintf(out + pos, bs - pos, "%s\x1b[0m%s", BD, BG);
+    /* 上边框写的是「┌ + (pw-1) 根横线」共 pw 格；底边不能像原先那样先按 cols=1 起算
+     * （那样横线只有 pw-2 根，右下角 ┘ 比上边框的 ┐ 短 1 列，用户报「颜色编辑弹出的框
+     * 右侧没有对齐」，60/44/100 列实测都短一格）。这里从 0 起算，横线 pw-1 根 + ┘，
+     * 与上边框逐格同宽。 */
     while (cols < pw - 1 && pos < bs - 8) { out[pos++] = '\xe2'; out[pos++] = '\x94'; out[pos++] = '\x80'; cols++; }
     pos += snprintf(out + pos, bs - pos, "┘\x1b[0m");
     *posp = pos;
@@ -1406,9 +1484,21 @@ void settings_wheel_scroll(int delta) {
             g_settings_pane_scroll = THEME_PANE_SLOTS - vis;
         if (g_settings_pane_scroll < 0) g_settings_pane_scroll = 0;
     } else if (g_settings_nav == 0) {
-        if (g_settings_table_sel < 0) g_settings_table_sel = 0;
-        if (dir > 0) { if (g_settings_table_sel < g_chooser_item_count - 1) g_settings_table_sel++; }
-        else if (g_settings_table_sel > 0) g_settings_table_sel--;
+        /* v2.1.2：「启动」页的滚轮先滚侧栏那个菜单项窗口（用户报「导航选项要可以滚动」），
+         * 到顶/到底之后才带动右侧表格的选中项。 */
+        int total = g_chooser_item_count;
+        int vis = settings_sidebar_geom_cap(g_mux.host_rows, total);
+        int maxs = total - vis;
+        if (maxs < 0) maxs = 0;
+        int before = g_settings_sidebar_scroll;
+        g_settings_sidebar_scroll += (dir > 0 ? step : -step);
+        if (g_settings_sidebar_scroll > maxs) g_settings_sidebar_scroll = maxs;
+        if (g_settings_sidebar_scroll < 0) g_settings_sidebar_scroll = 0;
+        if (g_settings_sidebar_scroll == before) {     /* 窗口到头了，才动选中项 */
+            if (g_settings_table_sel < 0) g_settings_table_sel = 0;
+            if (dir > 0) { if (g_settings_table_sel < g_chooser_item_count - 1) g_settings_table_sel++; }
+            else if (g_settings_table_sel > 0) g_settings_table_sel--;
+        }
         g_settings_startup_scroll += (dir > 0 ? step : -step);
         if (g_settings_startup_scroll < 0) g_settings_startup_scroll = 0;
         int mx = settings_startup_last(g_mux.host_rows) - 3 - (g_mux.host_rows - 3);
@@ -1803,11 +1893,7 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
     settings_tip_reset();          /* v2.1.0：截断行登记表每帧重建 */
     SettingsSidebarGeom sbg;
     settings_sidebar_geom(host_rows, g_chooser_item_count, &sbg);
-    int sb_w = SETTINGS_SIDEBAR_W;
-    if (sb_w > host_cols / 2) sb_w = host_cols / 2;
-    if (sb_w < 15) sb_w = 15;
-    if (sb_w > host_cols) sb_w = host_cols;
-    if (sb_w < 1) sb_w = 1;
+    int sb_w = settings_host_sidebar_w(host_cols);
 
     for (int y = 0; y < host_rows; y++) {
         int r = y + 2;
@@ -1826,8 +1912,10 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
 
     if (sbg.nav_label) {          /* 矮终端：表头/分隔行先省掉，把行留给入口 */
         char navlab[64];
+        int shown0 = sbg.items_scroll + 1;
+        int shown1 = sbg.items_scroll + sbg.items_cap;
         if (sbg.items_cap < g_chooser_item_count)
-            snprintf(navlab, sizeof(navlab), "  导航选项 (条目 1-%d/%d)", sbg.items_cap, g_chooser_item_count);
+            snprintf(navlab, sizeof(navlab), "  导航选项 (%d-%d/%d)", shown0, shown1, g_chooser_item_count);
         else
             snprintf(navlab, sizeof(navlab), "  导航选项");
         pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H\x1b[038;2;121;192;255;1m%s\x1b[0m", sbg.nav_label, navlab);
@@ -1844,24 +1932,74 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
     if (sbg.sep2)
         pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H\x1b[038;2;048;054;061m┈┈ 菜单项配置 ┈┈┈┈┈┈─\x1b[0m", sbg.sep2);
 
-    for (int i = 0; i < g_chooser_item_count && i < sbg.items_cap; i++) {
+    for (int i = 0; i < sbg.items_cap; i++) {
+        int it = sbg.items_scroll + i;            /* v2.1.2：窗口内第 i 行 = 第 it 个菜单项 */
+        if (it < 0 || it >= g_chooser_item_count) continue;
         int r = sbg.items_row0 + i;
         if (r > host_rows - 3) break;
-        int is_sel = (g_settings_nav == i + 1);
+        int is_sel = (g_settings_nav == it + 1);      /* 选中项按「自然项」比，不是窗口内序号 */
         int h_item = (g_mouse_y == r - 1 && g_mouse_x >= 0 && g_mouse_x < sb_w);
         const char *item_style = is_sel ? (h_item ? "\x1b[048;2;048;075;110m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;038;060;088m\x1b[038;2;121;192;255;1m")
                                         : (h_item ? "\x1b[048;2;033;038;045m\x1b[038;2;255;255;255;1m" : "\x1b[038;2;230;237;243m");
-        char dname[32] = {0};
-        format_name_display(dname, sizeof(dname), g_chooser_items[i].name);
-        pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H%s  %s [%d] %-10s\x1b[0m", r, item_style, is_sel ? "▶" : " ", i + 1, dname);
+        /* v2.1.2：名字按侧栏宽度截断并补「...」，同时登记悬停气泡（原先固定 %-10s，
+         * 10 列以后的名字直接消失，既没有省略号也查不到全文 —— 用户报「可以触发旁边的
+         * 悬停提示」却只有右侧窗格登记了气泡）。
+         * 这里【不能】借用 settings_line_*：它按 g_sl_left 记账，会吃掉下一次 begin
+         * 之前的预算，把侧栏下面的 [+] / [A] 等行整段挤掉（实测过，别再来一遍）。 */
+        char line[96];
+        snprintf(line, sizeof(line), "  %s [%d] ", is_sel ? "▶" : " ", it + 1);
+        int used = utf8_cols(line, (int)strlen(line));
+        int room = sb_w - 1 - used;                 /* 留出右侧 │ 那一列 */
+        if (room < 4) room = 4;
+        const char *nm = g_chooser_items[it].name;
+        int nw = utf8_cols(nm, (int)strlen(nm));
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H%s%s", r, item_style, line);
+        if (nw <= room) {
+            pos += snprintf(out + pos, bs - pos, "%s", nm);
+        } else {
+            char cut[64];
+            int ci = 0, cc = 0;
+            for (int s0 = 0; s0 < (int)sizeof(cut) - 4; s0 = ci) {
+                int adv = 0;
+                unsigned cp = utf8_decode_cp(nm + s0, (int)strlen(nm) - s0, &adv);
+                if (adv <= 0) break;
+                int cw = is_wide_cp(cp) ? 2 : 1;
+                if (cc + cw > room - 3) break;
+                for (int q = 0; q < adv && ci < (int)sizeof(cut) - 4; q++) cut[ci++] = nm[s0 + q];
+                cc += cw;
+            }
+            cut[ci++] = '.'; cut[ci++] = '.'; cut[ci++] = '.'; cut[ci] = 0;
+            pos += snprintf(out + pos, bs - pos, "%s", cut);
+            if (g_tip_n < SETTINGS_TIP_MAX) {
+                SettingsTip *t = &g_tips[g_tip_n++];
+                t->row = r; t->col = used + 1; t->len = used + nw;
+                /* 气泡正文的拷贝必须停在【字符】边界上：snprintf 按字节截断会把半个
+                 * UTF-8 序列留在串尾，渲染时解码成 '?'，框宽也会跟着差一列。 */
+                int nb = 0;
+                int s0 = 0, nmlen = (int)strlen(nm);
+                while (s0 < nmlen) {
+                    int adv = 0;
+                    (void)utf8_decode_cp(nm + s0, nmlen - s0, &adv);
+                    if (adv <= 0 || s0 + adv > nmlen) break;
+                    if (nb + adv >= (int)sizeof(t->full) - 4) break;   /* 留位给「...」 */
+                    for (int q = 0; q < adv; q++) t->full[nb++] = nm[s0 + q];
+                    s0 += adv;
+                }
+                if (s0 < nmlen) { t->full[nb++]='.'; t->full[nb++]='.'; t->full[nb++]='.'; }
+                t->full[nb] = 0;
+            }
+        }
+        pos += snprintf(out + pos, bs - pos, "\x1b[0m");
     }
 
     int add_r = sbg.add;
     if (add_r <= host_rows - 2) {
         int h_add = (g_mouse_y == add_r - 1 && g_mouse_x >= 0 && g_mouse_x < sb_w);
         if (sbg.items_cap < g_chooser_item_count) {
+            /* v2.1.2：这一行不再是「(共N项)」的死提示——滚轮/↑↓ 能把后面的条目滚进
+             * 侧栏窗口，还剩几项由表头的 (a-b/N) 说明，这里回到普通的「添加新条目」。 */
             char addlab[64];
-            snprintf(addlab, sizeof(addlab), "  [+] 添加(共%d项)", g_chooser_item_count);
+            snprintf(addlab, sizeof(addlab), "  [+] 添加新条目");
             settings_line_begin(out, bs, &pos, add_r, 1, sb_w, h_add ? "\x1b[048;2;063;185;080m\x1b[038;2;013;017;023;1m" : "\x1b[038;2;063;185;080;1m");
             settings_line_text(out, bs, &pos, addlab);
             settings_line_end(out, bs, &pos);
@@ -2066,9 +2204,14 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
         int f2_sel = (g_settings_field == 2);
         int f2_hover = (d_f2i > 0 && g_mouse_y + 1 == d_f2i && g_mouse_x >= main_left - 1 && g_mouse_x <= main_left + input_w + 2);
         const char *f2_bg = f2_sel ? "\x1b[048;2;038;060;088m" : (f2_hover ? "\x1b[048;2;033;038;045m" : "\x1b[048;2;022;027;034m");
-        if (d_f2 > 0)
-            pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[038;2;230;237;243;1m3. 启动目录 (Working Directory) \x1b[038;2;139;148;158m[留空为当前目录，支持 %%USERPROFILE%%]:\x1b[0m",
-                            d_f2, main_left);
+        if (d_f2 > 0) {
+            /* v2.1.2：这两行原来是裸 snprintf，一窄就整段越过行尾把下一行/侧栏顶掉
+             * （用户报「[用此项新建标签页时的颜色，默认=蓝]: 这个太窄时没有...提示」）。
+             * 改走 settings_line_* 后：切到行尾补「...」+ 悬停气泡给全文。 */
+            settings_line_begin(out, bs, &pos, d_f2, main_left, host_cols, "\x1b[038;2;230;237;243;1m");
+            settings_line_text(out, bs, &pos, "3. 启动目录 (Working Directory) [留空为当前目录，支持 %USERPROFILE%]:");
+            settings_line_end(out, bs, &pos);
+        }
         if (d_f2i > 0) {
             pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[048;2;033;038;045m│\x1b[0m%s ", d_f2i, main_left, f2_bg);
             render_scrollable_input(out, bs, &pos, g_edit_dir, g_edit_dir_len, g_edit_dir_pos, input_w, f2_bg, NULL);
@@ -2077,10 +2220,11 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
 
         /* v1.8.9: 第 4 个字段 —— 这个菜单项启动出来的标签页默认用什么颜色。 */
         int f3_sel = (g_settings_field == 3);
-        if (d_f3 > 0)
-            pos += snprintf(out + pos, bs - pos,
-                            "\x1b[%d;%dH\x1b[038;2;230;237;243;1m4. 启动默认颜色 (Tab Color) "
-                            "\x1b[038;2;139;148;158m[用此项新建标签页时的颜色，默认=蓝]:\x1b[0m", d_f3, main_left);
+        if (d_f3 > 0) {
+            settings_line_begin(out, bs, &pos, d_f3, main_left, host_cols, "\x1b[038;2;230;237;243;1m");
+            settings_line_text(out, bs, &pos, "4. 启动默认颜色 (Tab Color) [用此项新建标签页时的颜色，默认=蓝]:");
+            settings_line_end(out, bs, &pos);
+        }
         if (d_f3i > 0) {
             g_item_color_max = settings_detail_color_w(host_cols, main_left);
             render_item_color_row(out, bs, &pos, d_f3i, main_left, g_edit_color, f3_sel);
@@ -2091,10 +2235,20 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
         int h_del = (act_r > 0 && g_mouse_y == act_r - 1 && g_mouse_x >= main_left + 37 && g_mouse_x < main_left + 49);
 
         if (act_r > 0) {
-            pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH", act_r, main_left);
-            pos += snprintf(out + pos, bs - pos, "%s [保存并应用此项] \x1b[0m  ", h_apply ? "\x1b[048;2;121;192;255m\x1b[038;2;013;017;023;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;121;192;255;1m");
-            pos += snprintf(out + pos, bs - pos, "%s [从预设库导入] \x1b[0m  ", h_imp ? "\x1b[048;2;031;136;061m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;031;136;061;1m");
-            pos += snprintf(out + pos, bs - pos, "%s [删除此项] \x1b[0m", h_del ? "\x1b[048;2;248;081;073m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;248;081;073;1m");
+            /* 三个按钮：前两枚按剩余宽度整枚丢弃，最后一枚才带「...」——
+             * 裸 snprintf 时它们会跨过行尾把下一行顶掉（v2.1.2 一并修掉）。 */
+            settings_line_begin(out, bs, &pos, act_r, main_left, host_cols, "");
+            settings_line_sgr(out, bs, &pos, h_apply ? "\x1b[048;2;121;192;255m\x1b[038;2;013;017;023;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;121;192;255;1m");
+            settings_line_text_e(out, bs, &pos, " [保存并应用此项] ", 0);
+            settings_line_end(out, bs, &pos);
+            settings_line_begin(out, bs, &pos, act_r, main_left + 19, host_cols,
+                                h_imp ? "\x1b[048;2;031;136;061m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;031;136;061;1m");
+            settings_line_text_e(out, bs, &pos, " [从预设库导入] ", 0);
+            settings_line_end(out, bs, &pos);
+            settings_line_begin(out, bs, &pos, act_r, main_left + 37, host_cols,
+                                h_del ? "\x1b[048;2;248;081;073m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;248;081;073;1m");
+            settings_line_text_e(out, bs, &pos, " [删除此项] ", 0);
+            settings_line_end(out, bs, &pos);
         }
 
         if (d_hint > 0) {
@@ -4531,11 +4685,7 @@ void render_screen(void) {
                 pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[?25h", ptop + 1, ccol);
                 goto cursor_done;
             }
-            int sb_w = SETTINGS_SIDEBAR_W;
-            if (sb_w > g_mux.host_cols / 2) sb_w = g_mux.host_cols / 2;
-            if (sb_w < 15) sb_w = 15;
-            if (sb_w > g_mux.host_cols) sb_w = g_mux.host_cols;
-            if (sb_w < 1) sb_w = 1;
+            int sb_w = settings_host_sidebar_w(g_mux.host_cols);   /* v2.1.2：与画侧栏同一式 */
             int main_left = sb_w + 3;
             if (g_hex_edit_role < 0) {
                 /* v2.0.9：窗格配色页的 hex 框（role 负数编码槽位）。以前这里拿负数去查外观页
@@ -4559,11 +4709,7 @@ void render_screen(void) {
                     pos += snprintf(out + pos, bs - pos, "\x1b[?25l");
             }
         } else if (g_settings_nav >= 1 && g_settings_nav <= g_chooser_item_count && !g_settings_show_presets) {
-            int sb_w = SETTINGS_SIDEBAR_W;
-            if (sb_w > g_mux.host_cols / 2) sb_w = g_mux.host_cols / 2;
-            if (sb_w < 15) sb_w = 15;
-            if (sb_w > g_mux.host_cols) sb_w = g_mux.host_cols;
-            if (sb_w < 1) sb_w = 1;
+            int sb_w = settings_host_sidebar_w(g_mux.host_cols);   /* v2.1.2：与画侧栏同一式 */
             int main_left = sb_w + 3;
             int right_max_w = g_mux.host_cols - main_left - 2;
             if (right_max_w < 10) right_max_w = 10;

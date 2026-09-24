@@ -29,6 +29,7 @@ int g_settings_pane_scheme = 0;
 int g_settings_show_pane_schemes = 0;
 int g_settings_pane_scroll = 0;
 int g_settings_appear_scroll = 0;
+int g_settings_sidebar_scroll = 0;   /* v2.1.2：侧栏菜单项列表滚动量（不写进 ini） */
 int g_settings_behavior_scroll = 0;
 int g_settings_detail_scroll = 0;
 int g_settings_startup_scroll = 0;
@@ -60,7 +61,7 @@ int settings_nav_index_of(int nav) {
     return 0;
 }
 
-char g_edit_name[32] = {0};
+char g_edit_name[sizeof(g_chooser_items[0].name)] = {0};
 int g_edit_name_len = 0, g_edit_name_pos = 0;
 char g_edit_cmd[256] = {0};
 int g_edit_cmd_len = 0, g_edit_cmd_pos = 0;

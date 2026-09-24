@@ -2064,11 +2064,7 @@ static void handle_settings_appearance_key(WORD vk, WCHAR uc, BOOL is_ctrl) {
 /* v2.0.7：窗格配色页键盘。排布见 render.c 的 g_pane_order（两列各 9 行）。 */
 static void handle_settings_pane_key(WORD vk, WCHAR uc, BOOL is_ctrl) {
     if (vk == VK_ESCAPE) { settings_leave_subpage(); return; }
-    int sb_w = SETTINGS_SIDEBAR_W;
-    if (sb_w > g_mux.host_cols / 2) sb_w = g_mux.host_cols / 2;
-    if (sb_w < 15) sb_w = 15;
-    if (sb_w > g_mux.host_cols) sb_w = g_mux.host_cols;
-    if (sb_w < 1) sb_w = 1;
+    int sb_w = settings_host_sidebar_w(g_mux.host_cols);   /* v2.1.2：与画侧栏同一式 */
     int main_left = sb_w + 3;
     int rows = settings_pane_rows_per_col(g_mux.host_cols, main_left);   /* 单列时 = 20 */
     /* 方案行（g_settings_pane_sel == -1）：←/→ 换方案，Enter 应用，↓ 进槽位表 */
@@ -2399,6 +2395,14 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
             g_mux.needs_redraw = 1;
             return;
         }
+        /* v2.1.2：侧栏菜单项列表的窗口 —— PgUp/PgDn（无滚轮的终端也能用）。 */
+        if (vk == VK_PRIOR || vk == VK_NEXT) {
+            int step = 3;
+            g_settings_sidebar_scroll += (vk == VK_NEXT ? step : -step);
+            settings_sidebar_clamp_sel(g_mux.host_rows, g_chooser_item_count);
+            g_mux.needs_redraw = 1;
+            return;
+        }
 
         if (vk == VK_RETURN || uc == 'e' || uc == 'E') {
             int i = g_settings_table_sel;
@@ -2522,7 +2526,7 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
         int *pos = NULL;
         int max_len = 0;
         if (g_settings_field == 0) {
-            buf = g_edit_name; len = &g_edit_name_len; pos = &g_edit_name_pos; max_len = 31;
+            buf = g_edit_name; len = &g_edit_name_len; pos = &g_edit_name_pos; max_len = (int)sizeof(g_edit_name) - 1;
         } else if (g_settings_field == 1) {
             buf = g_edit_cmd; len = &g_edit_cmd_len; pos = &g_edit_cmd_pos; max_len = 255;
         } else if (g_settings_field == 2) {
@@ -2603,6 +2607,9 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
 
 void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
     int mx = me->dwMousePosition.X, my = me->dwMousePosition.Y;
+    int host_rows = g_mux.host_rows;
+    int host_cols = g_mux.host_cols;
+/* v2.1.2：见上，侧栏宽度这里不再需要（滚轮不再按左右半屏区分）。 */
     int press = (me->dwButtonState & (FROM_LEFT_1ST_BUTTON_PRESSED | FROM_LEFT_2ND_BUTTON_PRESSED | RIGHTMOST_BUTTON_PRESSED)) != 0;
     /* v2.1.1：滚轮（dwEventFlags = MOUSE_WHEELED，增量在 dwButtonState 高位）——
      * 用户报「终端过矮时，设置右边窗格无法滚轮滚动」：旧代码第一件事就是
@@ -2620,18 +2627,21 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             }
             g_hex_edit_role = -1;
         }
+        /* v2.1.2：「启动」页（nav==0）的滚轮滚的是侧栏菜单项列表的窗口 —— 这一页右侧
+         * 是「默认启动项 + 菜单项管理表」，用户报的「导航选项要可以滚动，而不是省略成
+         * 添加(共N项)」就在这儿；指针在侧栏还是右侧都算（右侧那半屏本来就跟着整页走）。 */
+        if (g_settings_nav == SETTINGS_NAV_STARTUP) {
+            int dir = (d > 0) ? -1 : 1;
+            g_settings_sidebar_scroll += dir * 3;
+            g_mux.needs_redraw = 1;
+            return;
+        }
         settings_wheel_scroll(d);
         return;
     }
     if (!press || (me->dwEventFlags != 0 && me->dwEventFlags != DOUBLE_CLICK)) return;
 
-    int host_rows = g_mux.host_rows;
-    int host_cols = g_mux.host_cols;
-    int sb_w = SETTINGS_SIDEBAR_W;
-    if (sb_w > host_cols / 2) sb_w = host_cols / 2;
-    if (sb_w < 15) sb_w = 15;
-    if (sb_w > host_cols) sb_w = host_cols;
-    if (sb_w < 1) sb_w = 1;
+    int sb_w = settings_host_sidebar_w(host_cols);      /* v2.1.2：与渲染共用同一式 */
     int main_left = sb_w + 3;
     int right_max_w = host_cols - main_left - 2;
     if (right_max_w < 10) right_max_w = 10;
@@ -2706,13 +2716,14 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             g_mux.needs_redraw = 1;
             return;
         }
-        for (int i = 0; i < g_chooser_item_count && i < sbg.items_cap; i++) {
-            if (r == sbg.items_row0 + i) {
-                g_settings_nav = i + 1;
-                load_item_to_editor(i);
-                g_mux.needs_redraw = 1;
-                return;
-            }
+        for (int i = 0; i < sbg.items_cap; i++) {          /* v2.1.2：命中按「窗口内第 i 行」反查 */
+            if (r != sbg.items_row0 + i) continue;
+            int it = sbg.items_scroll + i;
+            if (it < 0 || it >= g_chooser_item_count) return;
+            g_settings_nav = it + 1;
+            load_item_to_editor(it);
+            g_mux.needs_redraw = 1;
+            return;
         }
         if (r == sbg.add) {
             if (g_chooser_item_count < MAX_CHOOSER_ITEMS) {

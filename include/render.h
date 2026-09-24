@@ -192,8 +192,18 @@ typedef struct {
     int items_row0, items_cap, add, presets;   /* presets = 0 表示隐藏 */
     int app, keys, beh, pane, save;
     int compact, hide_presets;
+    int items_scroll;                          /* v2.1.2：菜单项列表滚动量（已夹好） */
 } SettingsSidebarGeom;
 void settings_sidebar_geom(int host_rows, int item_count, SettingsSidebarGeom *g);
+/* v2.1.2：只问「这一屏侧栏能放几行菜单项」。 */
+int  settings_sidebar_geom_cap(int host_rows, int item_count);
+/* v2.1.2：把侧栏窗口夹到「选中项可见」。只在选中项变化时调用（不能每帧调，
+ * 否则滚轮被拽回原位）。 */
+void settings_sidebar_clamp_sel(int host_rows, int item_count);
+/* v2.1.2：侧栏列表当前该被看见的行（0 = 无）。渲染夹窗口时用。 */
+int  settings_sidebar_sel_natural(void);
+/* v2.1.2：侧栏宽度单一来源（渲染 / 命中 / 光标都调它，窄终端下不再各算一套）。 */
+int  settings_host_sidebar_w(int host_cols);
 int settings_theme_row(int idx);
 int settings_role_row(int role);
 int settings_role_col(int main_left, int role);

@@ -148,7 +148,9 @@ typedef struct {
 } Pane;
 
 typedef struct {
-    char name[32];
+    /* v2.1.2：32 字节只放得下 10 个汉字，菜单项名字稍长就被从中间切断——不仅显示截断，
+     * 悬停气泡里也是断的（snprintf 按字节截，尾巴还会留半个 UTF-8 序列变成 '?'）。 */
+    char name[64];
     char cmd[256];
     char workdir[256];
     int color;          /* 启动默认标签颜色：0 = 跟随默认(蓝)，1-8 = 指定色 */
