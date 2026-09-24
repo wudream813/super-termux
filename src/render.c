@@ -4591,7 +4591,7 @@ void render_screen(void) {
         } else {
             pos += snprintf(out + pos, bs - pos, "\x1b[?25l");
         }
-    cursor_done:
+    cursor_done: ;   /* v2.1.1：clang 不许「标签是复合语句末项」（C23 扩展），补一条空语句 */
     } else if (g_mux.chooser_mode || g_mux.ctx_mode || g_mux.help_mode) {
         pos += snprintf(out + pos, bs - pos, "\x1b[?25l");
     } else if (g_mux.active_pane >= 0 && g_mux.active_pane < g_mux.pane_count && g_mux.panes[g_mux.active_pane].active) {
