@@ -2604,6 +2604,25 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
 void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
     int mx = me->dwMousePosition.X, my = me->dwMousePosition.Y;
     int press = (me->dwButtonState & (FROM_LEFT_1ST_BUTTON_PRESSED | FROM_LEFT_2ND_BUTTON_PRESSED | RIGHTMOST_BUTTON_PRESSED)) != 0;
+    /* v2.1.1：滚轮（dwEventFlags = MOUSE_WHEELED，增量在 dwButtonState 高位）——
+     * 用户报「终端过矮时，设置右边窗格无法滚轮滚动」：旧代码第一件事就是
+     * 「不是按下就 return」，滚轮事件整个被丢掉。滚轮滚的是当前页的滚动量，
+     * 所以指针在侧栏还是右侧区都算（右侧区是主目标）。 */
+    if (me->dwEventFlags == MOUSE_WHEELED || me->dwEventFlags == MOUSE_HWHEELED) {
+        int d = (short)HIWORD(me->dwButtonState);
+        if (g_key_capture_active) return;             /* 录键时不滚页 */
+        if (g_hex_edit_active) {                      /* 编辑中滚轮 = 先收下当前值再滚 */
+            g_hex_edit_active = 0;
+            if (g_hex_edit_len == 6) {
+                if (g_hex_edit_role >= 0) theme_set_role_hex(theme_role_name(g_hex_edit_role), g_hex_edit_buf);
+                else theme_set_pane_hex(theme_pane_slot_name(-g_hex_edit_role - 1), g_hex_edit_buf);
+                save_config();
+            }
+            g_hex_edit_role = -1;
+        }
+        settings_wheel_scroll(d);
+        return;
+    }
     if (!press || (me->dwEventFlags != 0 && me->dwEventFlags != DOUBLE_CLICK)) return;
 
     int host_rows = g_mux.host_rows;
@@ -2946,6 +2965,8 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                 return;
             }
             if (nat == 15) {   /* v1.8.9: 启动默认颜色选择条 */
+                /* v2.1.1：窄终端只画了前几格，命中也用同一个上限（越界 = 点不到） */
+                g_item_color_max = settings_detail_color_w(host_cols, main_left);
                 int hit = item_color_hit(main_left, c);
                 if (hit >= 0) {
                     g_settings_field = 3;

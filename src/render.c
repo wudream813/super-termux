@@ -359,22 +359,48 @@ void render_ctx_menu(char *out, int bs, int *posp, int host_rows, int host_cols)
 /* ---------------------------------------------------------------------------
  * v1.8.9: 菜单项的「启动默认颜色」选择条
  * 第 0 格「默认」宽 6，其后 8 个色块每格宽 3，格子相连。渲染与命中同源。
+ * v2.1.1：整条宽 30，窄终端的右侧区域放不下时，后几格会被裁到屏幕外、鼠标也点不到
+ * （用户报「过窄时，颜色编辑被截断」）。改成按可用宽度决定画几格，命中用同一个数。
  * ------------------------------------------------------------------------- */
+int g_item_color_max = 8;      /* 本帧实际画出的色块格数（1..8），命中判定共用 */
+
 int item_color_hit(int left, int col) {
     int off = col - left;
-    if (off < 0 || off >= ITEM_COLOR_ROW_W) return -1;
+    int roww = ITEM_COLOR_DEFAULT_W + g_item_color_max * ITEM_COLOR_SWATCH_W;
+    if (off < 0 || off >= roww) return -1;
     if (off < ITEM_COLOR_DEFAULT_W) return 0;
-    return 1 + (off - ITEM_COLOR_DEFAULT_W) / ITEM_COLOR_SWATCH_W;
+    int idx = 1 + (off - ITEM_COLOR_DEFAULT_W) / ITEM_COLOR_SWATCH_W;
+    return (idx <= g_item_color_max) ? idx : -1;
+}
+
+/* 右侧区域放得下多少格（渲染与 input 命中同源）。
+ * 画不满 8 格时要给行尾的「+N」留 2 列，否则它会被 ?7l 截掉，用户就不知道
+ * 还有剩余色块可取。 */
+int settings_detail_color_w(int host_cols, int main_left) {
+    int avail = host_cols - main_left + 1;
+    int n = (avail - ITEM_COLOR_DEFAULT_W) / ITEM_COLOR_SWATCH_W;
+    if (n < 8) n = (avail - ITEM_COLOR_DEFAULT_W - 2) / ITEM_COLOR_SWATCH_W;
+    if (n > 8) n = 8;
+    if (n < 1) n = 1;
+    return n;
 }
 
 void render_item_color_row(char *out, int bs, int *posp, int row, int left, int color, int focused) {
+    render_item_color_row_w(out, bs, posp, row, left, color, focused, g_mux.host_cols);
+}
+
+/* v2.1.1：行尾还能剩几列（host_cols）决定要不要打「+N」/提示；独立可测（不藏全局）。 */
+void render_item_color_row_w(char *out, int bs, int *posp, int row, int left, int color, int focused,
+                             int host_cols) {
     int pos = *posp;
     if (color < 0 || color > 8) color = 0;
     int hover = -1;
     if (g_mouse_y + 1 == row) hover = item_color_hit(left, g_mouse_x + 1);
 
     pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH", row, left);
-    for (int i = 0; i <= 8; i++) {
+    if (g_item_color_max < 1) g_item_color_max = 1;
+    if (g_item_color_max > 8) g_item_color_max = 8;
+    for (int i = 0; i <= g_item_color_max; i++) {
         int sel = (i == color);
         int hot = (i == hover);
         const char *bg;
@@ -390,10 +416,21 @@ void render_item_color_row(char *out, int bs, int *posp, int row, int left, int 
         pos += snprintf(out + pos, bs - pos, "%s%s%c%d%c\x1b[0m", bg, fg,
                         sel ? '[' : ' ', i, sel ? ']' : ' ');
     }
-    /* 焦点在这一行时给个箭头，键盘用户才知道 ←/→ 会作用到哪里。 */
-    pos += snprintf(out + pos, bs - pos, "  %s%s\x1b[0m",
-                    focused ? "\x1b[038;2;121;192;255;1m" : "\x1b[038;2;110;118;129m",
-                    focused ? "左右键选颜色" : "            ");
+    /* 焦点在这一行时给个箭头，键盘用户才知道 ←/→ 会作用到哪里。
+     * 窄到只画了几格时给「+N」：剩下的色块用方向键/数字键仍可取。 */
+    {
+        int used = ITEM_COLOR_DEFAULT_W + g_item_color_max * ITEM_COLOR_SWATCH_W;
+        int room = host_cols - (left + used) + 1;        /* 行尾还剩几列 */
+        int cut = (g_item_color_max < 8);                 /* 有色块没画出来 */
+        const char *tail;
+        /* 有色块没画出来 ⇒ 行尾必须留个「+N」（贴着屏幕边也要写，宁可挤掉别的提示）；
+         * 放得下时提示与占位串等宽（14 列），保证整条行宽不随选中格变化。 */
+        if (cut) tail = (room >= 14) ? (focused ? "+N 左右键取剩余" : "     +N    ") : "+N";
+        else if (room >= 14) tail = focused ? "左右键选颜色" : "            ";
+        else tail = "";
+        pos += snprintf(out + pos, bs - pos, "  %s%s\x1b[0m",
+                        focused ? "\x1b[038;2;121;192;255;1m" : "\x1b[038;2;110;118;129m", tail);
+    }
     *posp = pos;
 }
 
@@ -647,6 +684,23 @@ void settings_scroll_mark(char *out, int bs, int *posp, int row, int right_col,
     pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[038;2;110;118;129m%s\x1b[0m",
                     row, right_col - tl + 1, tag);
     *posp = pos;
+}
+
+/* ---- v2.1.1：十六进制颜色编辑浮层（几何在文件后段，画框需要 append_swatch 等）----
+ * 用户反馈「过窄时，颜色编辑被截断」：编辑框原先嵌在表行里，值段起点是
+ * col + SETTINGS_PANE_VALUE_OFF - 1（窗格页）或 role_col + 21（外观页右列），
+ * 终端一窄就整段跑到屏幕外——看不见色块，也看不见自己敲到哪一位。
+ * 改成居中浮层：色块 + 完整 6 位 + 提示，宽度按需收缩，任何尺寸都不截断。 */
+void hex_edit_popup_geom(int host_rows, int host_cols, int *top, int *left, int *w, int *h);
+static int hex_edit_popup_w(int host_cols);
+static int settings_host_sidebar_w(int host_cols);
+
+/* 浮层是否会盖在这一行上：会 ⇒ 表行不再重复画编辑框（避免同一个值出现两份）。
+ * 另一个浮层（预设 / 方案列表）打开时 hex 编辑其实已被打断，此时仍画表行内的框。 */
+static int hex_edit_popup_shown(int host_rows, int host_cols) {
+    if (!g_hex_edit_active || g_settings_show_presets || g_settings_show_pane_schemes) return 0;
+    if (hex_edit_popup_w(host_cols) < HEX_EDIT_POPUP_MIN || host_rows < 3) return 0;
+    return 1;
 }
 
 /* 提示行右端的位置指示：仅当本页确实需要滚动时画。 */
@@ -1015,7 +1069,9 @@ static void render_settings_appearance(char *out, int bs, int *posp, int host_ro
                         row, col, settings_row_style(selected, hovered), theme_role_name(role));
         append_swatch(out, bs, &pos, r, g, b);
 
-        if (g_hex_edit_active && g_hex_edit_role == role) {
+        if (g_hex_edit_active && g_hex_edit_role == role && hex_edit_popup_shown(host_rows, host_cols)) {
+            /* v2.1.1：编辑框交给浮层（窄终端上这一行放不下值段，画出来也是被裁的） */
+        } else if (g_hex_edit_active && g_hex_edit_role == role) {
             char shown[16];
             snprintf(shown, sizeof(shown), "#%s", g_hex_edit_buf);
             pos += snprintf(out + pos, bs - pos, " \x1b[048;2;038;060;088m\x1b[038;2;255;255;255;1m%-8s\x1b[0m", shown);
@@ -1163,6 +1219,215 @@ void render_pane_scheme_picker(char *out, int bs, int *posp, int host_rows, int 
     *posp = pos;
 }
 
+/* ---- v2.1.1：十六进制编辑浮层 --------------------------------------------
+ * 只画「色块 + 完整 6 位 + 提示」三行，宽度按需收缩到终端宽；表行此时不重复画框。
+ * 因为框宽 = min(需要, 终端宽) 且值段固定排在左 + 6，任何宽度下都不会截断。 */
+#define HEX_EDIT_POPUP_W 50
+/* 侧栏宽度（与 render_settings_panel / handle_settings_mouse 同式）：浮层必须整体
+ * 待在右侧正文区里，否则会切掉侧栏菜单（分隔线在 sb_w + 2）。 */
+static int settings_host_sidebar_w(int host_cols) {
+    int sb_w = SETTINGS_SIDEBAR_W;
+    if (sb_w > host_cols / 2) sb_w = host_cols / 2;
+    if (sb_w < 15) sb_w = 15;
+    if (sb_w > host_cols) sb_w = host_cols;
+    if (sb_w < 1) sb_w = 1;
+    return sb_w;
+}
+
+void hex_edit_popup_geom(int host_rows, int host_cols, int *top, int *left, int *w, int *h) {
+    int ml = settings_host_sidebar_w(host_cols) + 3;      /* 正文起点 */
+    int pw = hex_edit_popup_w(host_cols);
+    if (pw < 1) pw = HEX_EDIT_POPUP_MIN;
+    if (pw > host_cols) pw = host_cols;
+    int ph = 3;
+    if (ph > host_rows) ph = host_rows;
+    int t = host_rows / 3;                    /* 上 1/3：盖住表头，不压正在编辑的行 */
+    if (t < 1) t = 1;
+    if (t + ph - 1 > host_rows) t = host_rows - ph + 1;
+    if (t < 1) t = 1;
+    int content = host_cols - ml + 1;
+    int l = ml + (content - pw) / 2;
+    if (l < ml) l = ml;
+    if (l < 1) l = 1;
+    if (pw > content && l > host_cols - pw + 1) l = host_cols - pw + 1;   /* 贴右墙 */
+    if (l < 1) l = 1;
+    if (l + pw > host_cols + 1) l = host_cols + 1 - pw;
+    if (l < 1) l = 1;
+    if (top) *top = t;
+    if (left) *left = l;
+    if (w) *w = pw;
+    if (h) *h = ph;
+}
+
+static int hex_edit_popup_w(int host_cols) {
+    int ml = settings_host_sidebar_w(host_cols) + 3;
+    int pw = HEX_EDIT_POPUP_W;
+    int content = host_cols - ml + 1;
+    if (pw > content) pw = content;
+    if (pw >= HEX_EDIT_POPUP_MIN) return pw;
+    /* 正文区装不下：改成贴右墙画（可以越过分隔线盖住侧栏——和方案列表浮层一样），
+     * 因为「看得见完整 6 位」比「侧栏此刻少两行菜单」重要得多。 */
+    pw = host_cols - 1;
+    if (pw > HEX_EDIT_POPUP_W) pw = HEX_EDIT_POPUP_W;
+    if (pw < HEX_EDIT_POPUP_MIN) return 0;   /* 连 8 位值都放不下：退回表行内联 */
+    return pw;
+}
+
+void render_hex_edit_popup(char *out, int bs, int *posp, int host_rows, int host_cols) {
+    int pos = *posp;
+    if (host_rows < 3 || hex_edit_popup_w(host_cols) < HEX_EDIT_POPUP_MIN) return;  /* 退回内联 */
+    int top, left, pw, ph;
+    hex_edit_popup_geom(host_rows, host_cols, &top, &left, &pw, &ph);
+    /* 只补「框左边到页面正文起点」这一段，右侧什么都不写：
+     *  · framediff 是按行 diff 的，右侧上一帧的残字会由页面自己那一段重画（提示行
+     *    本来就裁到行尾），不会像只画框那样在右边界外冒出半个边框；
+     *  · 左侧必须补，否则框左沿会把侧栏文字切掉一截。 */
+    /* 只补「正文起点 → 框左沿」的空隙（正文比框宽时才有）；
+     * 框已经贴到左侧（正文区太窄）时整行重写，此时侧栏让位给颜色编辑。 */
+    int fill_from = (left <= settings_host_sidebar_w(host_cols) + 2)
+                        ? 1 : settings_host_sidebar_w(host_cols) + 3;
+    if (fill_from < 1) fill_from = 1;
+    if (fill_from > left - 1) fill_from = left;
+    #define HEX_POPUP_FILL(rr)                                                          \
+        do {                                                                            \
+            if (fill_from < left) {                                                     \
+                pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[0m\x1b[048;2;022;027;034m", (rr), fill_from); \
+                for (int k = fill_from; k < left && pos < bs - 8; k++) out[pos++] = ' '; \
+            }                                                                           \
+            pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH", (rr), left);            \
+        } while (0)
+    int r, g, b;
+    char shown[16];
+    snprintf(shown, sizeof(shown), "#%s", g_hex_edit_buf);
+    if (g_hex_edit_role >= 0) theme_role_rgb(g_hex_edit_role, &r, &g, &b);
+    else if (!theme_pane_rgb(-g_hex_edit_role - 1, &r, &g, &b))
+        theme_pane_fallback_rgb(-g_hex_edit_role - 1, &r, &g, &b);
+    const char *label = (g_hex_edit_role >= 0) ? theme_role_name(g_hex_edit_role)
+                                               : theme_pane_slot_label(-g_hex_edit_role - 1);
+    const char *BG = "\x1b[048;2;022;027;034m";
+    const char *BD = "\x1b[048;2;033;038;045m";
+
+    char hdr[128];
+    int hcols;
+    int n = snprintf(hdr, sizeof(hdr), "┌─ 颜色编辑: %s ", label);
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(hdr) - 1) n = (int)sizeof(hdr) - 1;
+    hcols = utf8_cols(hdr, n);
+    HEX_POPUP_FILL(top);
+    pos += snprintf(out + pos, bs - pos, "\x1b[038;2;255;255;255m\x1b[048;2;031;136;061;1m%s", hdr);
+    while (hcols < pw - 1 && pos < bs - 8) { out[pos++] = '\xe2'; out[pos++] = '\x94'; out[pos++] = '\x80'; hcols++; }
+    pos += snprintf(out + pos, bs - pos, "┐\x1b[0m");
+
+    /* 值段：│ + 两空格 + 色块 2 + 空格 + 8 位（'#' + 6 位，光标停在第 7/8 位） */
+    int cols = 1;
+    HEX_POPUP_FILL(top + 1);
+    pos += snprintf(out + pos, bs - pos, "%s\x1b[0m%s  ", BD, BG);
+    append_swatch(out, bs, &pos, r, g, b);
+    cols += 1 + 2;
+    pos += snprintf(out + pos, bs - pos,
+                    "\x1b[0m \x1b[048;2;038;060;088m\x1b[038;2;255;255;255;1m%-8s\x1b[0m%s", shown, BG);
+    cols += 1 + 8;
+    {
+        const char *hint = "输入 6 位 · Enter 确认 · Esc 取消";
+        int hw = utf8_cols(hint, (int)strlen(hint));
+        if (pw - cols - 2 >= hw) {          /* 放不下就整段不写（宁可空着也不切一半） */
+            pos += snprintf(out + pos, bs - pos, "\x1b[038;2;139;148;158m   %s\x1b[0m%s", hint, BG);
+            cols += 3 + hw;
+        }
+    }
+    pad_to_right_border(out, bs, &pos, &cols, pw);
+
+    cols = 1;
+    HEX_POPUP_FILL(top + 2);
+    pos += snprintf(out + pos, bs - pos, "%s\x1b[0m%s", BD, BG);
+    while (cols < pw - 1 && pos < bs - 8) { out[pos++] = '\xe2'; out[pos++] = '\x94'; out[pos++] = '\x80'; cols++; }
+    pos += snprintf(out + pos, bs - pos, "┘\x1b[0m");
+    *posp = pos;
+    #undef HEX_POPUP_FILL
+}
+
+/* ---- v2.1.1：滚轮滚动设置页右侧内容 --------------------------------------
+ * 用户反馈「终端过矮时，设置右边窗格无法滚轮滚动」：设置面板的鼠标处理函数开头
+ * 只认「按下」事件，滚轮整个被丢掉；矮终端里超出可见带的行只能靠 ↑/↓ 挪选中项
+ * 才看得到。这里按当前页把滚轮翻成「选中项移动 + 页面跟着走」（与调色板浮层里
+ * 滚轮的既有手感一致）；滚动量用的就是渲染/命中那一套 *scroll，天然同源。 */
+void settings_wheel_scroll(int delta) {
+    int dir = (delta > 0) ? -1 : 1;     /* 向上滚 = 看更早的内容 */
+    int step = 3;
+    if (g_settings_show_pane_schemes) {
+        int nn = theme_pane_scheme_count();
+        if (nn > 0)
+            g_settings_pane_scheme = (g_settings_pane_scheme + (dir > 0 ? 1 : nn - 1)) % nn;
+        g_mux.needs_redraw = 1;
+        return;
+    }
+    if (g_settings_show_presets) {
+        if (g_preset_count > 0)
+            g_preset_sel = (g_preset_sel + (dir > 0 ? 1 : g_preset_count - 1)) % g_preset_count;
+        g_mux.needs_redraw = 1;
+        return;
+    }
+    if (g_settings_nav == SETTINGS_NAV_APPEARANCE) {
+        int total = theme_count() + TH_ROLE_COUNT;
+        if (g_settings_theme_sel < 0) g_settings_theme_sel = 0;
+        if (dir > 0) { if (g_settings_theme_sel < total - 1) g_settings_theme_sel++; }
+        else if (g_settings_theme_sel > 0) g_settings_theme_sel--;
+        int vis = g_mux.host_rows - SETTINGS_THEME_ROW0;
+        if (vis < 1) vis = 1;
+        g_settings_appear_scroll += (dir > 0 ? step : -step);
+        if (g_settings_appear_scroll > total - vis) g_settings_appear_scroll = total - vis;
+        if (g_settings_appear_scroll < 0) g_settings_appear_scroll = 0;
+    } else if (g_settings_nav == SETTINGS_NAV_BEHAVIOR) {
+        int total = SETTINGS_BEHAVIOR_TOGGLES;
+        if (g_settings_behavior_sel < 0) g_settings_behavior_sel = 0;
+        if (dir > 0) { if (g_settings_behavior_sel < total) g_settings_behavior_sel++; }
+        else if (g_settings_behavior_sel > 0) g_settings_behavior_sel--;
+        int vis = g_mux.host_rows - SETTINGS_BEHAVIOR_ROW0;
+        if (vis < 1) vis = 1;
+        g_settings_behavior_scroll += (dir > 0 ? step : -step);
+        if (g_settings_behavior_scroll > total + 2 - vis) g_settings_behavior_scroll = total + 2 - vis;
+        if (g_settings_behavior_scroll < 0) g_settings_behavior_scroll = 0;
+    } else if (g_settings_nav == SETTINGS_NAV_KEYS) {
+        int total = settings_keys_rows();
+        if (g_settings_keys_sel < 0) g_settings_keys_sel = 0;
+        if (dir > 0) { if (g_settings_keys_sel < total - 1) g_settings_keys_sel++; }
+        else if (g_settings_keys_sel > 0) g_settings_keys_sel--;
+        g_settings_keys_scroll += (dir > 0 ? step : -step);
+        if (g_settings_keys_scroll > total - 1) g_settings_keys_scroll = total - 1;
+        if (g_settings_keys_scroll < 0) g_settings_keys_scroll = 0;
+    } else if (g_settings_nav == SETTINGS_NAV_PANE) {
+        if (g_settings_pane_sel < -1) g_settings_pane_sel = -1;
+        if (g_settings_pane_sel >= THEME_PANE_SLOTS) g_settings_pane_sel = THEME_PANE_SLOTS - 1;
+        if (dir > 0) { if (g_settings_pane_sel < THEME_PANE_SLOTS - 1) g_settings_pane_sel++; }
+        else if (g_settings_pane_sel > -1) g_settings_pane_sel--;
+        int vis = settings_pane_visible_rows(g_mux.host_rows, g_mux.host_cols, 0);
+        g_settings_pane_scroll += (dir > 0 ? step : -step);
+        if (g_settings_pane_scroll > THEME_PANE_SLOTS - vis)
+            g_settings_pane_scroll = THEME_PANE_SLOTS - vis;
+        if (g_settings_pane_scroll < 0) g_settings_pane_scroll = 0;
+    } else if (g_settings_nav == 0) {
+        if (g_settings_table_sel < 0) g_settings_table_sel = 0;
+        if (dir > 0) { if (g_settings_table_sel < g_chooser_item_count - 1) g_settings_table_sel++; }
+        else if (g_settings_table_sel > 0) g_settings_table_sel--;
+        g_settings_startup_scroll += (dir > 0 ? step : -step);
+        if (g_settings_startup_scroll < 0) g_settings_startup_scroll = 0;
+        int mx = settings_startup_last(g_mux.host_rows) - 3 - (g_mux.host_rows - 3);
+        if (mx < 0) mx = 0;
+        if (g_settings_startup_scroll > mx) g_settings_startup_scroll = mx;
+    } else {
+        int f = (g_settings_field < 0) ? 0 : g_settings_field;
+        f = (f + (dir > 0 ? 1 : 3)) % 4;
+        g_settings_field = f;
+        g_settings_detail_scroll += (dir > 0 ? step : -step);
+        if (g_settings_detail_scroll < 0) g_settings_detail_scroll = 0;
+        int mx = (SETTINGS_DETAIL_LAST - SETTINGS_DETAIL_FIRST + 1)
+                 - (g_mux.host_rows - SETTINGS_DETAIL_FIRST + 1);
+        if (mx < 0) mx = 0;
+        if (g_settings_detail_scroll > mx) g_settings_detail_scroll = mx;
+    }
+    g_mux.needs_redraw = 1;
+}
+
 static void render_settings_pane(char *out, int bs, int *posp, int host_rows, int host_cols, int main_left) {
     int pos = *posp;
     int avail = host_cols - main_left + 1;           /* 右侧可用列数 */
@@ -1210,7 +1475,9 @@ static void render_settings_pane(char *out, int bs, int *posp, int host_rows, in
         append_swatch(out, bs, &pos, r, g, b);
         int val_avail = item_avail - SETTINGS_PANE_VALUE_OFF;
         settings_tip_arm(row, col + SETTINGS_PANE_VALUE_OFF - 1);
-        if (g_hex_edit_active && g_hex_edit_role == -(slot + 1)) {
+        if (g_hex_edit_active && g_hex_edit_role == -(slot + 1) && hex_edit_popup_shown(host_rows, host_cols)) {
+            /* v2.1.1：编辑框在浮层里（窄终端上这一行的值段会被裁到屏幕外） */
+        } else if (g_hex_edit_active && g_hex_edit_role == -(slot + 1)) {
             char shown[16];
             snprintf(shown, sizeof(shown), "#%s", g_hex_edit_buf);
             pos += snprintf(out + pos, bs - pos, " \x1b[048;2;038;060;088m\x1b[038;2;255;255;255;1m");
@@ -1814,8 +2081,10 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
             pos += snprintf(out + pos, bs - pos,
                             "\x1b[%d;%dH\x1b[038;2;230;237;243;1m4. 启动默认颜色 (Tab Color) "
                             "\x1b[038;2;139;148;158m[用此项新建标签页时的颜色，默认=蓝]:\x1b[0m", d_f3, main_left);
-        if (d_f3i > 0)
+        if (d_f3i > 0) {
+            g_item_color_max = settings_detail_color_w(host_cols, main_left);
             render_item_color_row(out, bs, &pos, d_f3i, main_left, g_edit_color, f3_sel);
+        }
 
         int h_apply = (act_r > 0 && g_mouse_y == act_r - 1 && g_mouse_x >= main_left - 1 && g_mouse_x < main_left + 17);
         int h_imp = (act_r > 0 && g_mouse_y == act_r - 1 && g_mouse_x >= main_left + 19 && g_mouse_x < main_left + 35);
@@ -1843,6 +2112,9 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
     if (g_settings_show_pane_schemes) {
         render_pane_scheme_picker(out, bs, &pos, host_rows, host_cols);
     }
+    /* v2.1.1：十六进制编辑浮层最后画（盖在页面上），保证编辑内容任何宽度都完整可见 */
+    if (hex_edit_popup_shown(host_rows, host_cols))
+        render_hex_edit_popup(out, bs, &pos, host_rows, host_cols);
     render_settings_tooltip(out, bs, &pos, host_rows, host_cols);
 
     *posp = pos;
@@ -2653,6 +2925,13 @@ static void render_palette_editor(char *out, int bs, int *posp, int host_rows, i
         int fill = pw - 2;
         for (int k = 0; k < fill && pos < bs - 8; k++) out[pos++] = ' ';
         pos += snprintf(out + pos, bs - pos, "\x1b[0m\x1b[048;2;033;038;045m│\x1b[0m");
+        /* 浮层里也按宽度限格（v2.1.1）：极窄时别把色块条画到框外 */
+        {
+            int pc = (pw - 2 - ITEM_COLOR_DEFAULT_W) / ITEM_COLOR_SWATCH_W;
+            if (pc > 8) pc = 8;
+            if (pc < 1) pc = 1;
+            g_item_color_max = pc;
+        }
         render_item_color_row(out, bs, &pos, color_row, left + 1, g_edit_color, g_mux.palette_field == 3);
     }
 
@@ -4241,6 +4520,17 @@ void render_screen(void) {
          * 外观 / 键位 / 行为页没有输入框，必须把光标藏起来，
          * 否则会留下一个位置错乱的闪烁光标。 */
         if (g_hex_edit_active && !g_settings_show_presets) {
+            if (hex_edit_popup_shown(g_mux.host_rows, g_mux.host_cols)) {
+                /* v2.1.1：编辑框在浮层里 ⇒ 光标也落在浮层的值段上（窄终端上表行里的
+                 * 值段本来就被裁出屏幕，光标跟过去等于看不见）。 */
+                int ptop, pleft, pw, ph;
+                hex_edit_popup_geom(g_mux.host_rows, g_mux.host_cols, &ptop, &pleft, &pw, &ph);
+                int ccol = pleft + HEX_EDIT_POPUP_HEX_OFF + g_hex_edit_len;
+                if (ccol > g_mux.host_cols) ccol = g_mux.host_cols;
+                if (ccol < 1) ccol = 1;
+                pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[?25h", ptop + 1, ccol);
+                goto cursor_done;
+            }
             int sb_w = SETTINGS_SIDEBAR_W;
             if (sb_w > g_mux.host_cols / 2) sb_w = g_mux.host_cols / 2;
             if (sb_w < 15) sb_w = 15;
@@ -4301,6 +4591,7 @@ void render_screen(void) {
         } else {
             pos += snprintf(out + pos, bs - pos, "\x1b[?25l");
         }
+    cursor_done:
     } else if (g_mux.chooser_mode || g_mux.ctx_mode || g_mux.help_mode) {
         pos += snprintf(out + pos, bs - pos, "\x1b[?25l");
     } else if (g_mux.active_pane >= 0 && g_mux.active_pane < g_mux.pane_count && g_mux.panes[g_mux.active_pane].active) {

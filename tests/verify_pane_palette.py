@@ -826,6 +826,83 @@ int main(int argc, char **argv) {
         tl2 = "\n".join(vt_text(24, 100, l2) or [])
         ck("L3 100 列下提示行没被截断 → 不画气泡（无框线）", "┌─" not in tl2, "")
 
+    # ======================= M 组：滚轮 + 颜色编辑浮层 + 色块条自适应（v2.1.1）=======================
+    # 用户反馈：①「过窄时，颜色编辑被截断」②「终端过矮时，设置右边窗格无法滚轮滚动」
+    def wheel(col, row, n, down=True):
+        btn = 65 if down else 64
+        return "".join("\x1b[<%d;%d;%dM\x1b[<%d;%d;%dm" % (btn, col, row, btn, col, row)
+                       for _ in range(n)).encode()
+
+    tj = vt_text(24, 100, b"") if not os.environ.get("TERMUX_NO_VTERM") else None
+    if tj is None:
+        print("  [SKIP] M 组 —— 本机没有 libvterm-dev")
+    else:
+        # M1 矮终端（12 行）滚轮：外观页语义色区滚进可见区
+        home = [b"\x1b", b"\x02s"]      # Esc 退出设置页 → s 再进：滚动态会复位
+        m1a = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s"] + home + [b"\x1bOQ"])) or [])
+        m1b = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s"] + home + [b"\x1bOQ", wheel(60, 8, 2)])) or [])
+        ck("M1 12 行 × 外观页：滚轮向下把「语义颜色 (Palette)」+ background 行滚进可见区",
+           "■ 语义颜色 (Palette)" not in m1a and "■ 语义颜色 (Palette)" in m1b and "background" in m1b,
+           "")
+        # 注意：12 行下即使没滚过，提示行也已经带 (3-11/20) 标记（选中行被夹进可见区），
+        # 所以「标记是否出现」不是可用信号，可用的是「标记里的起始行变没变」。
+        wm = re.compile(r"提示.*?\((\d+)-(\d+)/(\d+)\)", re.S)
+        wa = wm.search(m1a); wb = wm.search(m1b)
+        ck("M1 滚轮滚动后提示行的行窗口起始行后移（真滚动，不是选中项平移）",
+           wa is not None and wb is not None and int(wb.group(1)) > int(wa.group(1))
+           and wb.group(3) == wa.group(3) == "20",
+           "base=%s scrolled=%s" % (wa and wa.groups(), wb and wb.groups()))
+        # M2 滚轮向上回到原位（先滚开再滚回：否则「页首在屏内」在旧版也成立）
+        # 滚到底（再往上滚一步都越界、被夹住）后连滚 9 下向上 → 必须逐字回到基线那一屏。
+        m2 = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s"] + home + [b"\x1bOQ",
+                                                                    wheel(60, 8, 9),
+                                                                    wheel(60, 8, 9, down=False)])) or [])
+        w2 = wm.search(m2)
+        ck("M2 滚轮向上能回到页首（标题行重新出现、行窗口回到基线 (3-11/20)）",
+           "■ 配色主题 (Theme)" not in m1b and "■ 配色主题 (Theme)" in m2
+           and w2 is not None and w2.group(1) == wa.group(1) == "3",
+           "base=%s after-roundtrip=%s" % (wa and wa.groups(), w2 and w2.groups()))
+        # M3 启动项页 / 详情页
+        ini3 = "[menu]\n1 = sh, /bin/sh\n2 = two, /bin/bash\n3 = three, /bin/sh\n"
+        m3a = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s"], ini=ini3)) or [])
+        m3b = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", wheel(60, 8, 3)], ini=ini3)) or [])
+        ck("M3 12 行 × 启动项页：滚轮向下能把第 3 个菜单项滚进可见区",
+           "three" not in m3a and "three" in m3b, "")
+        m3c = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", wheel(60, 8, 3),
+                                                                      b"\r", wheel(60, 8, 2)], ini=ini3)) or [])
+        ck("M3 12 行 × 菜单项详情页：滚轮能滚到第 3 个字段（启动目录）",
+           "3. 启动目录" in m3c and "4. 启动默认颜色" not in m3a, "实际 %r" % m3c[:80])
+        # M4 窗格配色页滚轮
+        m4a = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"W"])) or [])
+        m4 = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"W", wheel(60, 8, 7)])) or [])
+        ck("M4 12 行 × 窗格配色页：滚轮向下把最后一项「亮白 (跟随终端)」滚进可见区",
+           "亮白" not in m4a and "亮白" in m4, "")
+        # M5 颜色编辑浮层：任何宽度都不截断
+        for rows, cols in [(12, 30), (12, 44), (24, 60)]:
+            t = "\n".join(vt_text(rows, cols, capture_page_keys(rows, cols, [b"\x02s", b"W",
+                                                                              wheel(max(cols // 2, 20), 8, 6),
+                                                                              b"\r", b"ab"])) or [])
+            ck("M5 %dx%d：窄终端下 Enter 编辑颜色 → 浮层完整显示 名称 + #ab（表行会被裁掉）" % (rows, cols),
+               "颜色编辑" in t and "#ab" in t and "┌" in t and "┘" in t, "")
+        # M6 浮层光标：紧跟已输入位（1 基 = 框左沿 + 6 + 2）
+        t60 = vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"W", wheel(50, 8, 6), b"\r", b"ab"])) or []
+        row60 = next((i + 1 for i, l in enumerate(t60) if "#ab" in l), 0)
+        cur60 = capture_page_keys(12, 100, [b"\x02s", b"W", wheel(50, 8, 6), b"\r", b"ab"])
+        ck("M6 浮层光标落在值段之后（与「#ab」同一行）",
+           row60 > 0 and ("\x1b[%d;%dH\x1b[?25h" % (row60, 46)).encode() in cur60,
+           "row=%d" % row60)
+        # M7 详情页色块条按宽度限格：窄到放不下 8 格时少画几格并标 +N，不再越界
+        ini7 = "[menu]\n1 = sh, /bin/sh\n"
+        def colorrow(rows, cols):
+            t = vt_text(rows, cols, capture_page_keys(rows, cols, [b"\x02s", b"\r"], ini=ini7)) or []
+            return next((l for l in t if re.search(r"默认\s+\[?1\]?\s", l)), "")
+        r40, r60, r100 = colorrow(24, 40), colorrow(24, 60), colorrow(24, 100)
+        ck("M7 40 列 × 详情页：色块条只画放得下的几格 + 标 +N（第 8 格不再被裁出屏幕）",
+           "N" in r40 and "8" not in r40, "40列=%r" % r40[-40:])
+        ck("M7 60 列 × 详情页：8 格刚好放得下 → 不标 +N",
+           "N" not in r60 and "8" in r60, "60列=%r" % r60[-40:])
+        ck("M7 100 列 × 详情页：8 格全在（值 8 可见），色块不越界", "8" in r100, "100列=%r" % r100[-40:])
+
     print()
     if FAILS:
         print("%d 项失败：%s" % (len(FAILS), "；".join(FAILS)))

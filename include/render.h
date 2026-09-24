@@ -41,8 +41,13 @@
 #define ITEM_COLOR_SWATCH_W  3
 #define ITEM_COLOR_ROW_W     (ITEM_COLOR_DEFAULT_W + 8 * ITEM_COLOR_SWATCH_W)
 /* col / left 均为 1-based 终端列；未命中返回 -1，命中返回 0(默认) 或 1-8。 */
+/* v2.1.1：本帧实际画出的色块格数（1..8）——渲染与鼠标命中同源。 */
+extern int g_item_color_max;
 int item_color_hit(int left, int col);
 void render_item_color_row(char *out, int bs, int *posp, int row, int left, int color, int focused);
+/* v2.1.1：host_cols 版（行尾剩余宽度决定「+N」/提示）；上面那个只是传 g_mux.host_cols 的包装。 */
+void render_item_color_row_w(char *out, int bs, int *posp, int row, int left, int color, int focused,
+                             int host_cols);
 #define SETTINGS_KEYS_EDIT_COL  87
 #define SETTINGS_KEYS_RESET_COL 92
 #define SETTINGS_SB_MINUS_COL   22
@@ -213,6 +218,17 @@ int settings_keys_reset_col(int host_cols, int main_left);
 int settings_keys_show_reset(int host_cols, int main_left);
 /* v2.1.0：窗格配色页顶部的「预设方案」行按 Enter / 点击打开的方案列表浮层。 */
 void pane_scheme_picker_geom(int host_rows, int host_cols, int *top, int *left, int *w, int *h);
+/* v2.1.1：十六进制颜色编辑浮层。以前编辑框是「嵌在表行里」的，终端一窄
+ * （值段起点在屏幕外）就整段被裁掉——看不见色、也看不见自己敲了哪几位。
+ * 改成居中的小浮层：色块 + 完整 6 位十六进制 + 提示，任何宽度都不截断。 */
+void hex_edit_popup_geom(int host_rows, int host_cols, int *top, int *left, int *w, int *h);
+#define HEX_EDIT_POPUP_MIN 20    /* 能摆下「色块 + 8 位值」的最小框宽 */
+#define HEX_EDIT_POPUP_HEX_OFF 6   /* 值段（'#'）在 left + 该偏移（1 基）：│ + 两空格 + 色块 2 + 空格 */
+void render_hex_edit_popup(char *out, int bs, int *posp, int host_rows, int host_cols);
+/* v2.1.1：滚轮滚动设置页右侧内容（渲染与命中同用一套滚动量）。 */
+void settings_wheel_scroll(int delta);
+/* v2.1.1：详情页「启动默认颜色」色块条，宽度不够时少画几格（渲染与命中同源）。 */
+int settings_detail_color_w(int host_cols, int main_left);
 void render_pane_scheme_picker(char *out, int bs, int *posp, int host_rows, int host_cols);
 int  pane_scheme_picker_swatches(int pw);
 /* v2.0.9：菜单项管理页（启动页下半部分）每行的 [↑][↓][改][删] 按钮列同样随宽度收缩：
