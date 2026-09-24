@@ -2864,13 +2864,18 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
         if (g_settings_nav == 0) {
             int snat = settings_startup_natural_at(host_rows, r);
             if (snat == 5) {
-                if (c >= main_left && c < main_left + 26) {
+                /* v2.1.3：热区改成「和这一帧真正画出来的段一致」。原先写死
+                 * main_left+26 / +29..+51 ⇒ 40 列时「内置帮助」根本没画，点那块
+                 * 空白却会改配置；而且 +51 已经越过右边界（g_mouse_x 的上界）。 */
+                int r0_on = 0, r0_w = 0, r1_on = 0, r1_w = 0;
+                settings_startup_radio_spans(host_cols, main_left, &r0_on, &r0_w, &r1_on, &r1_w);
+                if (r0_on && c >= main_left && c < main_left + r0_w) {
                     g_default_startup = 0;
                     save_config();
                     g_mux.needs_redraw = 1;
                     return;
                 }
-                if (c >= main_left + 29 && c < main_left + 51) {
+                if (r1_on && c >= main_left + r0_w + 3 && c < main_left + r0_w + 3 + r1_w) {
                     g_default_startup = 1;
                     save_config();
                     g_mux.needs_redraw = 1;
@@ -2881,11 +2886,12 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                 if (snat == 10 + i) {
                     int mbtn = settings_menu_btn_col(host_cols, main_left);
                     int mud = settings_menu_show_ud(host_cols, main_left);
+                    int mbtn_on = settings_menu_show_btn(host_cols, main_left);   /* v2.1.3：与渲染同源 */
                     int ecol = mbtn + (mud ? 6 : 0);
-                    int h_up = (mud && c >= main_left + mbtn && c <= main_left + mbtn + 2);
-                    int h_dn = (mud && c >= main_left + mbtn + 3 && c <= main_left + mbtn + 5);
-                    int h_ed = (c >= main_left + ecol && c <= main_left + ecol + 3);
-                    int h_del = (c >= main_left + ecol + 4 && c <= main_left + ecol + 7);
+                    int h_up = (mud && mbtn_on && c >= main_left + mbtn && c <= main_left + mbtn + 2);
+                    int h_dn = (mud && mbtn_on && c >= main_left + mbtn + 3 && c <= main_left + mbtn + 5);
+                    int h_ed = (mbtn_on && c >= main_left + ecol && c <= main_left + ecol + 3);
+                    int h_del = (mbtn_on && c >= main_left + ecol + 4 && c <= main_left + ecol + 7);
                     if (h_up) {
                         if (i > 0) {
                             ChooserItem tmp = g_chooser_items[i];

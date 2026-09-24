@@ -95,7 +95,8 @@ jobs:
       - name: 装依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y mingw-w64 clang
+          # libvterm-dev：tests/verify_pane_palette.py 的语义级判据要靠它回放宿主字节流
+          sudo apt-get install -y mingw-w64 clang libvterm-dev
 
       - name: 构建 Linux 版
         run: make -B linux 2>&1 | tee build.log

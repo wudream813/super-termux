@@ -146,9 +146,14 @@ check("settings_menu_btn_col(host_cols, main_left)" in RENDER and
       "settings_menu_show_ud(host_cols, main_left)" in RENDER and
       "settings_menu_show_ud(host_cols, main_left)" in INPUT,
       "菜单表格按钮列的收缩几何没有在渲染与命中两侧共用")
-check("append_padded_utf8(out, bs, &pos, &row_cols, dname, 12)" in RENDER,
-      "设置表格显示名称没有按终端列宽补齐")
-check("append_padded_utf8(out, bs, &pos, &row_cols, dcmd, settings_menu_cmd_w(host_cols, main_left))" in RENDER,
+# v2.1.3：名称列宽度也从「写死 12」变成 menu_geom 的输出（settings_menu_name_w），
+# 40 列时 12 列名称 + 按钮已经超过右栏宽度 ⇒ 整行溢出、终端折行盖掉侧栏。
+# 判据不变：两列都必须用 append_padded_utf8 按【显示列】补齐，宽度来自同一套几何函数。
+check("append_padded_utf8(out, bs, &pos, &row_cols, dname, mname)" in RENDER and
+      "int mname = settings_menu_name_w(host_cols, main_left)" in RENDER,
+      "设置表格显示名称没有按终端列宽补齐（宽度须来自 settings_menu_name_w）")
+check("append_padded_utf8(out, bs, &pos, &row_cols, dcmd, mcw)" in RENDER and
+      "int mcw = settings_menu_cmd_w(host_cols, main_left)" in RENDER,
       "设置表格命令行没有按终端列宽补齐（v2.0.9：宽度随可用列收缩，窄终端上按钮才不会被裁掉）")
 check("%-12s" not in RENDER and "%-30s" not in RENDER,
       "设置表格仍使用按字节计算的 %-Ns 补齐")

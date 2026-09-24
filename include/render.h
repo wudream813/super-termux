@@ -170,10 +170,12 @@ int  settings_tip_count(void);
 const SettingsTip *settings_tip_at(int row, int col);   /* 命中返回登记项，否则 NULL */
 /* 有滚动时在行右端画 (first-last/total) 位置指示 */
 void settings_scroll_mark(char *out, int bs, int *posp, int row, int right_col,
-                          int first_vis, int last_vis, int total);
+                          int first_vis, int last_vis, int total, int host_rows);
 void settings_page_mark(char *out, int bs, int *posp, int row, int right_col, int host_rows,
                         int first, int last, int *scroll);
 
+void settings_startup_radio_spans(int host_cols, int main_left,
+                                  int *opt0_on, int *opt0_w, int *opt1_on, int *opt1_w);
 int  settings_page_row(int host_rows, int natural, int first, int last,
                        int *scroll, int sel_natural);
 int  settings_page_natural_at(int host_rows, int row, int first, int last, int *scroll, int sel_natural);
@@ -245,6 +247,10 @@ int  pane_scheme_picker_swatches(int pw);
  * 先压「启动命令行」列（30 → 8），极窄时只留 [改][删]（调序用 Ctrl+↑/↓）。
  * 渲染与鼠标命中共用。 */
 int settings_menu_cmd_w(int host_cols, int main_left);
+int settings_menu_name_w(int host_cols, int main_left);         /* 显示名称列宽（窄时收窄） */
+int settings_menu_pre_w(int host_cols, int main_left);           /* 行首（▶ + [n]）占几列 */
+int settings_menu_show_btn(int host_cols, int main_left);       /* 0 = 连按钮区都放不下 */
+int settings_menu_header(char *buf, int bs, int host_cols, int main_left);
 int settings_menu_btn_col(int host_cols, int main_left);
 int settings_menu_show_ud(int host_cols, int main_left);   /* 是否画 [↑][↓] */
 int settings_pane_order_slot(int pos);

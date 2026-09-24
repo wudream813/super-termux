@@ -43,7 +43,17 @@ R, C = 24, 80
 FAILS = []
 
 
+_VTEXT_OK = True      # libvterm 不可用时由 vt_text()/border_pos() 置 False
+
+
 def ck(name, cond, extra=""):
+    # 依赖 libvterm 的那些组（G/I/J/K/L/M/N/O）在没有 libvterm 的机器上【不能算失败】：
+    # 以前只是不画它们，但 N1 那种「顺手用 vt_text 结果求 max()」的写法会直接
+    # ValueError 崩掉整个脚本（CI 的 Release Linux 作业没装 libvterm-dev，实测就是这样
+    # 红了一整条流水线）。现在统一降级成 SKIP。
+    if not cond and not _VTEXT_OK and re.match(r"^[G-O]\d", name):
+        print("  [SKIP] %s —— 本机没有 libvterm-dev" % name)
+        return
     print("  [%s] %s %s" % ("ok" if cond else "FAIL", name, extra if not cond else ""))
     if not cond:
         FAILS.append(name)
@@ -757,7 +767,10 @@ int main(int argc, char **argv) {
 
     def vt_text(rows, cols, data, _cache={}):
         """把一段宿主字节流回放进 libvterm，返回屏幕文本行列表（宽字符后半格跳过）。"""
-        if os.environ.get("TERMUX_NO_VTERM"): return None
+        global _VTEXT_OK
+        if os.environ.get("TERMUX_NO_VTERM"):
+            _VTEXT_OK = False
+            return None
         if "bin" not in _cache:
             td = tempfile.mkdtemp(prefix="termux_palette_txt_")
             src = os.path.join(td, "vtext.c"); exe = os.path.join(td, "vtext")
@@ -765,6 +778,7 @@ int main(int argc, char **argv) {
             r = subprocess.run(["gcc", "-O1", src, "-o", exe, "-lvterm"], capture_output=True, text=True)
             _cache["bin"] = exe if r.returncode == 0 else ""
             if not _cache["bin"]:
+                _VTEXT_OK = False
                 print("  [SKIP] J/K/L 组 —— vterm 文本 dump 编译失败：%s" % r.stderr.strip()[:160])
         if not _cache["bin"]: return None
         dump = os.path.join(tempfile.mkdtemp(prefix="termux_palette_d_"), "s.bin")
@@ -963,7 +977,9 @@ int main(int argc, char **argv) {
 
     def border_pos(rows, cols, data, _c={}):
         """返回 [(行号, 最后一个非空列, {'L':列,'R':列,'|':[列...]})]；没有 libvterm 时 None。"""
+        global _VTEXT_OK
         if os.environ.get("TERMUX_NO_VTERM"):
+            _VTEXT_OK = False
             return None
         if "exe" not in _c:
             td = tempfile.mkdtemp(prefix="termux_meas_")
@@ -973,8 +989,10 @@ int main(int argc, char **argv) {
             r = subprocess.run(["gcc", "-O1", cs, "-o", ex, "-lvterm"], capture_output=True, text=True)
             _c["exe"] = ex if r.returncode == 0 else ""
             if not _c["exe"]:
+                _VTEXT_OK = False
                 print("  [SKIP] N5 —— 边框列号 dump 编译失败：%s" % r.stderr.strip()[:160])
         if not _c["exe"]:
+            _VTEXT_OK = False
             return None
         dp = os.path.join(tempfile.mkdtemp(prefix="termux_meas_d_"), "s.bin")
         with open(dp, "wb") as f:
@@ -1010,7 +1028,8 @@ int main(int argc, char **argv) {
        and "  [1] sh" in n1d and "  [2] 一" in n1d, "")
     n1h = vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s"], ini=nini5)) or []
     n1col = [l.split("│")[0] for l in n1h]          # 只看侧栏那一列，右侧画什么不影响判据
-    n1last = max(i for i, l in enumerate(n1col) if re.search(r"\[\d\]", l))
+    _cand = [i for i, l in enumerate(n1col) if re.search(r"\[\d\]", l)]
+    n1last = max(_cand) if _cand else -1            # v2.1.3：没有 libvterm 时 n1h 为空 ⇒ 别再 ValueError
     n1add = next((i for i, l in enumerate(n1col) if "[+] 添加新条目" in l), -1)
     ck("N1 24 行 × 条目全都放得下 → 表头不带 (a-b/N)，[+] 紧贴列表末行（侧栏不空出一段）",
        any("导航选项" in l and "(" not in l for l in n1col)
@@ -1087,7 +1106,56 @@ int main(int argc, char **argv) {
     ck("N7 长名字悬停：气泡是全文，且没有半个 UTF-8 字符留下的 '?'",
        nlong in nlt and "?" not in nlt, "")
 
+    # ======================= O 组：窄终端设置页左右两栏互不越界（v2.1.3）=======================
+    # 用户报「40 列时设置页左右两栏互相盖住、分隔线 │ 整段消失」。机制有两条，都得钉住：
+    #   (1) 右栏某行（菜单表格 [+]/[P] 按钮行、说明行）写到 host_cols 之外 ⇒ 终端自动折行，
+    #       把【下一行的行首】整段盖掉 —— 侧栏 [A]/[K]/[B]/[W] 就是这么没的；
+    #   (2) 侧栏那批按 20~22 列写死的定宽标签串，在 sb_w 被窄终端夹小时盖掉 col sb_w 的 │。
+    # 判据用真实屏幕列号（libvterm）：每行最右非空列 ≤ host_cols；凡是内容越过侧栏宽度的
+    # 行，col sb_w 必须仍是 │。libvterm 不可用时 border_pos() 返回 None ⇒ 只判第一条。
+    oin = ("[menu]\n1 = sh, /bin/sh\n2 = 一个非常长的菜单项名字用来验证截断, /bin/bash\n"
+           "3 = three, /bin/sh\n4 = four, /bin/sh\n5 = five, /bin/sh\n")
+    OPAGES = (("启动项页", [b"\x02s"]), ("外观页", [b"\x02s", b"a"]),
+              ("键位页", [b"\x02s", b"k"]), ("行为页", [b"\x02s", b"b"]),
+              ("窗格页", [b"\x02s", b"w"]), ("菜单项详情页", [b"\x02s", b"\r"]))
+    for oc in (40, 50):
+        osb = 22 if oc >= 44 else max(15, oc // 2)
+        for oname, okeys in OPAGES:
+            obytes = capture_page_keys(24, oc, okeys, ini=oin)
+            ot = vt_text(24, oc, obytes) or []
+            over = [r for r in range(1, 25) if r <= len(ot) and dispw(ot[r - 1]) > oc]
+            ck("O %d 列 × %s：每行的显示宽度都不超过终端宽度（超宽会折行盖掉下一行行首）"
+               % (oc, oname), not over, "越界行=%r" % over[:4])
+            ob = border_pos(24, oc, obytes)
+            if ob is None:
+                continue
+            olast = {r: (last, pos) for r, last, pos in ob}
+            obad = []
+            for r in range(3, 24):
+                if r not in olast:
+                    continue
+                last, pos = olast[r]
+                if last >= osb and osb not in pos.get("|", []):
+                    obad.append((r, last))
+            ck("O %d 列 × %s：内容越过侧栏宽度的行仍带 col %d 的分隔线（左右两栏没互盖）"
+               % (oc, oname, osb), not obad, "缺分隔线的行=%r" % obad[:4])
 
+        # O3 行窗口标记 (a-b/N)：它贴着右端写，窄终端上必须收到侧栏之前
+        owheel = "\x1b[<65;%d;8M\x1b[<65;%d;8m" % (oc - 6, oc - 6)
+        ot = vt_text(14, oc, capture_page_keys(14, oc,
+                                              [b"\x02s", owheel.encode(), owheel.encode()],
+                                              ini=oin)) or []
+        omark = [(r, dispw(l)) for r, l in enumerate(ot[:14], 1) if re.search(r"\(\d+-\d+/\d+\)", l)]
+        obb = border_pos(14, oc, capture_page_keys(14, oc,
+                                                   [b"\x02s", owheel.encode(), owheel.encode()],
+                                                   ini=oin)) or []
+        omap = {r: (last, pos) for r, last, pos in obb}
+        obad2 = [(r, last) for r, (last, pos) in omap.items()
+                 if re.search(r"\(\d+-\d+/\d+\)", ot[r - 1] if r <= len(ot) else "")
+                 and last >= osb and osb not in pos.get("|", [])]
+        ck("O %d 列 × 14 行：滚动后的行窗口标记 (a-b/N) 不越界、不盖掉 col %d 的分隔线"
+           % (oc, osb), not [x for x in omark if x[1] > oc] and not obad2,
+           "越界=%r 缺│=%r" % ([x for x in omark if x[1] > oc][:2], obad2[:2]))
     print()
     if FAILS:
         print("%d 项失败：%s" % (len(FAILS), "；".join(FAILS)))
