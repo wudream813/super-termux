@@ -1170,35 +1170,46 @@ int main(int argc, char **argv) {
     # 窄视口放不下「名称列 + 按钮」时按固定阶梯让位：命令行 → 列间隔 → 收窄名称列 →
     # 丢 [↑][↓] → 连 [改][删] 一起丢（退成纯键盘）。40 列正好落在最后一档，56 列画得下。
     # 注意：ini 里的命令行必须是能跑起来的程序，否则 pane 一开就退 ⇒ 沙箱里整个 app 跟着
-    # 退出，一帧都抓不到（「长内容」改用启动目录那一列造）。
-    pini = "[menu]" + chr(10) + "1 = sh, /bin/sh, /home/user/projects/super-termux-workdir-for-hscroll" + chr(10) + "2 = two, /bin/sh" + chr(10)
+    # 退出，一帧都抓不到（「长内容」改用启动目录那一列造，该目录不必存在：chdir 失败会退回
+    # HOME，见 src/platform_posix.c）。但这里绝不能写死某个人的绝对路径 —— 那样判据只在某台
+    # 机器上成立，换台机器就假红/假绿，故统一取临时目录下的长名字。
+    pdir = os.path.join(tempfile.gettempdir(), "termux-hscroll-fixture-for-a-long-column")
+    pini = ("[menu]" + chr(10) + "1 = sh, /bin/sh, " + pdir + chr(10) +
+            "2 = two, /bin/sh" + chr(10))
     ph = "\x1b[<69;30;10M\x1b[<69;30;10m"      # Shift+滚轮向下（b=69：64=滚轮 + 1=下 + 4=Shift）
-    p0 = vt_text(24, 40, capture_page_keys(24, 40, [b"\x02s", b"m"], ini=pini)) or []
-    p2 = vt_text(24, 40, capture_page_keys(24, 40, [b"\x02s", b"m", ph.encode(), ph.encode()],
-                                             ini=pini)) or []
-    j0, j2 = "\n".join(p0), "\n".join(p2)
-    ck("P 40 列 × 条目管理页：只有序号 + 名称（这一档按设计不画按钮），且不折行不盖侧栏",
-       bool(p0) and "[1] sh" in j0 and "[改]" not in j0 and "[删]" not in j0
-       and "»" in j0 and all(dispw(l) <= 40 for l in p0),
-       "最长=%d" % (max([dispw(l) for l in p0] or [0])))
-    ck("P 40 列 × Shift+滚轮：画面跟着左右滚，序号仍钉在视口左端，行窗口标记不动",
-       bool(p2) and p0 != p2 and "\u25b6[1]" in j2 and "(3-23/24)" in j2
-       and all(dispw(l) <= 40 for l in p2),
-       "滚后=%r" % j2[:160])
-    q0 = vt_text(24, 56, capture_page_keys(24, 56, [b"\x02s", b"m"], ini=pini)) or []
-    q2 = vt_text(24, 56, capture_page_keys(24, 56, [b"\x02s", b"m", ph.encode(), ph.encode()],
-                                            ini=pini)) or []
-    k0, k2 = "\n".join(q0), "\n".join(q2)
-    ck("P 56 列 × 条目管理页：默认就同时看得见序号 / 名称 / [改][删]（按钮贴视口右端）",
-       bool(q0) and "[1] sh" in k0 and "[改][删]" in k0
-       and all(dispw(l) <= 56 for l in q0),
-       "最长=%d" % (max([dispw(l) for l in q0] or [0])))
-    # 按钮是「钉在视口右端」的（滚到底也一直在），滚的是中间那截：名称尾部被推出去、
-    # 后面的内容滚进来 —— 所以判据是「画面变了 + 行窗口没变 + 不折行」。
-    ck("P 56 列 × Shift+滚轮：中段跟着滚（按钮钉右端不消失），行窗口不变、不折行",
-       bool(q2) and q0 != q2 and "[改][删]" in k2 and "▶[1]" in k2
-       and "(3-23/24)" in k2 and all(dispw(l) <= 56 for l in q2),
-       "滚后=%r" % k2[:200])
+    # 这四条判据都建立在「真实屏幕文本」上 ⇒ 非有 libvterm 回放不可。缺 libvterm 的机器
+    # （macOS runner）必须像 J/K/L 组那样明确 SKIP：拿空帧去比宽度会得到「最长=0」「滚后=''」，
+    # 看着像窄终端横滚真的坏了，其实那台机器根本没渲染过一帧。
+    pv0 = vt_text(24, 40, capture_page_keys(24, 40, [b"\x02s", b"m"], ini=pini))
+    if pv0 is None:
+        print("  [SKIP] P 组 —— 本机没有 libvterm-dev")
+    else:
+        p0 = pv0 or []
+        p2 = vt_text(24, 40, capture_page_keys(24, 40, [b"\x02s", b"m", ph.encode(), ph.encode()],
+                                                ini=pini)) or []
+        j0, j2 = "\n".join(p0), "\n".join(p2)
+        ck("P 40 列 × 条目管理页：只有序号 + 名称（这一档按设计不画按钮），且不折行不盖侧栏",
+           bool(p0) and "[1] sh" in j0 and "[改]" not in j0 and "[删]" not in j0
+           and "»" in j0 and all(dispw(l) <= 40 for l in p0),
+           "最长=%d" % (max([dispw(l) for l in p0] or [0])))
+        ck("P 40 列 × Shift+滚轮：画面跟着左右滚，序号仍钉在视口左端，行窗口标记不动",
+           bool(p2) and p0 != p2 and "\u25b6[1]" in j2 and "(3-23/24)" in j2
+           and all(dispw(l) <= 40 for l in p2),
+           "滚后=%r" % j2[:160])
+        q0 = vt_text(24, 56, capture_page_keys(24, 56, [b"\x02s", b"m"], ini=pini)) or []
+        q2 = vt_text(24, 56, capture_page_keys(24, 56, [b"\x02s", b"m", ph.encode(), ph.encode()],
+                                                ini=pini)) or []
+        k0, k2 = "\n".join(q0), "\n".join(q2)
+        ck("P 56 列 × 条目管理页：默认就同时看得见序号 / 名称 / [改][删]（按钮贴视口右端）",
+           bool(q0) and "[1] sh" in k0 and "[改][删]" in k0
+           and all(dispw(l) <= 56 for l in q0),
+           "最长=%d" % (max([dispw(l) for l in q0] or [0])))
+        # 按钮是「钉在视口右端」的（滚到底也一直在），滚的是中间那截：名称尾部被推出去、
+        # 后面的内容滚进来 —— 所以判据是「画面变了 + 行窗口没变 + 不折行」。
+        ck("P 56 列 × Shift+滚轮：中段跟着滚（按钮钉右端不消失），行窗口不变、不折行",
+           bool(q2) and q0 != q2 and "[改][删]" in k2 and "▶[1]" in k2
+           and "(3-23/24)" in k2 and all(dispw(l) <= 56 for l in q2),
+           "滚后=%r" % k2[:200])
     print()
     print()
     if FAILS:
