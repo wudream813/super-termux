@@ -670,10 +670,45 @@ void settings_sidebar_geom(int host_rows, int item_count, SettingsSidebarGeom *g
      * [+] 掉到第 17 行）。 */
     if (g->items_cap > item_count) g->items_cap = item_count;
     if (cap > item_count) cap = item_count;
+    /* v2.1.5：条目列表从侧栏撤掉（用户：左侧不要再额外放 [1] cmd 那一串）。
+     * 只把【窗口】收成 0 行，上面按 cap 算出来的 nav0/app/keys/beh/pane 一律不动 ——
+     * 那几行的行位是右栏「哪几行要给侧栏让位」的门槛，挪一格就会牵动窄终端整页排版。 */
+    g->items_cap = 0;
+    g->items_scroll = 0;
     g->items = g->items_row0 + cap;
     int nav0 = g->items + (g->nav_tight ? 1 : 2);   /* [M] 那一行；非窄档再让出上一版 [P] 的一行 */
-    g->app = nav0; g->keys = nav0 + 1; g->beh = nav0 + 2; g->pane = nav0 + 3;
+    /* v2.1.5：右栏「哪几行要给侧栏让位」的门槛继续用上面这个老行位（窄终端整页排版靠它，
+     * 一格都动不得）；侧栏自己那一排入口另算，见下面。 */
+    g->yield_row = nav0;
+    /* 条目窗口空出来之后，底部那一排（[M] [A] [K] [B] [W]）就紧贴「默认」行往下排，
+     * 侧栏不再空一大段。屏高连这 5 条都放不下时（9 行实测：老版直接丢掉 [W]，用户再也
+     * 进不去窗格页）改成「窗口 + 一根细滚动条」，滚轮/拖动都能翻。 */
+    int n0 = g->items_row0 + 1;
+    int n1 = host_rows - 1;                     /* 末行留给 [Ctrl+S] */
+    if (n1 < n0) n1 = n0;
+    int avail = n1 - n0 + 1;
+    if (avail < 1) avail = 1;
+    g->nav_total = 5; g->nav_row0 = n0; g->nav_hi = n1;
+    g->nav_vis = avail < g->nav_total ? avail : g->nav_total;
+    int maxn = g->nav_total - g->nav_vis;
+    if (maxn < 0) maxn = 0;
+    if (g_settings_sidebar_scroll > maxn) g_settings_sidebar_scroll = maxn;
+    if (g_settings_sidebar_scroll < 0) g_settings_sidebar_scroll = 0;
+    g->nav_off = g->nav_vis < g->nav_total ? g_settings_sidebar_scroll : 0;
+    int r0 = n0 - g->nav_off;
+    g->items = r0;                              /* [M] 条目管理 */
+    g->app = r0 + 1; g->keys = r0 + 2; g->beh = r0 + 3; g->pane = r0 + 4;
     g->save = host_rows;
+}
+
+int settings_sidebar_nav_win(int host_rows, int *row0, int *row1,
+                             int *total, int *vis, int *off) {
+    SettingsSidebarGeom g;
+    settings_sidebar_geom(host_rows, g_chooser_item_count, &g);
+    if (g.nav_vis >= g.nav_total) return 0;
+    *row0 = g.nav_row0; *row1 = g.nav_hi;
+    *total = g.nav_total; *vis = g.nav_vis; *off = g.nav_off;
+    return 1;
 }
 
 /* 侧栏列表里当前该被看见的那一行：1..item_count = 第 n 个菜单项，0 = 无选中。
@@ -710,6 +745,7 @@ void settings_startup_radio_spans(int host_cols, int main_left,
 static int menu_pre_w(int host_cols, int main_left);   /* v2.1.4：定义在后面，横滚算画布宽要先用 */
 static int settings_right_row_limit(int host_rows, int host_cols, int main_left, int row);
 static int settings_mark_left(int host_rows, int right_col, int row, int tl);   /* v2.1.4 */
+int settings_vbar_visible(int host_rows);                                           /* v2.1.5 */
 /* v2.1.4：>0 时 menu_geom 改用这个「视口可用列数」，并把按钮钉到它的右端。
  * 只在 settings_menu_table_geom() 算窄视口那一档时临时置位。 */
 static int g_menu_narrow_av = 0;
@@ -817,31 +853,6 @@ int settings_menu_table_calc(int host_rows, int host_cols, int main_left,
 }
 
 /* 横向滚动条：画在表格行右端（与纵向的 (a-b/total) 同一条线，只是换成 « »）。 */
-/* 启动项页：聚焦行的名称列滚进视口（只管左侧名称；按钮列仍由 Shift+滚轮去找，
- * 否则一进来就被拽到最右边，反而看不到名字）。纵向的自动跟随在 settings_page_row 里。 */
-static void settings_startup_hfollow(int host_rows) {
-    /* 「自动滚到聚焦位置」：只在【选中行刚变化】的那一次动手，且只把聚焦行的行首
-     * （序号 + 名称）拽进视口 —— 聚焦已经看得见就什么都不做。
-     * 每帧都夹会把用户 Shift+滚轮滚出来的位置一次次拽回去（v2.1.4 第一版就这样）。 */
-    static int last_sel = -999, last_rows = -1, last_cols = -1;
-    int changed = (last_sel != g_settings_table_sel || last_rows != host_rows
-                   || last_cols != g_mux.host_cols);
-    last_sel = g_settings_table_sel; last_rows = host_rows; last_cols = g_mux.host_cols;
-    if (!changed) return;
-    int sbw = settings_host_sidebar_w(g_mux.host_cols);
-    int main_left = sbw + 3;
-    int nw = 0, nc = 0, nb = 0, nu = 0, nt = 0;
-    if (!settings_menu_table_calc(g_mux.host_rows, g_mux.host_cols, main_left,
-                                  &nw, &nc, &nb, &nu, &nt)) return;
-    int cw = settings_canvas_w(g_mux.host_cols, main_left);
-    int *v = &g_settings_hscroll[settings_hscroll_slot(g_settings_nav)];
-    if (*v <= 0) return;          /* 一开始就停在最左：序号/名称本来就看得见，不拽 */
-    int pre = settings_menu_pre_w(cw + main_left + 1, main_left);
-    if (nw < 1) nw = 1;
-    /* 只在聚焦行首真的掉出视口左端时才滚回来。 */
-    if (pre - 1 < *v) *v = pre - 1;
-    settings_hscroll_clamp(host_rows, g_mux.host_cols, main_left, cw);
-}
 
 void settings_hscroll_mark(char *out, int bs, int *posp, int row, int right_col,
                            int h, int vw, int content_w, int host_rows) {
@@ -869,7 +880,7 @@ void settings_hscroll_by(int delta) {
  * 别的页没有可滚的东西，直接不做，免得用户以为坏了。 */
 void settings_h_wheel(int delta) {
     int nav = g_settings_nav;
-    if (nav != SETTINGS_NAV_STARTUP && nav != SETTINGS_NAV_ITEMS) return;
+    if (nav != SETTINGS_NAV_ITEMS) return;      /* v2.1.5：启动页没有表了，横滚只剩条目页 */
     settings_hscroll_by((delta > 0 ? -3 : 3));
 }
 /* 聚焦行变了（滚轮 / ↑↓ / 点击）⇒ 把聚焦行滚进视口。 */
@@ -955,6 +966,10 @@ static void hcut(const char *src, char *dst, int dstbs, int from, int to) {
  * 写标记的两支函数与「正文先让几列」的算法必须共用这里，否则标记会压在正文最后一个宽字符的
  * 右半格上：vterm 会把那个宽字符挤成半角 ⇒ 整行显示宽度反而多出 1 列（32/56/58 列实测）。 */
 static int settings_mark_left(int host_rows, int right_col, int row, int tl) {
+    /* v2.1.5：右侧面板的纵向滚动条固定占终端最右一列。标记凡是排到那一列的，先让它让开
+     * 一格 —— 12×100 实测：不让的话 (3-11/20) 的收尾 ')' 会被条子盖掉。与画条子用的是
+     * 同一个判据（settings_page_vband），所以不会出现「让了格子却没条子」。 */
+    if (right_col == g_mux.host_cols && settings_vbar_visible(host_rows)) right_col--;
     if (right_col < SETTINGS_WIDE_COLS) {
         int ml = settings_host_sidebar_w(right_col) + 3;
         int lim = settings_right_row_limit(host_rows, right_col, ml, row);
@@ -1043,7 +1058,7 @@ int settings_right_row_limit(int host_rows, int host_cols, int main_left, int ro
     SettingsSidebarGeom g;
     settings_sidebar_geom(host_rows, g_chooser_item_count, &g);
 
-    if (row < g.app) return full;               /* 还没到侧栏底部那一排 */
+    if (row < g.yield_row) return full;         /* 还没到侧栏底部那一排 */
     int room = main_left - 3;                   /* │ 在 main_left-3 列 ⇒ 正文最多写到它之前 */
     return room < full ? room : full;
 }
@@ -1154,6 +1169,18 @@ void settings_page_mark(char *out, int bs, int *posp, int row, int right_col, in
     settings_scroll_mark(out, bs, posp, row, right_col, top, top + vis - 1, tot, host_rows);
 }
 
+/* v2.1.5：条目管理页顶部动作条的三段标签 —— 渲染画它、鼠标命中也用它，宽度必须由
+ * 同一支函数给出（写死两遍就是「画在一处、点在另一处」，v2.1.4 已经为这个道过歉）。 */
+const char *settings_manage_action_label(int which) {
+    if (which == 0) return " [+] 新建条目 ";
+    if (which == 1) return " [P] 预设库 ";
+    return " [设为默认] ";            /* 把聚焦的那条设成启动默认 */
+}
+int settings_manage_action_span(int which) {
+    const char *l = settings_manage_action_label(which);
+    return utf8_cols(l, (int)strlen(l));
+}
+
 /* 外观页：自然行 3..22（标题/提示/5 个主题/语义色标题+说明/16 色两列 8 行/提示） */
 #define SETTINGS_APPEAR_FIRST 3
 #define SETTINGS_APPEAR_LAST  (SETTINGS_ROLE_ROW0 + SETTINGS_ROLE_ROWS + 1)
@@ -1201,19 +1228,29 @@ int settings_detail_row_view(int host_rows, int natural) {
                              SETTINGS_DETAIL_LAST, &g_settings_detail_scroll, sel);
 }
 /* 默认启动项页：自然行 3..(10+n+2)（标题/提示/两个选项/管理标题+说明/表头/n 行/按钮/提示） */
+/* v2.1.5：这一页只剩「默认显示哪个界面」+ 一行当前默认摘要 + 提示行 ⇒ 自然行 3..8。
+ * 条目表整个搬去「[M] 条目管理」页（用户：左侧不要再额外放条目列表 / [+] / [P] / 每行 [1] cmd）。
+ * 行少了 ⇒ 启动页在正常高度下根本不需要滚，纵条 / 横条自动都不出现（判据由几何自己给）。 */
 static int settings_startup_last(int host_rows) {
     (void)host_rows;
-    return 12 + (g_chooser_item_count > 0 ? g_chooser_item_count : 1);
+    return 8;
 }
+/* 条目管理页真正的末行：标题/说明/表头 + 每条两行余量里的 1 行 + 动作条 + 提示行。
+ * v2.1.5：原先这里被 SETTINGS_MANAGE_LAST(26) 硬夹住，条目 ≥ 15 条时【动作条与最后几条】
+ * 落在可见带之外，滚多少下都到不了（滚动条一加出来就暴露了）⇒ 改成按条目数算。 */
+int settings_manage_last(void) {
+    int last = 12 + g_chooser_item_count;
+    if (last < SETTINGS_MANAGE_FIRST + 1) last = SETTINGS_MANAGE_FIRST + 1;
+    return last;
+}
+
 int settings_manage_row_view(int host_rows, int natural) {
     int sel = (g_settings_table_sel >= 0) ? 10 + g_settings_table_sel : -1;
     /* 横向：滚过界就夹回来（这一页没有「▶ 跟随」的必要——表很短）。 */
     int sbw = settings_host_sidebar_w(g_mux.host_cols);
     settings_hscroll_clamp(host_rows, g_mux.host_cols, sbw + 3,
                            settings_canvas_w(g_mux.host_cols, sbw + 3));   /* 与渲染同一个画布口径 */
-    int last = SETTINGS_MANAGE_LAST;
-    int total = 12 + g_chooser_item_count;         /* 到提示行为止 */
-    if (total < last) last = total;
+    int last = settings_manage_last();             /* 到提示行为止 —— 条目多了也要滚得到尾巴 */
     int vis = host_rows - SETTINGS_MANAGE_FIRST + 1;
     if (vis > last - SETTINGS_MANAGE_FIRST + 1) vis = last - SETTINGS_MANAGE_FIRST + 1;
     int maxs = (last - SETTINGS_MANAGE_FIRST + 1) - vis;
@@ -1235,8 +1272,7 @@ int settings_manage_row_view(int host_rows, int natural) {
 int settings_manage_natural_at(int host_rows, int row) {
     /* 与 settings_manage_row_view 互逆：屏幕行 → 自然行（命中判定用）。 */
     int vis = host_rows - SETTINGS_MANAGE_FIRST + 1;
-    int total = 12 + g_chooser_item_count;
-    int last = (total < SETTINGS_MANAGE_LAST) ? total : SETTINGS_MANAGE_LAST;
+    int last = settings_manage_last();
     if (vis > last - SETTINGS_MANAGE_FIRST + 1) vis = last - SETTINGS_MANAGE_FIRST + 1;
     if (row < SETTINGS_MANAGE_FIRST || row > SETTINGS_MANAGE_FIRST + vis - 1) return -1;
     int nat = row + g_settings_manage_scroll;
@@ -1246,7 +1282,6 @@ int settings_manage_natural_at(int host_rows, int row) {
 
 int settings_startup_row_view(int host_rows, int natural) {
     int sel = (g_settings_table_sel >= 0) ? 10 + g_settings_table_sel : -1;
-    settings_startup_hfollow(host_rows);      /* v2.1.4：聚焦行横向自动滚进视口（只在选中变化时动） */
     return settings_page_row(host_rows, natural, 3, settings_startup_last(host_rows),
                              &g_settings_startup_scroll, sel);
 }
@@ -1457,6 +1492,25 @@ static int g_sl_host_rows = 0;   /* v2.1.3：本帧行数（逐行限宽判定�
 static int g_sl_row = 0, g_sl_col0 = 1;   /* v2.1.0：当前行与行首列（截断气泡登记用） */
 static int g_sl_hidden = 0;               /* 1 = 本行不可见，begin 已提前返回 */
 /* v2.1.4：这两行上移到本文件靠前的位置（横向滚动行的气泡登记要用）。 */
+/* v2.1.5：把「被截断的全文」登记成一格悬停气泡。拷贝必须停在【字符】边界上 ——
+ * snprintf 按字节截断会把半个 UTF-8 序列留在串尾，渲染时解码成 '?'，框宽也会差一列。 */
+static void settings_tip_add(int row, int col, const char *txt, int full_cols) {
+    if (g_tip_n >= SETTINGS_TIP_MAX || !txt || !txt[0]) return;
+    SettingsTip *t = &g_tips[g_tip_n++];
+    t->row = row; t->col = col; t->len = full_cols;
+    int nb = 0, s0 = 0, n = (int)strlen(txt);
+    while (s0 < n) {
+        int adv = 0;
+        (void)utf8_decode_cp(txt + s0, n - s0, &adv);
+        if (adv <= 0 || s0 + adv > n) break;
+        if (nb + adv >= (int)sizeof(t->full) - 4) break;
+        for (int q = 0; q < adv && nb < (int)sizeof(t->full) - 4; q++) t->full[nb++] = txt[s0 + q];
+        s0 += adv;
+    }
+    if (s0 < n) { t->full[nb++]='.'; t->full[nb++]='.'; t->full[nb++]='.'; }
+    t->full[nb] = 0;
+}
+
 void settings_tip_reset(void) { g_tip_n = 0; g_sl_row = 0; }
 int settings_tip_count(void) { return g_tip_n; }
 const SettingsTip *settings_tip_at(int row, int col) {
@@ -1537,13 +1591,380 @@ static void settings_line_end(char *out, int bs, int *posp) {
     *posp += snprintf(out + *posp, bs - *posp, "\x1b[0m");
 }
 
+/* ===========================================================================
+ * v2.1.5：设置页滚动条 —— 右栏纵向一条 + 表头横向一格，都能拖滑块 / 点轨道翻页。
+ *
+ * 为什么要抽成「一份几何两边用」：滚动条画在某一行/某一列，命中判定就必须落在同一处，
+ * 否则「看得见却点不着 / 点着了滚的是别的东西」（v2.1.4 的表格列宽就是靠
+ * settings_menu_table_calc() 治的，这里同一套路）。
+ *
+ * 位置选择上刻意【不抢】任何现有预算：
+ *   纵条 = 终端最右一列 host_cols（右栏正文的预算本来就是 host_cols-main_left-1，
+ *          这一列从来没被写过）⇒ 行宽、可滚行数与 v2.1.4 逐字节一致；
+ *   横条 = 表头行行尾那 9 格（原先 «n/m» 文字标记的位置，正文已经按它让过位）
+ *          ⇒ 不新增列、不折行，窄终端那套「不越界」判据不受影响。
+ * ======================================================================== */
+int settings_bar_make(SettingsBar *b, int a, int b1, int total, int vis, int off) {
+    int len = b1 - a + 1, tl, maxoff = total - vis;
+    if (maxoff < 0) maxoff = 0;
+    if (off < 0) off = 0;
+    if (off > maxoff) off = maxoff;
+    if (len < 3 || maxoff <= 0 || total <= 0 || vis <= 0) return 0;
+    tl = (int)((long long)vis * len / total);
+    if (tl < 1) tl = 1;
+    if (tl > len) tl = len;
+    b->a = a; b->b = b1; b->total = total; b->vis = vis; b->off = off;
+    b->t0 = (len > tl) ? a + (int)((long long)off * (len - tl) / maxoff) : a;
+    if (b->t0 > b->a + (len - tl)) b->t0 = b->a + (len - tl);
+    b->t1 = b->t0 + tl - 1;
+    if (b->t1 > b1) b->t1 = b1;
+    return 1;
+}
+
+/* 命中：0 = 落在条外；1 = 落在滑块上（拖）；2 = 落在轨道上（按方向翻一页）。 */
+int settings_bar_hit(const SettingsBar *b, int pos) {
+    if (pos < b->a || pos > b->b) return 0;
+    return (pos >= b->t0 && pos <= b->t1) ? 1 : 2;
+}
+
+/* 由「点/拖到的那一格」算出新偏移。drag=1：滑块中心跟到这一格；
+ * drag=0：往那一侧翻一页（vis-1 格）。 */
+int settings_bar_pos_off(const SettingsBar *b, int pos, int drag) {
+    int maxoff = b->total - b->vis;
+    if (maxoff <= 0) return 0;
+    if (!drag) {
+        int v = b->off + (pos < b->t0 ? -(b->vis - 1) : (b->vis - 1));
+        if (v < 0) v = 0;
+        if (v > maxoff) v = maxoff;
+        return v;
+    }
+    int len = b->b - b->a + 1, tl = b->t1 - b->t0 + 1;
+    int span = len - tl;
+    if (span < 1) return maxoff;
+    int t0 = pos - (tl - 1) / 2;
+    if (t0 < b->a) t0 = b->a;
+    if (t0 > b->a + span) t0 = b->a + span;
+    int v = (int)(((long long)(t0 - b->a) * maxoff * 2 + span) / (2LL * span));
+    if (v < 0) v = 0;
+    if (v > maxoff) v = maxoff;
+    return v;
+}
+
+/* 这一页该用哪个纵向滚动量（与 settings_wheel_scroll 的分派同一套变量）。 */
+static int *settings_page_scroll_ptr(int nav) {
+    if (nav == SETTINGS_NAV_ITEMS) return &g_settings_manage_scroll;
+    if (nav == SETTINGS_NAV_STARTUP) return &g_settings_startup_scroll;
+    if (nav == SETTINGS_NAV_APPEARANCE) return &g_settings_appear_scroll;
+    if (nav == SETTINGS_NAV_BEHAVIOR) return &g_settings_behavior_scroll;
+    if (nav == SETTINGS_NAV_KEYS) return &g_settings_keys_scroll;
+    if (nav >= 1 && nav <= g_chooser_item_count) return &g_settings_detail_scroll;
+    return NULL;      /* 窗格配色页是两列布局，横竖条都不适用 */
+}
+
+/* 当前页的「聚焦行」在自然行序里的位置（各页自己那套 sel_natural 的同款算式）。
+ * 滚动条的可滚区间必须按它算：这些页每帧都会把行窗夹成「聚焦行不能滚出屏幕」，
+ * 所以条子的两端不是 [0, tot-vis] 而是 [max(0,sel-vis+1), min(tot-vis,sel)] ——
+ * 不然用户把滑块拖到底，画面却停在中间，条子永远差那么几格。 */
+static int settings_page_sel_natural(int host_rows) {
+    int nav = g_settings_nav;
+    if (nav == SETTINGS_NAV_ITEMS || nav == SETTINGS_NAV_STARTUP)
+        return (g_settings_table_sel >= 0) ? 10 + g_settings_table_sel : -1;
+    if (nav == SETTINGS_NAV_APPEARANCE) return settings_appearance_sel_natural(host_rows);
+    if (nav == SETTINGS_NAV_BEHAVIOR) return settings_behavior_sel_natural(host_rows);
+    if (nav == SETTINGS_NAV_KEYS) return SETTINGS_KEYS_ROW0 + g_settings_keys_sel;
+    if (nav >= 1 && nav <= g_chooser_item_count)
+        return (g_settings_field >= 0 && g_settings_field <= 3) ? 5 + g_settings_field * 2 : -1;
+    return -1;
+}
+
+
+/* 这一页原始的行窗（自然行 first..last、行数 tot、可视 vis、本页的滚动量 *sc）。
+ * 各页算 vis 的式子与它自己的 row_view 同式，滚动条才不会出现「条子说能滚、画面不动」。 */
+static int settings_page_band_raw(int host_rows, int *first_o, int *tot_o, int *vis_o, int **sc_o) {
+    int nav = g_settings_nav;
+    int *sc = settings_page_scroll_ptr(nav);
+    if (!sc) return 0;
+    int first, last, tot, v;
+    if (nav == SETTINGS_NAV_KEYS) {
+        first = SETTINGS_KEYS_ROW0;
+        tot = settings_keys_rows();
+        v = host_rows - first - 1;            /* 末行留给提示行（与键位页自己的算法同式） */
+        if (v < 1) v = 1;
+        if (v > tot) v = tot;
+        last = first + tot - 1;
+    } else {
+        if (nav == SETTINGS_NAV_ITEMS) {
+            first = SETTINGS_MANAGE_FIRST;
+            last = settings_manage_last();      /* 与 settings_manage_row_view 同式 */
+            tot = last - first + 1;
+        } else if (nav == SETTINGS_NAV_STARTUP) {
+            first = 3; last = settings_startup_last(host_rows);
+        } else if (nav == SETTINGS_NAV_APPEARANCE) {
+            first = SETTINGS_APPEAR_FIRST; last = SETTINGS_APPEAR_LAST;
+        } else if (nav == SETTINGS_NAV_BEHAVIOR) {
+            first = 3; last = SETTINGS_BEHAVIOR_LAST;
+        } else {
+            first = SETTINGS_DETAIL_FIRST; last = SETTINGS_DETAIL_LAST;
+        }
+        tot = last - first + 1;
+        if (tot < 1) return 0;
+        v = host_rows - first + 1;             /* 与 settings_page_row 同式（含 vis<3 兜底） */
+        if (v < 3) v = 3;
+        if (v > tot) v = tot;
+    }
+    *first_o = first; *tot_o = tot; *vis_o = v; *sc_o = sc;
+    return 1;
+}
+
+/* 本页允许的滚动量区间：这些页每帧都会把行窗夹成「聚焦行不能滚出屏幕」，所以条子的
+ * 两端不是 [0, tot-vis] 而是 [max(0,sel-vis+1), min(tot-vis,sel)] —— 不然滑块拖到底，
+ * 画面却停在中间，条子永远差那么几格。 */
+static void settings_page_band_span(int host_rows, int first, int tot, int vis,
+                                    int *lo, int *hi) {
+    int maxoff = tot - vis;
+    if (maxoff < 0) maxoff = 0;
+    int sel = settings_page_sel_natural(host_rows);
+    int l = 0, h = maxoff;
+    if (sel >= first) {
+        if (sel - first - vis + 1 > l) l = sel - first - vis + 1;
+        if (sel - first < h) h = sel - first;
+    }
+    if (l < 0) l = 0;
+    if (l > h) l = h;
+    *lo = l; *hi = h;
+}
+
+/* 这一页到底画不画纵条（浮层开着的时候不画：那几行归浮层，条子压在人家的边框上）。
+ * 画条子、命中测试、以及「标记让几列」三处必须问同一句，否则会各自算出一套。 */
+int settings_vbar_visible(int host_rows) {
+    if (g_settings_show_presets || g_settings_show_pane_schemes || g_hex_edit_active) return 0;
+    int r0, r1, tot, vis, off;
+    return settings_page_vband(host_rows, &r0, &r1, &tot, &vis, &off);
+}
+
+/* 当前页的纵向行窗（滚动条用）：返回 1 = 内容比行窗高，该画纵条。
+ * 出来的 total/off 是「条子口径」（已按上面的区间折算过），画与命中都用它。 */
+/* 「聚焦行跟着滚动条走」的那些页：条子的行程必须是【整页】，不能是「聚焦行附近」。
+ * 否则条目多时条子拖到头还看不见动作条/最后几条（用户说的就是这种「滚不动」）。
+ * 这些页在 settings_page_vset() 里会顺手把聚焦行挪到窗口顶端，所以放宽范围不会让
+ * 聚焦行跑出屏幕。 */
+static void settings_page_band_widen(int tot, int vis, int *lo, int *hi) {
+    if (g_settings_nav != SETTINGS_NAV_ITEMS) return;
+    int maxoff = tot - vis;
+    if (maxoff < 0) maxoff = 0;
+    if (*lo > 0) *lo = 0;
+    if (*hi < maxoff) *hi = maxoff;
+}
+
+int settings_page_vband(int host_rows, int *row0, int *row1, int *total, int *vis, int *off) {
+    int first, tot, v, *sc;
+    if (!settings_page_band_raw(host_rows, &first, &tot, &v, &sc)) return 0;
+    int lo = 0, hi = 0;
+    settings_page_band_span(host_rows, first, tot, v, &lo, &hi);
+    settings_page_band_widen(tot, v, &lo, &hi);
+    if (hi <= lo) return 0;
+    *total = hi - lo + v; *vis = v;
+    *off = *sc - lo;
+    if (*off < 0) *off = 0;
+    if (*off > hi - lo) *off = hi - lo;
+    *row0 = first; *row1 = first + v - 1;
+    if (*row1 > host_rows) *row1 = host_rows;
+    return 1;
+}
+
+void settings_page_vset(int host_rows, int v) {
+    int first, tot, vis, *sc;
+    if (!settings_page_band_raw(host_rows, &first, &tot, &vis, &sc)) return;
+    int lo = 0, hi = 0;
+    settings_page_band_span(host_rows, first, tot, vis, &lo, &hi);
+    settings_page_band_widen(tot, vis, &lo, &hi);
+    int nv0 = v < 0 ? 0 : (v > hi - lo ? hi - lo : v);
+    if (g_settings_nav == SETTINGS_NAV_ITEMS && g_chooser_item_count > 0) {
+        /* 条目管理页的行窗每帧都被「聚焦行」夹一遍（滚轮就是靠它走位的）。条子若只改
+         * 滚动量，一拖就被夹回聚焦行附近 ⇒ 看着像「拖不动」。所以这里把聚焦行一起挪到
+         * 窗口顶端：拖到哪儿就滚到哪儿，而且 ▶ 也跟着走，与滚轮同一套语义。 */
+        int nat_off = lo + nv0;                       /* 这一页自己的滚动量（自然行口径） */
+        int want_top = first + nat_off;
+        int selnat = want_top < 10 ? 10 : want_top;
+        if (selnat > 9 + g_chooser_item_count) selnat = 9 + g_chooser_item_count;
+        g_settings_table_sel = selnat - 10;
+        *sc = nat_off;
+        g_mux.needs_redraw = 1;
+        return;
+    }
+    *sc = lo + nv0;
+    g_mux.needs_redraw = 1;
+}
+
+/* 表头行那一格的横条：返回 0 = 这一页没有可滚的横向内容 / 放不下。 */
+int settings_hbar_geom(int host_rows, int host_cols, SettingsBar *b, int *row_out) {
+    int nav = g_settings_nav;
+    if (nav != SETTINGS_NAV_ITEMS) return 0;    /* v2.1.5：只有条目页的表需要横条 */
+    int sbw = settings_host_sidebar_w(host_cols);
+    int main_left = sbw + 3;
+    int cw = settings_canvas_w(host_cols, main_left);
+    int vw = host_cols - main_left - 1;
+    if (cw <= vw) return 0;
+    int hr = (nav == SETTINGS_NAV_ITEMS) ? settings_manage_row_view(host_rows, 9)
+                                        : settings_startup_row_view(host_rows, 9);
+    if (hr <= 0) return 0;
+    int mleft = settings_mark_left(host_rows, host_cols, hr, SETTINGS_HMARK_W - 1);
+    if (!mleft || mleft > host_cols - 4) return 0;
+    if (!settings_bar_make(b, mleft, host_cols - 1, cw, vw, settings_hscroll())) return 0;
+    if (row_out) *row_out = hr;
+    return 1;
+}
+
+void settings_hscroll_set(int host_rows, int host_cols, int v) {
+    int *p = &g_settings_hscroll[settings_hscroll_slot(g_settings_nav)];
+    *p = v;
+    int ml = settings_host_sidebar_w(host_cols) + 3;
+    settings_hscroll_clamp(host_rows, host_cols, ml, settings_canvas_w(host_cols, ml));
+    g_mux.needs_redraw = 1;
+}
+
+/* 一条滚动条：fixed = 纵条所在的列 / 横条所在的行（都是 1 基）。 */
+static void settings_bar_draw(const SettingsBar *b, int fixed, int horiz,
+                              char *out, int bs, int *posp) {
+    int pos = *posp;
+    for (int p = b->a; p <= b->b && pos < bs - 64; p++) {
+        int thumb = (p >= b->t0 && p <= b->t1);
+        int hov = horiz ? (fixed == g_mouse_y + 1 && p == g_mouse_x + 1)
+                        : (fixed == g_mouse_x + 1 && p == g_mouse_y + 1);
+        int r = horiz ? fixed : p, c = horiz ? p : fixed;
+        /* 条子只用【已登记在参考色板里】的色：滑块 = accent，滑块 hover = 侧栏 hover 那套
+         * 选区底，轨道 = 分隔线同色。新加 UI 色必须同步登记进 theme.c 的 g_theme_refs
+         * （verify_config_theme.py 逐色核对，漏一个就红）。 */
+        const char *sgr = thumb ? (hov ? "\x1b[048;2;048;075;110m\x1b[038;2;255;255;255;1m"
+                                      : "\x1b[048;2;121;192;255m\x1b[038;2;013;017;023;1m")
+                                : (hov ? "\x1b[038;2;121;192;255;1m" : "\x1b[038;2;048;054;061m");
+        const char *ch = thumb ? "\xe2\x96\x88" : (horiz ? "\xe2\x94\x80" : "\xe2\x94\x82");
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH%s%s\x1b[0m", r, c, sgr, ch);
+    }
+    *posp = pos;
+}
+
+void settings_vbar_draw(int host_rows, int host_cols, char *out, int bs, int *posp) {
+    if (g_settings_show_presets || g_settings_show_pane_schemes) return;   /* 浮层开着时不画 */
+    int r0, r1, tot, vis, off;
+    if (!settings_page_vband(host_rows, &r0, &r1, &tot, &vis, &off)) return;
+    SettingsBar b;
+    if (!settings_bar_make(&b, r0, r1, tot, vis, off)) return;
+    settings_bar_draw(&b, host_cols, 0, out, bs, posp);
+}
+
+/* 画在表头行行尾那 9 格上：左右两个尖括号保留（« » 就是「还能左右滚」的提示），
+ * 中间从原来的 «n/m» 文字换成可交互的滑块。 */
+void settings_hbar_draw(int host_rows, int host_cols, char *out, int bs, int *posp) {
+    SettingsBar b;
+    int hr = 0;
+    if (!settings_hbar_geom(host_rows, host_cols, &b, &hr)) return;
+    int pos = *posp;
+    SettingsBar inner = b;
+    if (b.b - b.a + 1 < 5) return;
+    inner.a = b.a + 1; inner.b = b.b - 1;
+    int maxoff = b.total - b.vis;
+    int ilen = inner.b - inner.a + 1;
+    int itl = (int)((long long)b.vis * ilen / b.total);
+    if (itl < 1) itl = 1;
+    if (itl > ilen) itl = ilen;
+    int irel = maxoff > 0 ? (int)((long long)b.off * (ilen - itl) / maxoff) : 0;
+    inner.t0 = inner.a + irel;
+    inner.t1 = inner.t0 + itl - 1;
+    if (inner.t1 > inner.b) inner.t1 = inner.b;
+    if (pos < bs - 96)
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[038;2;121;192;255m\xc2\xab\x1b[0m",
+                        hr, b.a);
+    settings_bar_draw(&inner, hr, 1, out, bs, &pos);
+    if (pos < bs - 64)
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[038;2;121;192;255m\xc2\xbb\x1b[0m",
+                        hr, b.b);
+    *posp = pos;
+}
+
+/* 滚动条的鼠标总入口：返回 1 = 这个事件已被条子吃掉。 */
+int settings_bars_mouse(int mx, int my, int press, int move) {
+    int host_rows = g_mux.host_rows, host_cols = g_mux.host_cols;
+    int r = my + 1, c = mx + 1;
+    if (!press) {
+        if (g_settings_bar_drag) { g_settings_bar_drag = 0; g_mux.needs_redraw = 1; }
+        return 0;
+    }
+    SettingsBar b;
+    if (!g_settings_bar_drag) {
+        int r0, r1, tot, vis, off;
+        /* v2.1.5（E）：极矮档的侧栏入口窗口条（画在分隔线那一列）。 */
+        if (!move && c == settings_host_sidebar_w(host_cols) + 1 - 1
+            && settings_sidebar_nav_win(host_rows, &r0, &r1, &tot, &vis, &off)
+            && settings_bar_make(&b, r0, r1, tot, vis, off)) {
+            int hit = settings_bar_hit(&b, r);
+            if (hit) {
+                g_settings_bar_drag = 3;
+                g_settings_sidebar_scroll = settings_bar_pos_off(&b, r, hit == 1);
+                if (g_settings_sidebar_scroll > tot - vis) g_settings_sidebar_scroll = tot - vis;
+                if (g_settings_sidebar_scroll < 0) g_settings_sidebar_scroll = 0;
+                g_mux.needs_redraw = 1;
+                return 1;
+            }
+        }
+        if (c == host_cols && settings_page_vband(host_rows, &r0, &r1, &tot, &vis, &off)
+            && settings_bar_make(&b, r0, r1, tot, vis, off)) {
+            int hit = settings_bar_hit(&b, r);
+            if (hit) {
+                g_settings_bar_drag = 1;
+                settings_page_vset(host_rows, settings_bar_pos_off(&b, r, hit == 1));
+                return 1;
+            }
+        }
+        int hr = 0;
+        if (settings_hbar_geom(host_rows, host_cols, &b, &hr) && r == hr) {
+            int hit = settings_bar_hit(&b, c);
+            if (hit) {
+                g_settings_bar_drag = 2;
+                settings_hscroll_set(host_rows, host_cols, settings_bar_pos_off(&b, c, hit == 1));
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (!move) return 1;                       /* 按住未动：也已经消费掉了 */
+    if (g_settings_bar_drag == 1) {
+        int r0, r1, tot, vis, off;
+        if (settings_page_vband(host_rows, &r0, &r1, &tot, &vis, &off)
+            && settings_bar_make(&b, r0, r1, tot, vis, off))
+            settings_page_vset(host_rows, settings_bar_pos_off(&b, r, 1));
+    } else if (g_settings_bar_drag == 2) {
+        if (settings_hbar_geom(host_rows, host_cols, &b, NULL))
+            settings_hscroll_set(host_rows, host_cols, settings_bar_pos_off(&b, c, 1));
+    } else if (g_settings_bar_drag == 3) {
+        int vr0, vr1, vt, vv, vo;
+        if (settings_sidebar_nav_win(host_rows, &vr0, &vr1, &vt, &vv, &vo)
+            && settings_bar_make(&b, vr0, vr1, vt, vv, vo)) {
+            g_settings_sidebar_scroll = settings_bar_pos_off(&b, r, 1);
+            if (g_settings_sidebar_scroll > vt - vv) g_settings_sidebar_scroll = vt - vv;
+            if (g_settings_sidebar_scroll < 0) g_settings_sidebar_scroll = 0;
+        }
+    }
+    return 1;
+}
+
 static void render_settings_items(char *out, int bs, int *posp, int host_rows, int host_cols, int main_left) {
     /* v2.1.4「条目管理」页：新建 / 快速预设库 / 每一项的 ↑↓改删 都收在这里，
      * 「启动」页那张表只留「设为启动默认」的单选。表本身与启动项页同一支函数画。 */
     int pos = *posp;
     settings_line_begin(out, bs, &pos, settings_manage_row_view(host_rows, 3),
                         main_left, host_cols, "\x1b[038;2;121;192;255;1m");
-        settings_line_text(out, bs, &pos, "\xe2\x96\xa0 \xe6\x9d\xa1\xe7\x9b\xae\xe7\xae\xa1\xe7\x90\x86 (Menu Items)");
+        {   /* v2.1.5：「设为启动默认」从启动页搬进这一页 ⇒ 标题行顺手说明当前默认是谁。 */
+            char ttl[256];
+            int di = g_default_startup - 2;
+            if (di >= 0 && di < g_chooser_item_count)
+                snprintf(ttl, sizeof(ttl), "\xe2\x96\xa0 条目管理 (Menu Items) —— 当前默认：%s",
+                         g_chooser_items[di].name);
+            else
+                snprintf(ttl, sizeof(ttl), "\xe2\x96\xa0 条目管理 (Menu Items) —— 当前默认：%s",
+                         g_default_startup == 1 ? "内置帮助" : "终端");
+            settings_line_text(out, bs, &pos, ttl);
+        }
         settings_line_end(out, bs, &pos);
     settings_line_begin(out, bs, &pos, settings_manage_row_view(host_rows, 4),
                         main_left, host_cols, "\x1b[038;2;139;148;158m");
@@ -1577,8 +1998,7 @@ static void render_settings_items(char *out, int bs, int *posp, int host_rows, i
             int mleft = settings_mark_left(host_rows, host_cols, hr, SETTINGS_HMARK_W - 1);
             settings_hline2(out, bs, &pos, hr, main_left, mleft ? mleft - 1 : host_cols,
                             g_cw, sg, ns, 40, 0, 0);
-            settings_hscroll_mark(out, bs, &pos, hr, host_cols, h_sc,
-                                  host_cols - main_left - 1, g_cw, host_rows);
+            settings_hbar_draw(host_rows, host_cols, out, bs, &pos);
         }
     }
     {
@@ -1594,14 +2014,28 @@ static void render_settings_items(char *out, int bs, int *posp, int host_rows, i
     /* 顶部动作条：[+] 新建条目 / [P] 快速预设库 */
     int btn_r = settings_manage_row_view(host_rows, 10 + g_chooser_item_count + 1);
     if (btn_r > 0) {
-        int h_add = (g_mouse_y == btn_r - 1 && g_mouse_x >= main_left - 1 && g_mouse_x < main_left + 13);
-        int h_pre = (g_mouse_y == btn_r - 1 && g_mouse_x >= main_left + 15 && g_mouse_x < main_left + 29);
+        /* 三段按钮：[+] 新建条目 / [P] 预设库 / [设为默认]。段间留 2 列，热区按
+         * settings_manage_action_span() 逐段推出来（与渲染同一份宽度）。 */
+        int w0 = settings_manage_action_span(0), w1 = settings_manage_action_span(1);
+        int w2 = settings_manage_action_span(2);
+        int x0 = main_left - 1, x1 = x0 + w0 + 2, x2 = x1 + w1 + 2;
+        int on_row = (g_mouse_y == btn_r - 1);
+        int h_add = (on_row && g_mouse_x >= x0 && g_mouse_x < x0 + w0);
+        int h_pre = (on_row && g_mouse_x >= x1 && g_mouse_x < x1 + w1);
+        int h_def = (on_row && g_mouse_x >= x2 && g_mouse_x < x2 + w2);
+        int di = g_default_startup - 2;
+        int def_on = (di == g_settings_table_sel);       /* 聚焦那条已经是默认 ⇒ 点亮 */
         settings_line_begin(out, bs, &pos, btn_r, main_left, host_cols, "\x1b[0m");
         settings_line_sgr(out, bs, &pos, h_add ? "\x1b[048;2;063;185;080m\x1b[038;2;013;017;023;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;063;185;080;1m");
-        settings_line_text_e(out, bs, &pos, " [+] \xe6\x96\xb0\xe5\xbb\xba\xe6\x9d\xa1\xe7\x9b\xae ", 0);
+        settings_line_text_e(out, bs, &pos, settings_manage_action_label(0), 0);
         settings_line_sgr(out, bs, &pos, "\x1b[0m");
         settings_line_sgr(out, bs, &pos, h_pre ? "\x1b[048;2;031;136;061m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;031;136;061;1m");
-        settings_line_text_e(out, bs, &pos, " [P] \xe9\xa2\x84\xe8\xae\xbe\xe5\xba\x93 ", 0);
+        settings_line_text_e(out, bs, &pos, settings_manage_action_label(1), 0);
+        settings_line_sgr(out, bs, &pos, "\x1b[0m");
+        settings_line_sgr(out, bs, &pos, h_def ? "\x1b[048;2;121;192;255m\x1b[038;2;013;017;023;1m"
+                                 : (def_on ? "\x1b[048;2;038;050;068m\x1b[038;2;121;192;255;1m"
+                                           : "\x1b[048;2;033;038;045m\x1b[038;2;121;192;255;1m"));
+        settings_line_text_e(out, bs, &pos, settings_manage_action_label(2), 0);
         settings_line_sgr(out, bs, &pos, "\x1b[0m");
         settings_line_end(out, bs, &pos);
     }
@@ -1613,11 +2047,11 @@ static void render_settings_items(char *out, int bs, int *posp, int host_rows, i
          * 与其让 settings_line_text 补「...」正好写满到最后一列（⇒ 自动折行盖掉下一行
          * 行首），不如直接换一条短的，整条都在预算里。 */
         const char *hint_long =
-            "\xe6\x8f\x90\xe7\xa4\xba: \xe2\x86\x91/\xe2\x86\x93 \xe9\x80\x89\xe6\x8b\xa9, Ctrl+\xe2\x86\x91/\xe2\x86\x93 \xe8\xb0\x83\xe5\xba\x8f, Enter \xe7\xbc\x96\xe8\xbe\x91, X \xe5\x88\xa0\xe9\x99\xa4, + \xe6\x96\xb0\xe5\xbb\xba, P \xe9\xa2\x84\xe8\xae\xbe, Shift+\xe6\xbb\x9a\xe8\xbd\xae \xe6\xa8\xaa\xe6\xbb\x9a";
+            "提示: ↑/↓ 选择, Ctrl+↑/↓ 调序, Enter 编辑, X 删除, + 新建, P 预设, S 设为默认, Shift+滚轮 横滚";
         const char *hint_short =
             "\xe6\x8f\x90\xe7\xa4\xba: \xe2\x86\x91/\xe2\x86\x93 \xe9\x80\x89\xe6\x8b\xa9, Ctrl+\xe2\x86\x91/\xe2\x86\x93 \xe8\xb0\x83\xe5\xba\x8f, Enter \xe7\xbc\x96\xe8\xbe\x91, X \xe5\x88\xa0\xe9\x99\xa4";
         int room = settings_mark_room(host_rows, host_cols, main_left, hint_r,
-                                      SETTINGS_MANAGE_FIRST, SETTINGS_MANAGE_LAST);
+                                      SETTINGS_MANAGE_FIRST, settings_manage_last());
         g_sl_left = (g_sl_left > room) ? (g_sl_left - room) : 0;   /* 0 ⇒ 整条提示不写 */
         const char *hint = utf8_cols(hint_long, (int)strlen(hint_long)) <= g_sl_left
                                ? hint_long : hint_short;
@@ -1625,7 +2059,7 @@ static void render_settings_items(char *out, int bs, int *posp, int host_rows, i
     }
     settings_line_end(out, bs, &pos);
     settings_page_mark(out, bs, &pos, hint_r, host_cols, host_rows, SETTINGS_MANAGE_FIRST,
-                       SETTINGS_MANAGE_LAST, &g_settings_manage_scroll);
+                       settings_manage_last(), &g_settings_manage_scroll);
     *posp = pos;
 }
 
@@ -2078,25 +2512,13 @@ void settings_wheel_scroll(int delta) {
             settings_sidebar_clamp_sel(g_mux.host_rows, total);
         }
     } else if (g_settings_nav == 0) {
-        /* v2.1.2：「启动」页的滚轮先滚侧栏那个菜单项窗口（用户报「导航选项要可以滚动」），
-         * 到顶/到底之后才带动右侧表格的选中项。 */
-        int total = g_chooser_item_count;
-        int vis = settings_sidebar_geom_cap(g_mux.host_rows, total);
-        int maxs = total - vis;
-        if (maxs < 0) maxs = 0;
-        int before = g_settings_sidebar_scroll;
-        g_settings_sidebar_scroll += (dir > 0 ? step : -step);
-        if (g_settings_sidebar_scroll > maxs) g_settings_sidebar_scroll = maxs;
-        if (g_settings_sidebar_scroll < 0) g_settings_sidebar_scroll = 0;
-        if (g_settings_sidebar_scroll == before) {     /* 窗口到头了，才动选中项 */
-            if (g_settings_table_sel < 0) g_settings_table_sel = 0;
-            if (dir > 0) { if (g_settings_table_sel < g_chooser_item_count - 1) g_settings_table_sel++; }
-            else if (g_settings_table_sel > 0) g_settings_table_sel--;
-        }
-        g_settings_startup_scroll += (dir > 0 ? step : -step);
-        if (g_settings_startup_scroll < 0) g_settings_startup_scroll = 0;
+        /* v2.1.5：启动页只剩几行了（条目表整张搬去「[M] 条目管理」页），所以滚轮滚的
+         * 就是这一页自己的行窗 —— 原先那套「先滚侧栏条目窗口、滚到头再带动选中项」
+         * 随侧栏条目列表一起去掉了。一页放得下时 maxs=0 ⇒ 什么都不做，条子也不画。 */
         int mx = settings_startup_last(g_mux.host_rows) - 3 - (g_mux.host_rows - 3);
         if (mx < 0) mx = 0;
+        g_settings_startup_scroll += (dir > 0 ? step : -step);
+        if (g_settings_startup_scroll < 0) g_settings_startup_scroll = 0;
         if (g_settings_startup_scroll > mx) g_settings_startup_scroll = mx;
     } else {
         int f = (g_settings_field < 0) ? 0 : g_settings_field;
@@ -2500,15 +2922,32 @@ void render_menu_rows(MenuRowCtx *rc) {
         /* %-Ns pads bytes, not terminal columns.  Build both fixed
          * columns with the same UTF-8 display-width helper used by the
          * renderer's other tables so CJK names cannot move the buttons. */
+        int name_col0 = row_cols;
         pos += snprintf(out + pos, bs - pos, "\x1b[038;2;230;237;243;1m");
         append_padded_utf8(out, bs, &pos, &row_cols, dname, mname);
         pos += snprintf(out + pos, bs - pos, "\x1b[0m%s  ", row_bg);
         row_cols += 2;
+        /* v2.1.5：这一档没有横向滚动（宽终端），装不下就只留「...」—— 所以必须在这里
+         * 登记气泡，否则长名字既滚不出来也查不到全文（侧栏那份条目列表撤掉之后，
+         * 表格里这两列是唯一的落点）。 */
+        {
+            const char *fn = g_chooser_items[i].name;
+            int fw = utf8_cols(fn, (int)strlen(fn));
+            int dnc = utf8_cols(dname, (int)strlen(dname));
+            if (mname > 0 && fw > mname && fw > dnc)
+                settings_tip_add(r, main_left + name_col0, fn, fw);
+        }
         if (mcmd_on) {
+            int cmd_col0 = row_cols;
             pos += snprintf(out + pos, bs - pos, "\x1b[038;2;139;148;158m");
             append_padded_utf8(out, bs, &pos, &row_cols, dcmd, mcw);
             pos += snprintf(out + pos, bs - pos, "\x1b[0m%s  ", row_bg);
             row_cols += 2;
+            const char *fc = g_chooser_items[i].cmd;
+            int fcw = utf8_cols(fc, (int)strlen(fc));
+            int dcc = utf8_cols(dcmd, (int)strlen(dcmd));
+            if (mcw > 0 && fcw > mcw && fcw > dcc)
+                settings_tip_add(r, main_left + cmd_col0, fc, fcw);
         }
 
         /* 按钮非 hover 时也要给一块自己的面板底色（022;027;034），否则聚焦/悬停
@@ -2785,7 +3224,7 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
         char navlab[64];
         int shown0 = sbg.items_scroll + 1;
         int shown1 = sbg.items_scroll + sbg.items_cap;
-        if (sbg.items_cap < g_chooser_item_count)
+        if (sbg.items_cap > 0 && sbg.items_cap < g_chooser_item_count)
             snprintf(navlab, sizeof(navlab), "  导航选项 (%d-%d/%d)", shown0, shown1, g_chooser_item_count);
         else
             snprintf(navlab, sizeof(navlab), "  导航选项");
@@ -2812,68 +3251,24 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
         pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H%s%s\x1b[0m", sbg.start, start_style, fit);
     }
 
-    for (int i = 0; i < sbg.items_cap; i++) {
-        int it = sbg.items_scroll + i;            /* v2.1.2：窗口内第 i 行 = 第 it 个菜单项 */
-        if (it < 0 || it >= g_chooser_item_count) continue;
-        int r = sbg.items_row0 + i;
-        if (r > host_rows - 3) break;
-        int is_sel = (g_settings_nav == it + 1);      /* 选中项按「自然项」比，不是窗口内序号 */
-        int h_item = (g_mouse_y == r - 1 && g_mouse_x >= 0 && g_mouse_x < sb_w);
-        const char *item_style = is_sel ? (h_item ? "\x1b[048;2;048;075;110m\x1b[038;2;255;255;255;1m" : "\x1b[048;2;038;060;088m\x1b[038;2;121;192;255;1m")
-                                        : (h_item ? "\x1b[048;2;033;038;045m\x1b[038;2;255;255;255;1m" : "\x1b[038;2;230;237;243m");
-        /* v2.1.2：名字按侧栏宽度截断并补「...」，同时登记悬停气泡（原先固定 %-10s，
-         * 10 列以后的名字直接消失，既没有省略号也查不到全文 —— 用户报「可以触发旁边的
-         * 悬停提示」却只有右侧窗格登记了气泡）。
-         * 这里【不能】借用 settings_line_*：它按 g_sl_left 记账，会吃掉下一次 begin
-         * 之前的预算，把侧栏下面的 [+] / [A] 等行整段挤掉（实测过，别再来一遍）。 */
-        char line[96];
-        snprintf(line, sizeof(line), "  %s [%d] ", is_sel ? "▶" : " ", it + 1);
-        int used = utf8_cols(line, (int)strlen(line));
-        int room = sb_w - 2 - used;                 /* v2.1.3：留出右侧 │ 那一列，宽字符舍入也不能踩到 */
-        if (room < 4) room = 4;
-        const char *nm = g_chooser_items[it].name;
-        int nw = utf8_cols(nm, (int)strlen(nm));
-        pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H%s%s", r, item_style, line);
-        if (nw <= room) {
-            pos += snprintf(out + pos, bs - pos, "%s", nm);
-        } else {
-            char cut[64];
-            int ci = 0, cc = 0;
-            for (int s0 = 0; s0 < (int)sizeof(cut) - 4; s0 = ci) {
-                int adv = 0;
-                unsigned cp = utf8_decode_cp(nm + s0, (int)strlen(nm) - s0, &adv);
-                if (adv <= 0) break;
-                int cw = is_wide_cp(cp) ? 2 : 1;
-                if (cc + cw > room - 3) break;
-                for (int q = 0; q < adv && ci < (int)sizeof(cut) - 4; q++) cut[ci++] = nm[s0 + q];
-                cc += cw;
-            }
-            cut[ci++] = '.'; cut[ci++] = '.'; cut[ci++] = '.'; cut[ci] = 0;
-            pos += snprintf(out + pos, bs - pos, "%s", cut);
-            if (g_tip_n < SETTINGS_TIP_MAX) {
-                SettingsTip *t = &g_tips[g_tip_n++];
-                t->row = r; t->col = used + 1; t->len = used + nw;
-                /* 气泡正文的拷贝必须停在【字符】边界上：snprintf 按字节截断会把半个
-                 * UTF-8 序列留在串尾，渲染时解码成 '?'，框宽也会跟着差一列。 */
-                int nb = 0;
-                int s0 = 0, nmlen = (int)strlen(nm);
-                while (s0 < nmlen) {
-                    int adv = 0;
-                    (void)utf8_decode_cp(nm + s0, nmlen - s0, &adv);
-                    if (adv <= 0 || s0 + adv > nmlen) break;
-                    if (nb + adv >= (int)sizeof(t->full) - 4) break;   /* 留位给「...」 */
-                    for (int q = 0; q < adv; q++) t->full[nb++] = nm[s0 + q];
-                    s0 += adv;
-                }
-                if (s0 < nmlen) { t->full[nb++]='.'; t->full[nb++]='.'; t->full[nb++]='.'; }
-                t->full[nb] = 0;
-            }
-        }
-        pos += snprintf(out + pos, bs - pos, "\x1b[0m");
+    if (sbg.items_row0 > 0 && sbg.items_row0 <= host_rows - 3) {
+        /* v2.1.5：条目不再列在侧栏；腾出来的那一格只写一行只读摘要。 */
+        int di = g_default_startup - 2;
+        char lab[96], fit[96];
+        if (di >= 0 && di < g_chooser_item_count)
+            snprintf(lab, sizeof(lab), "  默认：%s", g_chooser_items[di].name);
+        else
+            snprintf(lab, sizeof(lab), "  默认：%s", g_default_startup == 1 ? "内置帮助" : "终端");
+        sidebar_clip(fit, sizeof(fit), lab, sb_w - 1);
+        pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H\x1b[038;2;110;118;129m%s\x1b[0m",
+                        sbg.items_row0, fit);
     }
+    /* v2.1.5：这里原来是「侧栏里的菜单项列表窗口」（含逐条截断 + 悬停气泡），随着条目
+     * 从侧栏撤掉一并删除 —— 条目一律在「[M] 条目管理」页里看/改，那一页的表格自己带
+     * 截断气泡（见 render_menu_rows）。腾出来的行给底部那一排入口用（见 sidebar_geom）。 */
 
     int items_r = sbg.items;
-    if (items_r > 0 && items_r <= host_rows - 2) {
+    if (items_r >= sbg.nav_row0 && items_r > 0 && items_r <= host_rows - 2) {
         /* v2.1.4：[+] 添加新条目 / [P] 快速预设库 → 一条「[M] 条目管理」入口。 */
         int is_sel = (g_settings_nav == SETTINGS_NAV_ITEMS);
         int h_it = (g_mouse_y == items_r - 1 && g_mouse_x >= 0 && g_mouse_x < sb_w);
@@ -2894,6 +3289,7 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
     for (int i = 0; i < 4; i++) {
         int row = extra_nav[i].row;
         if (row > host_rows - 1) break;
+        if (row < sbg.nav_row0) continue;      /* v2.1.5：被窗口滚到上面去了的入口不画 */
         int is_sel = (g_settings_nav == extra_nav[i].nav);
         int hovered = (g_mouse_y == row - 1 && g_mouse_x >= 0 && g_mouse_x < sb_w);
         /* v2.1.3：这四条原本写死 18~20 列的定宽串。侧栏被窄终端夹到 15~19 列时，
@@ -2911,6 +3307,23 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
         char sv[64];
         sidebar_clip(sv, sizeof(sv), " [Ctrl+S] 保存配置  ", sb_w - 1);   /* v2.1.3 */
         pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H%s%s\x1b[0m", save_r, h_save_btn ? "\x1b[048;2;063;185;080m\x1b[038;2;013;017;023;1m" : "\x1b[048;2;033;038;045m\x1b[038;2;063;185;080;1m", sv);
+    }
+
+    {   /* v2.1.5（E）：极矮档侧栏入口窗口放不下 5 条 ⇒ 在分隔线那一列画一根细滚动条。
+         * 选分隔线而不是 sb_w-1：后者是侧栏正文的最后一格，长标签（[Ctrl+S] 保存配置）
+         * 会被裁到那儿，条子就会啃掉标签的收尾字符。 */
+        int vr0, vr1, vt, vv, vo;
+        if (settings_sidebar_nav_win(host_rows, &vr0, &vr1, &vt, &vv, &vo)) {
+            SettingsBar vb;
+            if (settings_bar_make(&vb, vr0, vr1, vt, vv, vo)) {
+                for (int rr = vr0; rr <= vr1 && pos < bs - 24; rr++) {
+                    int thumb = (rr >= vb.t0 && rr <= vb.t1);
+                    pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH%s\x1b[0m", rr, sb_w,
+                                    thumb ? "\x1b[038;2;121;192;255;1m\xe2\x96\x88"
+                                          : "\x1b[038;2;048;054;061m\xe2\x94\x82");
+                }
+            }
+        }
     }
 
     int main_left = sb_w + 3;
@@ -2967,68 +3380,30 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
             (void)fit;
         }
 
-        settings_line_begin(out, bs, &pos, settings_startup_row_view(host_rows, 7), main_left, host_cols, "\x1b[038;2;121;192;255;1m");
-        settings_line_text(out, bs, &pos, "■ 菜单项一览 (Menu Items)");
-        settings_line_end(out, bs, &pos);
-        settings_line_begin(out, bs, &pos, settings_startup_row_view(host_rows, 8), main_left, host_cols, "\x1b[038;2;139;148;158m");
-        settings_line_text(out, bs, &pos, "启动菜单项：点它 / ↑↓ 选中，←/→ 或 Space 设为启动默认；增删改在 [M] 条目管理");
-        settings_line_end(out, bs, &pos);
-
-        /* 表头：几何在下面的 settings_menu_table_geom() 里算，所以先算好再画这一行。 */
-        int g_cw = 0, g_nw = 0, g_cw2 = 0, g_bc = 0, g_ud = 0, g_btn = 0;
-        settings_menu_table_geom(host_rows, host_cols, main_left, &g_cw, &g_nw, &g_cw2,
-                                 &g_bc, &g_ud, &g_btn);
-        int h_on = (g_cw > host_cols - main_left - 1);
-        int h_sc = h_on ? settings_hscroll() : 0;
+        /* v2.1.5：原先这里是「■ 菜单项一览」标题 + 说明 + 表头 + n 行只读表。现在条目
+         * 只在「[M] 条目管理」页出现，这一页只留一行只读摘要（当前默认是谁）。 */
+        int dfl_r = settings_startup_row_view(host_rows, 7);
+        settings_line_begin(out, bs, &pos, dfl_r, main_left, host_cols, "\x1b[038;2;139;148;158m");
         {
-            int hr = settings_startup_row_view(host_rows, 9);
-            if (hr > 0) {
-                if (!h_on) {
-                    settings_line_begin(out, bs, &pos, hr, main_left, host_cols, "\x1b[038;2;121;192;255;1m");
-                    char head[192];
-                    /* v2.1.3：表头按实际列宽拼（原先写死一串空格，窄终端下比整行还宽 ⇒ 折行盖掉下一行） */
-                    if (settings_menu_header(head, sizeof(head), host_cols, main_left) > 0)
-                        settings_line_text(out, bs, &pos, head);
-                    settings_line_end(out, bs, &pos);
-                } else {
-                    int pre = settings_menu_pre_w(g_cw + main_left + 1, main_left);
-                    SettingsSeg sg[5]; int ns = 0;
-                    sg[ns].sgr = "\x1b[0m"; sg[ns].text = ""; sg[ns].pad_to_col = pre - 5; ns++;
-                    sg[ns].sgr = "\x1b[038;2;121;192;255;1m"; sg[ns].text = "\xe5\xba\x8f\xe5\x8f\xb7"; sg[ns].pad_to_col = pre; ns++;
-                    if (g_nw) { sg[ns].sgr = "\x1b[038;2;121;192;255;1m"; sg[ns].text = "\xe6\x98\xbe\xe7\xa4\xba\xe5\x90\x8d\xe7\xa7\xb0"; sg[ns].pad_to_col = pre + g_nw; ns++; }
-                    if (g_btn) { sg[ns].sgr = "\x1b[0m\x1b[038;2;121;192;255;1m"; sg[ns].text = "\xe6\x93\x8d\xe4\xbd\x9c"; sg[ns].pad_to_col = 0; ns++; }
-                    int mleft = settings_mark_left(host_rows, host_cols, hr, SETTINGS_HMARK_W - 1);
-                    settings_hline2(out, bs, &pos, hr, main_left, mleft ? mleft - 1 : host_cols,
-                                    g_cw, sg, ns, 40, 0, 0);   /* 同上：给 «n/m» 标记让位 */
-                settings_hscroll_mark(out, bs, &pos, hr, host_cols, h_sc,
-                                      host_cols - main_left - 1, g_cw, host_rows);
-                }
-            }
+            char lab[224];
+            int di = g_default_startup - 2;
+            if (di >= 0 && di < g_chooser_item_count)
+                snprintf(lab, sizeof(lab), "当前默认启动项：%s（%s）—— 要改条目就去 [M] 条目管理",
+                         g_chooser_items[di].name, g_chooser_items[di].cmd);
+            else
+                snprintf(lab, sizeof(lab), "当前默认启动项：%s —— 要改条目就去 [M] 条目管理",
+                         g_default_startup == 1 ? "内置帮助 (Help)" : "终端 (Terminal)");
+            settings_line_text(out, bs, &pos, lab);
         }
+        settings_line_end(out, bs, &pos);
 
-
-        {   /* 表格行（与「条目管理」页共用同一支绘制函数） */
-            MenuRowCtx rc; rc.out = out; rc.bs = bs; rc.pos = &pos;
-            rc.host_rows = host_rows; rc.host_cols = host_cols; rc.main_left = main_left;
-            rc.sel = g_settings_table_sel; rc.row_view = settings_startup_row_view;
-            rc.h_on = h_on; rc.h_sc = h_sc; rc.cw = g_cw;
-            rc.nw = g_nw; rc.cw2 = g_cw2; rc.bc = g_bc; rc.ud = g_ud; rc.btn = g_btn;
-            rc.show_ops = 0;   /* 启动项页的表只读：编辑动作都在「条目管理」页 */
-            render_menu_rows(&rc);
-        }
-        /* v2.1.4：这一页原先有「[+] 添加条目 / [P] 快速预设」两个按钮和每行的
-         * [↑][↓][改][删]。现在整张表只读（只有「设为启动默认」的单选与 ←/→），
-         * 增删改与排序统一到侧栏的「[M] 条目管理」页 —— 少一行按钮，多一行表。 */
-
-        /* v2.1.3：滚出可见区就整行不画（原先 `if (hint_r < 0) hint_r = host_rows;`
-         * 会把它硬塞到末行，正好盖住侧栏的保存行）。 */
-        int hint_r = settings_startup_row_view(host_rows, 12 + g_chooser_item_count);
+        int hint_r = settings_startup_row_view(host_rows, 8);
         settings_line_begin(out, bs, &pos, hint_r, main_left, host_cols, "\x1b[038;2;139;148;158m");
-        {   /* 同「条目管理」页：窄终端下先给行窗口标记让位 */
+        {   /* 提示行也得给行窗口标记让位（极矮终端时这一页仍然要滚） */
             int room = settings_mark_room(host_rows, host_cols, main_left, hint_r, 3,
                                           settings_startup_last(host_rows));
             g_sl_left = (g_sl_left > room) ? (g_sl_left - room) : 0;
-            settings_line_text(out, bs, &pos, "提示: ←/→/Space 设启动默认, T 终端, H 帮助, M 条目管理, Ctrl+S 保存, Esc 退出");
+            settings_line_text(out, bs, &pos, "提示: T 终端, H 帮助, M 条目管理, Ctrl+S 保存, Esc 退出");
         }
         settings_line_end(out, bs, &pos);
         settings_page_mark(out, bs, &pos, hint_r, host_cols, host_rows, 3,
@@ -3140,6 +3515,11 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
                                SETTINGS_DETAIL_FIRST, SETTINGS_DETAIL_LAST, &g_settings_detail_scroll);
         }
     }
+
+    /* v2.1.5：右栏纵向滚动条（浮层之前画，浮层仍盖在它上面）。 */
+
+    /* v2.1.5：右栏纵向滚动条画在最右一列（正文预算从来不动它），浮层仍盖在它上面。 */
+    settings_vbar_draw(host_rows, host_cols, out, bs, &pos);
 
     if (g_settings_show_presets) {
         render_settings_presets(out, bs, &pos, host_rows, host_cols);

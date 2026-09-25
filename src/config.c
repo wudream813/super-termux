@@ -30,7 +30,8 @@ int g_settings_show_pane_schemes = 0;
 int g_settings_pane_scroll = 0;
 int g_settings_appear_scroll = 0;
 int g_settings_manage_scroll = 0;        /* v2.1.4：条目管理页纵向滚动 */
-int g_settings_hscroll[6] = {0};       /* v2.1.4：右栏横向滚动量（每页一格，不写进 ini） */
+int g_settings_hscroll[6] = {0};
+int g_settings_bar_drag = 0;        /* v2.1.5：正在拖哪根滚动条（0 = 没拖） */       /* v2.1.4：右栏横向滚动量（每页一格，不写进 ini） */
 int g_settings_sidebar_scroll = 0;   /* v2.1.2：侧栏菜单项列表滚动量（不写进 ini） */
 int g_settings_behavior_scroll = 0;
 int g_settings_detail_scroll = 0;

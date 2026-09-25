@@ -2181,6 +2181,19 @@ static void settings_scrollback_step(int delta) {
 /* v2.1.4：条目管理页 —— 新建 / 预设库 / 每行 ↑↓改删 全在这一页。
  * 表与「启动」页那一支渲染函数共用几何，所以这里的行号换算、按钮热区都走
  * settings_manage_row_view() / settings_menu_*()。 */
+/* 把条目管理页聚焦的那一条设为启动默认；已经是默认或没选中项就不动（返回 0）。
+ * 点动作条的 [设为默认] 与按 S 都走这里 —— 启动页已经不列条目表了（v2.1.5）。 */
+static int settings_manage_set_default_startup(void) {
+    /* 表还没聚焦（进页面时 g_settings_table_sel = -1）就按「设为默认」时取第一行 ——
+     * 否则这颗按钮在一进页面时是死的。 */
+    int i = g_settings_table_sel < 0 ? 0 : g_settings_table_sel;
+    if (i >= g_chooser_item_count) return 0;
+    if (g_default_startup == 2 + i) return 0;
+    g_default_startup = 2 + i;
+    save_config();
+    return 1;
+}
+
 static void handle_settings_items_key(WORD vk, WCHAR uc, BOOL is_ctrl) {
     if (vk == VK_ESCAPE) { settings_leave_subpage(); return; }
     int n = g_chooser_item_count;
@@ -2193,6 +2206,10 @@ static void handle_settings_items_key(WORD vk, WCHAR uc, BOOL is_ctrl) {
         settings_hscroll_follow(g_mux.host_rows, g_mux.host_cols,
                                settings_host_sidebar_w(g_mux.host_cols) + 3, 4, 20);
         g_mux.needs_redraw = 1;
+        return;
+    }
+    if (uc == 's' || uc == 'S') {          /* v2.1.5：这一页也管「设为启动默认」 */
+        if (settings_manage_set_default_startup()) g_mux.needs_redraw = 1;
         return;
     }
     if (vk == VK_F2) { g_settings_nav = SETTINGS_NAV_APPEARANCE; g_mux.needs_redraw = 1; return; }
@@ -2711,18 +2728,26 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             }
             g_hex_edit_role = -1;
         }
-        /* v2.1.2：「启动」页（nav==0）的滚轮滚的是侧栏菜单项列表的窗口 —— 这一页右侧
-         * 是「默认启动项 + 菜单项管理表」，用户报的「导航选项要可以滚动，而不是省略成
-         * 添加(共N项)」就在这儿；指针在侧栏还是右侧都算（右侧那半屏本来就跟着整页走）。 */
-        if (g_settings_nav == SETTINGS_NAV_STARTUP) {
-            int dir = (d > 0) ? -1 : 1;
-            g_settings_sidebar_scroll += dir * 3;
-            g_mux.needs_redraw = 1;
-            return;
+        {   /* v2.1.5（E）：终端矮到侧栏那一排入口（[M][A][K][B][W]）摆不下时，指针在侧栏
+             * 上的滚轮先翻这一排（老版直接把 [W] 丢掉 ⇒ 极矮档根本进不去窗格页）。
+             * 只有「真的放不下」才接管，正常屏高一行都不受影响。 */
+            int vr0, vr1, vt, vv, vo;
+            int sb_w = settings_host_sidebar_w(host_cols);
+            if (mx + 1 <= sb_w && settings_sidebar_nav_win(host_rows, &vr0, &vr1, &vt, &vv, &vo)) {
+                g_settings_sidebar_scroll += (d > 0 ? -1 : 1);
+                if (g_settings_sidebar_scroll > vt - vv) g_settings_sidebar_scroll = vt - vv;
+                if (g_settings_sidebar_scroll < 0) g_settings_sidebar_scroll = 0;
+                g_mux.needs_redraw = 1;
+                return;
+            }
         }
         settings_wheel_scroll(d);
         return;
     }
+    /* v2.1.5：滚动条优先 —— 按下滑块 = 开始拖，之后带键的 MOUSE_MOVED 一路拖，点轨道按方向翻一页；
+     * 松开（press=0）清掉拖动状态。这几个事件都不该再落到页面命中判定里，否则拖条子会顺手改掉选中行。 */
+    if (settings_bars_mouse(mx, my, press, me->dwEventFlags == MOUSE_MOVED)) return;
+
     if (!press || (me->dwEventFlags != 0 && me->dwEventFlags != DOUBLE_CLICK)) return;
 
     int sb_w = settings_host_sidebar_w(host_cols);      /* v2.1.2：与渲染共用同一式 */
@@ -2800,15 +2825,8 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             g_mux.needs_redraw = 1;
             return;
         }
-        for (int i = 0; i < sbg.items_cap; i++) {          /* v2.1.2：命中按「窗口内第 i 行」反查 */
-            if (r != sbg.items_row0 + i) continue;
-            int it = sbg.items_scroll + i;
-            if (it < 0 || it >= g_chooser_item_count) return;
-            g_settings_nav = it + 1;
-            load_item_to_editor(it);
-            g_mux.needs_redraw = 1;
-            return;
-        }
+        /* v2.1.5：侧栏不再列条目（[1] cmd 那一串已经撤掉），所以这里没有「点条目行 =
+         * 进详情页」一事了 —— 看/改条目统一走「[M] 条目管理」页（点行 / Enter / [改]）。 */
         if (r == sbg.items) {              /* v2.1.4：[M] 条目管理 */
             g_key_capture_active = 0;
             g_hex_edit_active = 0;
@@ -3022,8 +3040,12 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                 g_mux.needs_redraw = 1;
                 return;
             }
-            if (snat == 10 + g_chooser_item_count + 1) {      /* 动作条：[+] / [P] */
-                if (vc >= 0 && vc < 14) {
+            if (snat == 10 + g_chooser_item_count + 1) {      /* 动作条：[+] / [P] / [设为默认] */
+                /* 段宽由 settings_manage_action_span() 给（与渲染同一份），不再写死 14/29。 */
+                int aw0 = settings_manage_action_span(0), aw1 = settings_manage_action_span(1);
+                int aw2 = settings_manage_action_span(2);
+                int ax1 = aw0 + 2, ax2 = ax1 + aw1 + 2;
+                if (vc >= 0 && vc < aw0) {
                     if (g_chooser_item_count < MAX_CHOOSER_ITEMS) {
                         int idx = g_chooser_item_count++;
                         snprintf(g_chooser_items[idx].name, sizeof(g_chooser_items[0].name), "新终端");
@@ -3038,10 +3060,14 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                         return;
                     }
                 }
-                if (vc >= 15 && vc < 29) {
+                if (vc >= ax1 && vc < ax1 + aw1) {
                     g_settings_show_presets = 1;
                     g_preset_sel = 0;
                     g_mux.needs_redraw = 1;
+                    return;
+                }
+                if (vc >= ax2 && vc < ax2 + aw2) {
+                    if (settings_manage_set_default_startup()) g_mux.needs_redraw = 1;
                     return;
                 }
             }

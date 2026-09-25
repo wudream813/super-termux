@@ -144,6 +144,10 @@ void render_settings_presets(char *out, int bs, int *posp, int host_rows, int ho
 void presets_geom(int host_rows, int host_cols, int *top, int *left, int *w, int *h, int *max_nw, int *max_cw);
 void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host_cols);
 void settings_sidebar_extra_rows(int *appearance_r, int *keys_r, int *behavior_r);
+/* v2.1.5：极矮档（终端矮到侧栏底部那一排入口摆不下）的侧栏入口窗口。返回 1 = 该画滚动条。
+ * 画、命中、滚轮三处必须共用它，否则会各算一套。 */
+int  settings_sidebar_nav_win(int host_rows, int *row0, int *row1,
+                              int *total, int *vis, int *off);
 
 /* ===========================================================================
  * v2.1.0：矮终端纵向滚动 + 窄屏截断的悬停气泡
@@ -228,6 +232,7 @@ int  settings_behavior_natural_at(int host_rows, int row);
 int  settings_detail_row_view(int host_rows, int natural);
 int  settings_startup_row_view(int host_rows, int natural);
 int  settings_manage_row_view(int host_rows, int natural);   /* v2.1.4：条目管理页 */
+int  settings_manage_last(void);                       /* v2.1.5：条目管理页末行（随条目数长） */
 int  settings_manage_natural_at(int host_rows, int row);
 int  settings_startup_natural_at(int host_rows, int row);
 int  settings_detail_natural_at(int host_rows, int row);
@@ -237,6 +242,8 @@ typedef struct {
     int app, keys, beh, pane, save;
     int compact, nav_tight;   /* nav_tight = 矮终端把底部那一排再挤紧一档（沿用上一版 hide_presets 的触发条件） */
     int items_scroll;                          /* v2.1.2：菜单项列表滚动量（已夹好） */
+    int yield_row;      /* v2.1.5：右栏「从这一行起要给侧栏让位」的门槛（沿用上一版行位，动不得） */
+    int nav_row0, nav_hi, nav_total, nav_vis, nav_off;   /* v2.1.5：极矮档侧栏入口窗口 */
 } SettingsSidebarGeom;
 void settings_sidebar_geom(int host_rows, int item_count, SettingsSidebarGeom *g);
 /* v2.1.2：只问「这一屏侧栏能放几行菜单项」。 */
@@ -352,6 +359,29 @@ int render_sb_cols_ok(int cols, int in_alt_screen);
  * 刚敲的字被滚动条的空格盖掉，光标看着像卡住不动（2026-09-20 用户报）。
  * 光标正落在右缘列时那一行不画滚动条，让刚敲的字始终可见。 */
 int render_sb_spare_row(int cursor_visible, int cursor_x, int cursor_y, int cols);
+
+/* v2.1.5：条目管理页顶部动作条的三段（渲染与鼠标命中同一份标签/宽度）。 */
+const char *settings_manage_action_label(int which);   /* 0=[+] 1=[P] 2=[设为默认] */
+int settings_manage_action_span(int which);            /* 该段的显示列数 */
+
+/* ==== v2.1.5：设置页滚动条（画与命中同一份几何）==== */
+typedef struct {
+    int a, b;               /* 轨道格范围（1 基，含）：纵条 = 行号，横条 = 终端列 */
+    int total, vis, off;    /* 内容长 / 视口长 / 当前偏移（0 基） */
+    int t0, t1;             /* 滑块格范围（含） */
+} SettingsBar;
+int  settings_bar_make(SettingsBar *b, int a, int b1, int total, int vis, int off);
+int  settings_bar_hit(const SettingsBar *b, int pos);
+int  settings_bar_pos_off(const SettingsBar *b, int pos, int drag);
+/* 当前页的纵向行窗：返回 1 = 这页内容比行窗高（该画纵条）。窗格配色页返回 0。 */
+int  settings_page_vband(int host_rows, int *row0, int *row1, int *total, int *vis, int *off);
+void settings_page_vset(int host_rows, int v);
+int  settings_hbar_geom(int host_rows, int host_cols, SettingsBar *b, int *row_out);
+void settings_hbar_draw(int host_rows, int host_cols, char *out, int bs, int *posp);
+void settings_vbar_draw(int host_rows, int host_cols, char *out, int bs, int *posp);
+void settings_hscroll_set(int host_rows, int host_cols, int v);
+/* 1 = 这个鼠标事件是滚动条吃掉的（按下/拖动/松开），页面命中判定不要再走。 */
+int  settings_bars_mouse(int mx, int my, int press, int move);
 
 void render_cleanup(void);
 

@@ -925,12 +925,14 @@ int main(int argc, char **argv) {
            "■ 配色主题 (Theme)" not in m1b and "■ 配色主题 (Theme)" in m2
            and w2 is not None and w2.group(1) == wa.group(1) == "3",
            "base=%s after-roundtrip=%s" % (wa and wa.groups(), w2 and w2.groups()))
-        # M3 启动项页 / 详情页
-        ini3 = "[menu]\n1 = sh, /bin/sh\n2 = two, /bin/bash\n3 = three, /bin/sh\n"
-        m3a = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s"], ini=ini3)) or [])
-        m3b = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", wheel(60, 8, 3)], ini=ini3)) or [])
-        ck("M3 12 行 × 启动项页：滚轮向下能把第 3 个菜单项滚进可见区",
-           "three" not in m3a and "three" in m3b, "")
+        # M3 条目管理页 / 详情页（v2.1.5：启动页只剩「当前默认」那几行，条目表整张在 [M] 页）
+        ini5m3 = ("[menu]\n1 = sh, /bin/sh\n2 = two, /bin/bash\n3 = three, /bin/sh\n"
+                  "4 = four, /bin/sh\n5 = five, /bin/sh\n")
+        m3a = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"m"], ini=ini5m3)) or [])
+        m3b = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"m", wheel(60, 8, 3)], ini=ini5m3)) or [])
+        ck("M3 12 行 × 条目管理页：滚轮（指针在右侧表上）能把后面的条目滚进可见区",
+           "five" not in m3a and "▶[5]  five" in m3b and "three" in m3b,
+           "基线=%r 滚后=%r" % (m3a[-160:], m3b[-160:]))
         # v2.1.4：启动项页的 Enter 只设「启动默认」，进详情页要先 m 去条目管理页再 Enter。
         m3c = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", wheel(60, 8, 3),
                                                                       b"m", b"\r", wheel(60, 8, 2)],
@@ -1017,31 +1019,43 @@ int main(int argc, char **argv) {
             res.append((int(m.group(1)), int(m.group(2)), pos))
         return res
 
+    def tip_move(lines, needle):
+        """v2.1.5：在屏幕文本里找 needle（被截断成「...」的那段）所在行 + 起始显示列，
+        拼出「把指针悬到那一格上」的 SGR 序列。行/列都不写死 —— 侧栏与右栏的行位会随
+        屏高变，写死就是「只在某一档成立」的判据。找不到就返回空串（判据会红，比假绿好）。"""
+        for i, l in enumerate(lines):
+            j = l.find(needle)
+            if j >= 0:
+                return ("\x1b[<35;%d;%dM" % (dispw(l[:j]) + 3, i + 1)).encode()
+        return b""
+
     nini5 = ("[menu]\n1 = sh, /bin/sh\n2 = 一个非常长的菜单项名字用来验证截断, /bin/bash\n"
              "3 = three, /bin/sh\n4 = four, /bin/sh\n5 = five, /bin/sh\n")
     nlong = "一" * 20                       # 60 字节：老结构体（32 字节）装不下，会被从中间切断
     nini_long = "[menu]\n1 = sh, /bin/sh\n2 = %s, /bin/bash\n" % nlong
 
-    n1a = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s"], ini=nini5)) or [])
-    n1b = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", wheel(60, 6, 3)], ini=nini5)) or [])
-    ck("N1 12 行 × 侧栏列表是窗口：滚轮能把第 4/5 项滚进来（不再写死成「添加(共N项)」）",
-       "  [1] sh" in n1a and "  [4] four" not in n1a and "  [4] four" in n1b and "  [1] sh" not in n1b
-       and "添加(共" not in n1a, "")
-    n1c = "\n".join(vt_text(13, 100, capture_page_keys(13, 100, [b"\x02s", wheel(60, 6, 2)], ini=nini5)) or [])
-    n1d = "\n".join(vt_text(13, 100, capture_page_keys(13, 100, [b"\x02s", wheel(60, 6, 2),
-                                                                  wheel(60, 6, 4, down=False)], ini=nini5)) or [])
-    ck("N1 13 行 × 滚轮向下换窗口、向上能滚回第 1 项",
-       "  [3] three" in n1c and "  [5] five" in n1c and "  [1] sh" not in n1c
-       and "  [1] sh" in n1d and "  [2] 一" in n1d, "")
+    # v2.1.5：侧栏不再列条目（用户：「左侧不要再额外放 [1] cmd 那一串」）⇒ 「第 4/5 项滚不滚得
+    # 进来」这件事整个挪到右侧的「[M] 条目管理」页；指针停在侧栏上滚也算（同一页只有一个窗口）。
+    n1a = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"m"], ini=nini5)) or [])
+    n1b = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"m", wheel(6, 6, 3)], ini=nini5)) or [])
+    ck("N1 12 行 × 条目管理页：指针停在侧栏上滚，滚的也是这一页（侧栏没条目列表可滚了）",
+       "[1]  sh" in n1a and "[5]" not in n1a and "▶[5]  five" in n1b and "添加(共" not in n1a,
+       "基线=%r 滚后=%r" % (n1a[-160:], n1b[-160:]))
+    n1c = "\n".join(vt_text(13, 100, capture_page_keys(13, 100, [b"\x02s", b"m", wheel(6, 6, 4)], ini=nini5)) or [])
+    n1d = "\n".join(vt_text(13, 100, capture_page_keys(13, 100, [b"\x02s", b"m", wheel(6, 6, 4),
+                                                                  wheel(6, 6, 9, down=False)], ini=nini5)) or [])
+    ck("N1 13 行 × 滚轮向下换窗口、向上能滚回第 1 项（窗口回得到页首）",
+       "[5]" in n1c and "▶[1]" not in n1c and "▶[1]  sh" in n1d, "向下=%r 回滚=%r" % (n1c[-90:], n1d[-90:]))
     n1h = vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s"], ini=nini5)) or []
     n1col = [l.split("│")[0] for l in n1h]          # 只看侧栏那一列，右侧画什么不影响判据
-    _cand = [i for i, l in enumerate(n1col) if re.search(r"\[\d\]", l)]
-    n1last = max(_cand) if _cand else -1            # v2.1.3：没有 libvterm 时 n1h 为空 ⇒ 别再 ValueError
-    n1add = next((i for i, l in enumerate(n1col) if "[M] 条目管理" in l), -1)   # v2.1.4：原 [+] 行
-    ck("N1 24 行 × 条目全都放得下 → 表头不带 (a-b/N)，[M] 紧贴列表末行（侧栏不空出一段）",
+    n1add = next((i for i, l in enumerate(n1col) if "[M] 条目管理" in l), -1)
+    n1def = next((i for i, l in enumerate(n1col) if "默认：" in l), -1)
+    ck("N1 24 行 × 侧栏只剩导航项：不列条目、不给条目区留空档，[M] 紧贴「默认」行下面一行",
        any("导航选项" in l and "(" not in l for l in n1col)
-       and n1add == n1last + 1 and "  [5] five" in "\n".join(n1col),
-       "末项行=%d [+]行=%d" % (n1last + 1, n1add + 1))
+       and not [l for l in n1col if re.search(r"\[\d\]", l)]
+       and n1add == n1def + 1 and "[+] 添加新条目" not in "\n".join(n1col),
+       "默认行=%d [M]行=%d 条目行=%r" % (n1def + 1, n1add + 1,
+                                        [l for l in n1col if re.search(r"\[\d\]", l)][:2]))
 
     n2 = vt_text(24, 50, capture_page_keys(24, 50, [b"\x02s", b"m", b"\r"], ini=nini5)) or []
     n2j = "\n".join(n2)
@@ -1051,11 +1065,15 @@ int main(int argc, char **argv) {
        n2j.count("...") >= 3 and all(dispw(l) <= 50 for l in n2),
        "%d 处 ...，最长 %d 列" % (n2j.count("..."), max([dispw(l) for l in n2] or [0])))
 
-    nhov_base = vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s"], ini=nini5)) or []
-    nhov = vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s", b"\x1b[<35;12;8M"], ini=nini5)) or []
+    # v2.1.5：侧栏那份条目列表撤掉后，「名字被截断」只剩右侧表格一处 ⇒ 悬停气泡也必须在那里给
+    # （渲染端 render_menu_rows 现在给名称列/命令行列各登记一条气泡）。
+    nhov_base = vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s", b"m"], ini=nini5)) or []
+    nhov = vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s", b"m", tip_move(nhov_base, "一个非...")],
+                                              ini=nini5)) or []
     nhovj = "\n".join(nhov)
-    ck("N3 鼠标停在被截断的菜单项名上 → 气泡给出全文（老版：光标在侧栏时压根不弹）",
-       "一个非常长的菜单项名字用来验证截断" in nhovj and "┌" in nhovj, "")
+    ck("N3 条目管理页：鼠标停在被截断的名字上 → 气泡给出全文（侧栏列表撤掉后唯一的落点）",
+       "一个非常长的菜单项名字用来验证截断" in nhovj and "┌" in nhovj,
+       "悬停序列=%r" % tip_move(nhov_base, "一个非..."))
     ck("N3 气泡落在分隔线右侧，不盖住侧栏，也不把侧栏各行顶掉",
        "\n".join(nhov_base) != nhovj
        and all(l.split("│")[0] == b.split("│")[0] for l, b in zip(nhov, nhov_base))
@@ -1108,7 +1126,9 @@ int main(int argc, char **argv) {
     nline = [l for l in (nini or "").splitlines() if l.startswith("2 =")]
     ck("N7 60 字节长名字：Ctrl+S 落盘后 ini 里仍是完整的 20 个字（老结构体只有 32 字节）",
        nline and nlong in nline[0], repr(nline))
-    nlt = "\n".join(vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s", b"\x1b[<35;12;8M"],
+    nlt_base = vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s", b"m"], ini=nini_long)) or []
+    nlt = "\n".join(vt_text(24, 100, capture_page_keys(24, 100, [b"\x02s", b"m",
+                                                                  tip_move(nlt_base, "一...")],
                                                         ini=nini_long)) or [])
     ck("N7 长名字悬停：气泡是全文，且没有半个 UTF-8 字符留下的 '?'",
        nlong in nlt and "?" not in nlt, "")
@@ -1189,27 +1209,121 @@ int main(int argc, char **argv) {
                                                 ini=pini)) or []
         j0, j2 = "\n".join(p0), "\n".join(p2)
         ck("P 40 列 × 条目管理页：只有序号 + 名称（这一档按设计不画按钮），且不折行不盖侧栏",
-           bool(p0) and "[1] sh" in j0 and "[改]" not in j0 and "[删]" not in j0
+           bool(p0) and "▶[1]" in j0 and "sh" in j0 and "[改]" not in j0 and "[删]" not in j0
            and "»" in j0 and all(dispw(l) <= 40 for l in p0),
-           "最长=%d" % (max([dispw(l) for l in p0] or [0])))
+           "最长=%d 首行=%r" % (max([dispw(l) for l in p0] or [0]), (p0 or [""])[9:11]))
+        # 行窗口标记不再写死成 (3-23/24)：页尾现在按条目数算（12+条目数），
+        # 判据改成「横滚不许动到纵向行窗」——两边取出来逐字比。
+        vmark = lambda ls: re.findall(r"\(\d+-\d+/\d+\)", "\n".join(ls))
         ck("P 40 列 × Shift+滚轮：画面跟着左右滚，序号仍钉在视口左端，行窗口标记不动",
-           bool(p2) and p0 != p2 and "\u25b6[1]" in j2 and "(3-23/24)" in j2
+           bool(p2) and p0 != p2 and "\u25b6[1]" in j2 and vmark(p0) == vmark(p2)
            and all(dispw(l) <= 40 for l in p2),
-           "滚后=%r" % j2[:160])
+           "滚后=%r 标记=%r/%r" % (j2[:160], vmark(p0), vmark(p2)))
         q0 = vt_text(24, 56, capture_page_keys(24, 56, [b"\x02s", b"m"], ini=pini)) or []
         q2 = vt_text(24, 56, capture_page_keys(24, 56, [b"\x02s", b"m", ph.encode(), ph.encode()],
                                                 ini=pini)) or []
         k0, k2 = "\n".join(q0), "\n".join(q2)
         ck("P 56 列 × 条目管理页：默认就同时看得见序号 / 名称 / [改][删]（按钮贴视口右端）",
-           bool(q0) and "[1] sh" in k0 and "[改][删]" in k0
+           bool(q0) and "▶[1]" in k0 and "sh" in k0 and "[改][删]" in k0
            and all(dispw(l) <= 56 for l in q0),
-           "最长=%d" % (max([dispw(l) for l in q0] or [0])))
+           "最长=%d 表行=%r" % (max([dispw(l) for l in q0] or [0]), (q0 or [""])[9:11]))
         # 按钮是「钉在视口右端」的（滚到底也一直在），滚的是中间那截：名称尾部被推出去、
         # 后面的内容滚进来 —— 所以判据是「画面变了 + 行窗口没变 + 不折行」。
         ck("P 56 列 × Shift+滚轮：中段跟着滚（按钮钉右端不消失），行窗口不变、不折行",
            bool(q2) and q0 != q2 and "[改][删]" in k2 and "▶[1]" in k2
-           and "(3-23/24)" in k2 and all(dispw(l) <= 56 for l in q2),
-           "滚后=%r" % k2[:200])
+           and vmark(q0) == vmark(q2) and all(dispw(l) <= 56 for l in q2),
+           "滚后=%r 标记=%r/%r" % (k2[:200], vmark(q0), vmark(q2)))
+    # ======================= Q 组：设置页滚动条（v2.1.5）=======================
+    # 用户报「设置页太窄/太矮时，右侧面板加滚动条：可以左右滚也可以上下滚；聚焦时要滚到聚焦
+    # 位置」。落点（都是零额外预算的）：纵条 = 终端最右一列，只在这一页真溢出时出现；横条 =
+    # 表头那 9 列标记位；终端矮到侧栏那一排入口（[M][A][K][B][W]）摆不下时，侧栏再自己开一个
+    # 窗口 + 一根细条子。三条判据都走 vterm 屏态：条子是每帧【最后】才写的，抓原始字节会
+    # 停在帧中间（假红），这一点已经踩过一次。
+    qini9 = "[menu]" + chr(10) + "".join("%d = 项目%02d, /bin/sh" % (i, i) + chr(10)
+                                         for i in range(1, 10))
+
+    def qcell(lines, row, col):
+        """第 row 行（1 基）第 col 显示列上的字符；宽字符算在它起始列上，右半格返回空。"""
+        l = lines[row - 1] if 0 < row <= len(lines) else ""
+        acc = 0
+        for ch in l:
+            cw = 2 if ord(ch) > 0x2E80 else 1
+            if acc + cw > col:
+                return ""
+            acc += cw
+            if acc >= col:
+                return ch
+        return ""
+
+    def qbars(lines, row0, row1, col):
+        return "".join(qcell(lines, r, col) for r in range(row0, row1 + 1))
+
+    def hbar_thumb(line):
+        """横条在「«…»」那一段里的位置（-1 = 这一行没有横条）。"""
+        i, j = line.find("\u00ab"), line.find("\u00bb")
+        if i < 0 or j < 0 or j <= i:
+            return -1, 0, 0
+        seg = line[i:j + 1]
+        return seg.find("\u2588"), len(seg), dispw(line[:i]) + 1
+
+    qv0 = vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"m"], ini=qini9))
+    if qv0 is None:
+        print("  [SKIP] Q 组 —— 本机没有 libvterm-dev")
+    else:
+        q0 = qv0 or []
+        ck("Q1 12 行 × 条目管理页：最右一列出现轨道+滑块（内容没溢出时不画，见 Q4）",
+           "\u2588" in qbars(q0, 3, 11, 100) and "\u2502" in qbars(q0, 3, 11, 100)
+           and all(dispw(l) <= 100 for l in q0),
+           "最右列=%r" % qbars(q0, 2, 12, 100))
+        qd = vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"m",
+                       b"\x1b[<0;100;4M\x1b[<35;100;8M\x1b[<35;100;11M\x1b[<0;100;11m"],
+                       ini=qini9)) or []
+        ck("Q2 拖滑块一路到底：页面真滚到底（动作条 [设为默认] 露出来），滑块也挪到轨道下端",
+           q0 != qd and "\u8bbe\u4e3a\u9ed8\u8ba4" in "\n".join(qd)
+           and "\u2588" in qbars(qd, 7, 11, 100) and "\u2588" not in qbars(qd, 3, 5, 100),
+           "拖后最右列=%r" % qbars(qd, 2, 12, 100))
+        qt = vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"m",
+                      b"\x1b[<0;100;11M\x1b[<35;100;11M"], ini=qini9)) or []
+        ck("Q3 点轨道下端 = 往下翻一页（不用按住拖也能滚）",
+           q0 != qt and "[5]" in "\n".join(qt), "点完=%r" % "\n".join(qt)[-90:])
+        qw = vt_text(24, 80, capture_page_keys(24, 80, [b"\x02s", b"m"], ini=qini9)) or []
+        ck("Q4 24 行 × 80 列（基准档）：这一页装得下 ⇒ 最右一列不许常驻一条，80 列排版不变",
+           not any(c in ("\u2588", "\u2502") for c in qbars(qw, 3, 24, 80))
+           and "[1]  项目01" in "\n".join(qw),
+           "第80列=%r" % qbars(qw, 2, 24, 80))
+        ph40 = "[menu]" + chr(10) + "1 = sh, /bin/sh, " + pdir + chr(10) + "2 = two, /bin/sh" + chr(10)
+        hb0 = vt_text(24, 40, capture_page_keys(24, 40, [b"\x02s", b"m"], ini=ph40)) or []
+        hrow = next((i for i, l in enumerate(hb0) if "\u00ab" in l and "\u00bb" in l), -1)
+        t0c, tlen, tcol = hbar_thumb(hb0[hrow]) if hrow >= 0 else (-1, 0, 0)
+        ck("Q5 40 列 × 条目管理页：表头那 9 列就是横条（«█───»），滑块贴在左端",
+           hrow >= 0 and t0c == 1 and tlen >= 4 and all(dispw(l) <= 40 for l in hb0),
+           "表头行=%r" % (hb0[hrow] if hrow >= 0 else ""))
+        hd = b""
+        if hrow >= 0:
+            hd = ("\x1b[<0;%d;%dM\x1b[<35;%d;%dM\x1b[<35;%d;%dM\x1b[<0;%d;%dm"
+                  % (tcol + 1, hrow + 1, tcol + tlen - 2, hrow + 1,
+                     tcol + tlen, hrow + 1, tcol + tlen, hrow + 1)).encode()
+        hb1 = vt_text(24, 40, capture_page_keys(24, 40, [b"\x02s", b"m", hd], ini=ph40)) or []
+        t1c = hbar_thumb(hb1[hrow])[0] if hrow >= 0 and hrow < len(hb1) else -1
+        ck("Q5 横条拖着走：把滑块拖到右端，横滚跟着到底（不靠 Shift+滚轮也能左右滚）",
+           t0c >= 0 and t1c > t0c and hb0 != hb1 and all(dispw(l) <= 40 for l in hb1),
+           "拖前=%r 拖后=%r" % (hb0[hrow] if hrow >= 0 else "", hb1[hrow] if hrow < len(hb1) else ""))
+        qs = vt_text(9, 100, capture_page_keys(9, 100, [b"\x02s"], ini=qini9)) or []
+        qsw = vt_text(9, 100, capture_page_keys(9, 100, [b"\x02s", wheel(6, 5, 3)], ini=qini9)) or []
+        dcol = 0
+        for l in qs:
+            if "\u2502" in l:
+                dcol = dispw(l[:l.index("\u2502")]) + 1
+                break
+        ck("Q6 9 行极矮档：侧栏入口摆不下 ⇒ 分隔线那一列变细滚动条，滚轮能把 [W] 窗格配色翻出来",
+           "[W] 窗格配色" not in "\n".join(qs) and "[W] 窗格配色" in "\n".join(qsw)
+           and dcol > 0 and "\u2588" in qbars(qs, 3, 8, dcol),
+           "分隔线列=%d 基线条=%r 滚后=%r" % (dcol, qbars(qs, 3, 8, dcol), qbars(qsw, 3, 8, dcol)))
+        qf = vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"m", b"\x1b[B" * 8], ini=qini9)) or []
+        ck("Q7 12 行 × 条目管理页：连按 ↓ 时行窗跟着聚焦行走（滚到聚焦位置，不是把 ▶ 顶出屏幕）",
+           "[9]" not in "\n".join(q0) and "\u25b6[9]" in "\n".join(qf)
+           and "[1]  项目01" in "\n".join(qf), "按8次↓=%r" % "\n".join(qf)[-90:])
+
     print()
     print()
     if FAILS:
