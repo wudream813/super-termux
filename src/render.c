@@ -3496,7 +3496,7 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
     {
         static const char *const sb_label[SETTINGS_SB_NAT_ROWS + 1] = {
             "", "  导航选项", "", "  %s 启动 (Startup)", "  [M] 条目管理",
-            "  [A] 外观 / 主题", "  [K] 键位设置", "  " "[B] 行为开关", "  [W] 窗格配色",
+            "  [A] 外观 / 主题", "  [K] 键位设置", "  [B] 行为开关", "  [W] 窗格配色",
             " [Ctrl+S] 保存配置",
         };
         int rows[SETTINGS_SB_NAT_ROWS + 1] = { 0, sbg.nav_label, sbg.sep1, sbg.start,
