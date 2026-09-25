@@ -306,7 +306,6 @@ int settings_pane_order_slot(int pos);
 int settings_pane_order_pos(int slot);
 int settings_sidebar_pane_row(void);
 int settings_keys_rows(void);
-int settings_keys_visible(int host_rows);
 int settings_keys_row_at(int host_rows, int entry);
 int settings_keys_entry_at(int host_rows, int row);
 void render_search_box(char *out, int bs, int *posp, int host_rows, int host_cols);
@@ -376,6 +375,11 @@ int  settings_bar_pos_off(const SettingsBar *b, int pos, int drag);
 /* 当前页的纵向行窗：返回 1 = 这页内容比行窗高（该画纵条）。窗格配色页返回 0。 */
 int  settings_page_vband(int host_rows, int *row0, int *row1, int *total, int *vis, int *off);
 void settings_page_vset(int host_rows, int v);
+/* v2.1.6：右栏整页的「画布宽度 / 当前横向偏移」。画布宽度 = 本帧最宽的一行（正文自己测出来
+ * 的，不逐页写死）与条目表虚拟画布取大者；hscroll 是两者都认可的当前偏移。 */
+int  settings_page_canvas_w(int host_cols, int main_left);
+int  settings_page_hscroll(int host_rows, int host_cols, int main_left);
+int  settings_page_h_on(int host_cols, int main_left);   /* 0 = 这页横向没藏东西（不用画横条） */
 int  settings_hbar_geom(int host_rows, int host_cols, SettingsBar *b, int *row_out);
 void settings_hbar_draw(int host_rows, int host_cols, char *out, int bs, int *posp);
 void settings_vbar_draw(int host_rows, int host_cols, char *out, int bs, int *posp);

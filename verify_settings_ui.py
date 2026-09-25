@@ -198,8 +198,10 @@ check("g_mouse_x <= col + SETTINGS_ROLE_COL_W - 3" in RENDER,
       "语义颜色网格 hover 列区间与点击命中未对齐（上界错位）")
 # v1.8.31：键位页整行 hover 不得覆盖右侧按钮列（[前缀]/[改]/[复位]），否则鼠标
 # 停在按钮上时行底色与按钮底色叠加（“文字 hover 带到按钮上”）。按钮高亮独立判断。
+# v2.1.6：这一页能横向滚动 ⇒ hover 判定必须在【画布列】上做（mc = 指针列 + 横滚量），
+# 拿终端列去比画布列会错位。行 hover 仍止步于按钮列左边界。
 check("int keys_on_btn" in RENDER and
-      "g_mouse_x < main_left + prefix_col - 1" in RENDER and "int prefix_col = settings_keys_prefix_col(host_cols, main_left)" in RENDER and
+      "mc >= 0 && mc < prefix_col && !keys_on_btn" in RENDER and "int prefix_col = settings_keys_prefix_col(host_cols, main_left)" in RENDER and
       "int row_under_mouse = (g_mouse_y == row - 1);" in RENDER and
       'h_edit = (row_under_mouse' in RENDER and 'h_reset = (show_reset && row_under_mouse' in RENDER,
       "键位页整行 hover 未排除按钮列（文字 hover 会带到 [前缀]/[改]/[复位] 按钮上）")
@@ -239,10 +241,16 @@ check("settings_behavior_row_view(host_rows, SETTINGS_BEHAVIOR_ROW0 + i)" in REN
 check("SettingsSidebarGeom sbg;" in RENDER and "SettingsSidebarGeom sbg;" in INPUT and
       "int cap = host_rows - 1 - fixed_below - g->items_row0 + 1;" in RENDER,
       "v2.1.0：侧栏自适应几何没有渲染/命中共用（矮终端下入口会被挤出屏幕）")
-check("if (row < 0) { g_sl_hidden = 1; g_sl_left = 0; g_sl_row = 0; return; }" in RENDER and
-      "if (g_sl_left <= 0 || g_sl_hidden) return;" in RENDER,
+# v2.1.6：这层防线从「每处调用各自判一下」收进了发射器 —— begin 只放行 1..host_rows+1，
+# 其余 text/end 在全程空转；行号 <1 也一并挡掉（提示行不再钉底之后，-1 这一路真的会走到，
+# 放过去就是 "\x1b[-1;91H" 这种残缺 CSI，屏幕上掉出 ";91H(9-17/20)" 残渣）。
+check("if (row < 1 || (g_sl_host_rows > 0 && row > g_sl_host_rows + 1)) return;" in RENDER and
+      "if (!g_sl_line || !text) return;" in RENDER and
+      "if (!g_sl_line) return;" in RENDER and
+      "if (row < 1) return;" in RENDER,
       "v2.1.0：滚出可见区的行仍会发出 CUP（会画到非法行）")
-check("out[(*posp)++]='.'; out[(*posp)++]='.'; out[(*posp)++]='.';" in RENDER and
+# v2.1.6：省略号改在【开窗】那一步补（行先进画布缓冲，开窗后右边还剩内容就补 ...）
+check("vis[k++]='.'; vis[k++]='.'; vis[k++]='.';" in RENDER and
       "render_settings_tooltip(out, bs, &pos, host_rows, host_cols);" in RENDER,
       "v2.1.0：窄屏截断没有补「...」或没有画悬停气泡")
 check("t->row = g_sl_row; t->col = g_sl_col0; t->len = w;" in RENDER and

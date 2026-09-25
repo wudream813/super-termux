@@ -130,7 +130,10 @@ check("cols = 1 + 2 + utf8_cols(preset_tag" in RENDER,
 
 # ---- 6) Settings page: sidebar, fields and table buttons ----
 check("if (c <= sb_w)" in INPUT, "设置侧栏命中区域漏掉渲染出的分隔列")
-check("if (r == host_rows)" in INPUT, "设置保存按钮命中仍覆盖底部空白行")
+# v2.1.6：侧栏是「一整条列表」，保存行会跟着滚动条走 ⇒ 命中不许再写死最后一行
+# （写死 = 列表短的时候点空白也命中、列表滚上去的时候点得到却画不出）。
+check("if (sbg.save > 0 && r == sbg.save)" in INPUT,
+      "设置保存按钮的命中没有跟随渲染行（v2.1.6 起侧栏整列滚动，行位由 SettingsSidebarGeom 给）")
 check("if (r >= host_rows)" not in INPUT, "设置保存按钮仍使用过宽的 r>=host_rows 命中")
 check("c < main_left + input_w + 4" in INPUT, "设置编辑字段命中没有限制在输入框宽度内")
 # Renderer hover ranges are mouse-space; handler ranges are ANSI-space.

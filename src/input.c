@@ -2849,7 +2849,9 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                 return;
             }
         }
-        if (r == host_rows) {
+        /* v2.1.6：侧栏是一整条列表，「保存配置」是它的最后一行 —— 行位由 sbg.save 给
+         * （矮终端上它可能正被滚出可见区，那时既画不出来也不该点得到）。 */
+        if (sbg.save > 0 && r == sbg.save) {
             if (settings_nav_is_item_detail()) {
                 save_editor_to_item(g_settings_nav - 1);
             } else {
@@ -2921,11 +2923,13 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                 int rcol = settings_keys_reset_col(host_cols, main_left);
                 int ecol = settings_keys_edit_col(host_cols, main_left);
                 int pcol = settings_keys_prefix_col(host_cols, main_left);
-                if (c >= main_left + rcol && c < main_left + rcol + 6) {
+                /* v2.1.6：这一页的行排在画布上（窄终端横向滚）⇒ 点击列要先换成画布列。 */
+                int cc = c - main_left + settings_page_hscroll(host_rows, host_cols, main_left);
+                if (cc >= rcol && cc < rcol + 6) {
                     settings_keys_reset_entry(entry);
-                } else if (c >= main_left + ecol && c < main_left + ecol + 4) {
+                } else if (cc >= ecol && cc < ecol + 4) {
                     g_key_capture_active = 1;
-                } else if (c >= main_left + pcol && c < main_left + pcol + 6) {
+                } else if (cc >= pcol && cc < pcol + 6) {
                     settings_keys_toggle_prefix(entry);
                 }
                 g_mux.needs_redraw = 1;
@@ -2942,9 +2946,10 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             }
             if (r == settings_behavior_row_view(host_rows, SETTINGS_BEHAVIOR_ROW0 + SETTINGS_BEHAVIOR_TOGGLES)) {
                 g_settings_behavior_sel = SETTINGS_BEHAVIOR_TOGGLES;
-                if (c >= main_left + SETTINGS_SB_MINUS_COL && c < main_left + SETTINGS_SB_MINUS_COL + 3)
+                int bc = c - main_left + settings_page_hscroll(host_rows, host_cols, main_left);
+                if (bc >= SETTINGS_SB_MINUS_COL && bc < SETTINGS_SB_MINUS_COL + 3)
                     settings_scrollback_step(-1000);
-                else if (c >= main_left + SETTINGS_SB_PLUS_COL && c < main_left + SETTINGS_SB_PLUS_COL + 3)
+                else if (bc >= SETTINGS_SB_PLUS_COL && bc < SETTINGS_SB_PLUS_COL + 3)
                     settings_scrollback_step(1000);
                 g_mux.needs_redraw = 1;
                 return;
@@ -2972,19 +2977,8 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                     return;
                 }
             }
-            /* v2.1.4：表只读 —— 点行 = 选中（▶），要改东西去「[M] 条目管理」页。
-             * 双击仍然直接进那一条的详细配置页（老手的手感不丢）。 */
-            for (int i = 0; i < g_chooser_item_count; i++) {
-                if (snat == 10 + i) {
-                    g_settings_table_sel = i;
-                    if (me->dwEventFlags == DOUBLE_CLICK) {
-                        g_settings_nav = i + 1;
-                        load_item_to_editor(i);
-                    }
-                    g_mux.needs_redraw = 1;
-                    return;
-                }
-            }
+            /* v2.1.5 起这一页不再列条目表（自然行只到 8）⇒ 这里没有「点某一行 = 选中 /
+             * 双击 = 进详情」那一段了，增删改与双击都在 [M] 条目管理页里。 */
         } else if (g_settings_nav == SETTINGS_NAV_ITEMS) {
             /* v2.1.4：条目管理页 —— 行内 [↑][↓][改][删] + 底部 [+] / [P] 动作条。
              * 列口径与渲染同源（settings_menu_*），横滚时再减去 hscroll。 */
@@ -3037,6 +3031,13 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                     return;
                 }
                 g_settings_table_sel = i;
+                /* v2.1.6（用户第 4 条）：双击这一行 ⇒ 直接进那一条的详细配置页。
+                 * 单击仍然是「只选中」（点在名字上不该顺手把配置页打开），
+                 * 双击的手感与启动页那张表一致。 */
+                if (me->dwEventFlags == DOUBLE_CLICK) {
+                    g_settings_nav = i + 1;
+                    load_item_to_editor(i);
+                }
                 g_mux.needs_redraw = 1;
                 return;
             }
