@@ -329,6 +329,44 @@ int main(int argc, char **argv) {
 """
 
 
+VTERM_SIG_C = r"""
+/* v2.1.7：每行一个签名 = 该行所有格子的 (前景亮度和, 背景亮度和)。真彩色按 r+g+b 累加，
+ * 调色板色按 1000+序号 累加，默认色记 0。用途：证明「过渡动画走完的静止屏」和
+ * 「关掉动画」逐格同文同色 —— 只看文本会漏掉背景/前景被动画留在屏上的偏差。
+ * argv: rows cols file */
+#include <vterm.h>
+#include <stdio.h>
+#include <stdlib.h>
+static long addcol(VTermState *st, VTermColor col, int is_default) {
+    if (is_default) return 0;
+    if ((col.type & VTERM_COLOR_TYPE_MASK) == VTERM_COLOR_INDEXED) return 1000 + col.indexed.idx;
+    vterm_state_convert_color_to_rgb(st, &col);
+    return (long)col.rgb.red + col.rgb.green + col.rgb.blue;
+}
+int main(int argc, char **argv) {
+    (void)argc;
+    int R = atoi(argv[1]), C = atoi(argv[2]);
+    VTerm *vt = vterm_new(R, C); vterm_set_utf8(vt, 1);
+    VTermScreen *scr = vterm_obtain_screen(vt); vterm_screen_reset(scr, 1);
+    VTermState *st = vterm_obtain_state(vt);
+    FILE *f = fopen(argv[3], "rb"); if (!f) return 2;
+    char buf[65536]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) vterm_input_write(vt, buf, n);
+    for (int r = 0; r < R; r++) {
+        long fs = 0, bs = 0;
+        for (int c = 0; c < C; c++) {
+            VTermScreenCell cell; VTermPos p = {r, c};
+            vterm_screen_get_cell(scr, p, &cell);
+            fs += addcol(st, cell.fg, !!(cell.fg.type & VTERM_COLOR_DEFAULT_FG));
+            bs += addcol(st, cell.bg, !!(cell.bg.type & VTERM_COLOR_DEFAULT_BG));
+        }
+        printf("%ld %ld\n", fs, bs);
+    }
+    return 0;
+}
+"""
+
+
 def capture_page_keys(rows, cols, keys, ini=None, keep_ini=False):
     """起 termux(rows x cols)，依次发 keys，返回收到的全部字节。
     ini 非空时先写 termux.ini（用来造出「5 个菜单项」这类需要配置的场景）。"""
@@ -786,6 +824,25 @@ int main(int argc, char **argv) {
         dump = os.path.join(tempfile.mkdtemp(prefix="termux_palette_d_"), "s.bin")
         with open(dump, "wb") as f: f.write(data)
         out = subprocess.run([_cache["bin"], str(rows), str(cols), dump], capture_output=True, text=True).stdout
+        os.remove(dump)
+        return out.splitlines()
+
+    def vt_sig(rows, cols, data, _sc={}):
+        """逐行「前景 + 背景」签名（见 VTERM_SIG_C）。没有 libvterm 时返回 None。"""
+        if os.environ.get("TERMUX_NO_VTERM"):
+            return None
+        if "sbin" not in _sc:
+            td = tempfile.mkdtemp(prefix="termux_sig_")
+            src = os.path.join(td, "vsig.c"); exe = os.path.join(td, "vsig")
+            with open(src, "w") as f: f.write(VTERM_SIG_C)
+            r = subprocess.run(["gcc", "-O1", src, "-o", exe, "-lvterm"], capture_output=True, text=True)
+            _sc["sbin"] = exe if r.returncode == 0 else ""
+            if not _sc["sbin"]:
+                print("  [SKIP] 前景/背景签名工具编译失败：%s" % r.stderr.strip()[:160])
+        if not _sc["sbin"]: return None
+        dump = os.path.join(tempfile.mkdtemp(prefix="termux_sig_d_"), "s.bin")
+        with open(dump, "wb") as f: f.write(data)
+        out = subprocess.run([_sc["sbin"], str(rows), str(cols), dump], capture_output=True, text=True).stdout
         os.remove(dump)
         return out.splitlines()
 
@@ -1463,6 +1520,149 @@ int main(int argc, char **argv) {
         ck("Q7 12 行 × 条目管理页：连按 ↓ 时行窗跟着聚焦行走（滚到聚焦位置，不是把 ▶ 顶出屏幕）",
            "[9]" not in "\n".join(q0) and "\u25b6[9]" in "\n".join(qf)
            and "[1]  项目01" in "\n".join(qf), "按8次↓=%r" % "\n".join(qf)[-90:])
+
+    # ================== R 组：切页 / 浮层的过渡动画（v2.1.7）==================
+    # 「没那么生硬」和「别太长」都是主观话，落到判据上只有四件事：
+    #   1) 静止那一屏不许被动画碰过一格（文本 + 逐格前景背景色都要与 off 相同）；
+    #   2) 变化的那几帧确实在渐入（同一行被写了多种「不是原色」的颜色，一档一档往上）；
+    #   3) 档数很少（110ms / 15ms 一片 ≈ 7 档），点一下不用等；ini 改档位就跟着变；
+    #   4) 浮层的淡入是「从上往下」：越靠下的行，最后一档暗色出现得越晚。
+    # 量法：面板每帧都在 always 段发一次 \x1b[?7l ⇒ 按它切块就得到「帧」；每一行都以
+    # ESC<行>;<列>H 起笔 ⇒ 行内出现过的 38/48 真彩色就是这帧这行的颜色。真色集合由
+    # anim=off 那一次跑提供（两个二进制只差这个开关），所以「这行这帧的颜色不在真色集合里」
+    # = 这一格此刻正被动画压暗。全程只读原始字节，不依赖终端模拟。
+    rA_cup = re.compile(rb"\x1b\[(\d+);(\d+)H")
+    rA_tri = re.compile(rb"0?(?:[34]8);2;(\d{3});(\d{3});(\d{3})")
+
+    def rA_rowsums(block, row):
+        """一帧（block）里第 row 行写过的所有颜色亮度（r+g+b 之和）集合。"""
+        got = set()
+        for m in rA_cup.finditer(block):
+            if int(m.group(1)) != row:
+                continue
+            nxt = rA_cup.search(block, m.end())
+            got |= {int(a) + int(g) + int(b) for a, g, b in
+                    rA_tri.findall(block[m.end(): nxt.start() if nxt else len(block)])}
+        return got
+
+    def rA_dim(data_off, data_on, lo=3, hi=20, win=12):
+        """{行: [帧号,…]}：该行在「最后 win 帧」里被压暗（写过非真色）的那些帧号。"""
+        boff = data_off.split(b"\x1b[?7l")
+        bon = data_on.split(b"\x1b[?7l")
+        if not bon:
+            return {}, 0
+        true = {}
+        for blk in boff:
+            for r in range(lo, hi + 1):
+                v = rA_rowsums(blk, r)
+                if v:
+                    true.setdefault(r, set()).update(v)
+        base = len(bon) - win
+        per = {}
+        for r in sorted(true):
+            hits = [i for i in range(max(0, base), len(bon))
+                    if rA_rowsums(bon[i], r) - true[r]]
+            if hits:
+                per[r] = hits
+        return per, len(bon)
+
+    def rini(anim):
+        return "[general]" + chr(10) + "anim = " + anim + chr(10)
+
+    SWITCH = [b"\x02s", b"\x1bOQ"]          # 进设置页 → F2 到「外观 / 主题」
+    r_off = capture_page_keys(24, 100, SWITCH, ini=rini("off"))
+    r_nrm = capture_page_keys(24, 100, SWITCH, ini=rini("normal"))
+    r_short = capture_page_keys(24, 100, SWITCH, ini=rini("short"))
+    r_slow = capture_page_keys(24, 100, SWITCH, ini=rini("200"))
+    r_junk = capture_page_keys(24, 100, SWITCH, ini=rini("probably-a-typo"))
+    d_off, n_boff = rA_dim(r_nrm, r_off)   # 用 normal 的颜色集合当参照：off 里不该有任何「多余」颜色
+    d_nrm, n_nrm = rA_dim(r_off, r_nrm)    # 反过来：normal 相对 off 多出来的就是淡入的档
+    d_short, _ = rA_dim(r_off, r_short)
+    d_slow, _ = rA_dim(r_off, r_slow)
+    d_junk, _ = rA_dim(r_off, r_junk)
+    lv = lambda d: max((len(v) for v in d.values()), default=0)
+    ck("R1 anim=off：整个过程没有一帧写过 normal 里不存在的颜色，也只画了 %d 帧（不多花一帧）" % n_boff,
+       not d_off and n_boff <= 10,
+       "off 多出的压暗行=%r 帧数=%d" % ({r: v for r, v in d_off.items()}, n_boff))
+    ck("R2 anim=normal（110ms）：切页时确有行被逐帧压暗，最多 %d 档（4~12 档，够看出渐变又不到 1/8 秒）" % lv(d_nrm),
+       4 <= lv(d_nrm) <= 12 and len(d_nrm) >= 8,
+       "档数=%d 参与行=%d" % (lv(d_nrm), len(d_nrm)))
+    # 「整页一起淡」的准确说法：所有行都是在【同一帧】回到原色的（没有谁排队在后面），
+    # 而且各行压暗的帧数相近（不是有的行只暗一帧、有的暗八帧）。
+    uni_nrm = {max(v) for v in d_nrm.values()}
+    lv_nrm = sorted(len(v) for v in d_nrm.values())
+    ck("R2b 切页是「整页一起淡」：各行同一帧回到原色（收尾批次 ≤2），且各行进度相近",
+       bool(d_nrm) and len(uni_nrm) <= 2 and lv_nrm and min(lv_nrm) * 10 >= 7 * max(lv_nrm),
+       "收尾帧集合=%r 档数=%r" % (sorted(uni_nrm), lv_nrm))
+    ck("R3 时长真按 ini 走：short(60) 档数 < normal(110) < 200ms，且 200ms 比 short 多 3 档以上",
+       lv(d_short) < lv(d_nrm) < lv(d_slow) and lv(d_slow) - lv(d_short) >= 3,
+       "short=%d normal=%d 200=%d" % (lv(d_short), lv(d_nrm), lv(d_slow)))
+    ck("R3b 认不出的单词不静默关掉动画（typo → 按默认 110ms 走）",
+       4 <= lv(d_junk) <= 12 and abs(lv(d_junk) - lv(d_nrm)) <= 3,
+       "typo=%d 档，normal=%d 档" % (lv(d_junk), lv(d_nrm)))
+    ck("R3c 动画期间多花的帧数有限（110ms ≈ 8 帧内，不会让主循环空转超过 16 帧）",
+       0 <= n_nrm - n_boff <= 16, "off=%d 帧，normal=%d 帧" % (n_boff, n_nrm))
+    t_off, t_nrm = vt_text(24, 100, r_off), vt_text(24, 100, r_nrm)
+    if t_off is None:
+        print("  [SKIP] R4/R5 —— 本机没有 libvterm-dev")
+    else:
+        ck("R4 动画走完后的静止屏：文本 + 逐格前景背景色都与 anim=off 逐行相同（不留一丝痕迹）",
+           t_off == t_nrm and vt_sig(24, 100, r_off) == vt_sig(24, 100, r_nrm),
+           "首个差异文本行=%r 签名首个差异=%r" % (
+               next((i for i in range(min(len(t_off), len(t_nrm))) if t_off[i] != t_nrm[i]), -1),
+               next((i for i, a in enumerate(vt_sig(24, 100, r_off) or [])
+                     if a != (vt_sig(24, 100, r_nrm) or [])[i]), -1)))
+        # 窄/矮两档：动画只改颜色数字，长度一字不变 ⇒ 静止屏也必须与 off 一致
+        for rows, cols in ((12, 100), (24, 40)):
+            o = capture_page_keys(rows, cols, SWITCH, ini=rini("off"))
+            n = capture_page_keys(rows, cols, SWITCH, ini=rini("normal"))
+            to, tn = vt_text(rows, cols, o), vt_text(rows, cols, n)
+            ck("R4b %d×%d 档：开动画的静止屏与 off 逐行同文同色，且没有任何一行超出列数" % (rows, cols),
+               to == tn and vt_sig(rows, cols, o) == vt_sig(rows, cols, n)
+               and all(dispw(l) <= cols for l in tn),
+               "差异行=%r" % (next((i for i in range(min(len(to), len(tn))) if to[i] != tn[i]), -1),))
+        # 浮层（窗格配色页按 Enter 弹「方案列表」）：自上而下逐行点亮 ⇒ 越靠下的行，
+        # 最后一档暗色出现得越晚；关动画时同样的键完全不会压暗。
+        POP = [b"\x02s", b"W", b"\r"]
+        p_off = capture_page_keys(24, 100, POP, ini=rini("off"))
+        p_nrm = capture_page_keys(24, 100, POP, ini=rini("normal"))
+        pd_off, pn_off = rA_dim(p_nrm, p_off)   # off 相对 normal 不该有任何「多余」颜色
+        pd, pn = rA_dim(p_off, p_nrm)
+        lastrow = {r: v[-1] for r, v in pd.items()}
+        rows_sorted = sorted(lastrow)
+        ck("R5 浮层出现 = 自上而下逐行点亮（行号越大、最后一档暗色越晚：收尾分好几批，且不倒序）",
+           len(rows_sorted) >= 6 and len({max(v) for v in pd.values()}) >= 2
+           and (max(lastrow.values()) - min(lastrow.values()) if lastrow else 0) >= 2
+           and all(lastrow[rows_sorted[i]] <= lastrow[rows_sorted[i + 1]] + 1
+                   for i in range(len(rows_sorted) - 1)) and not pd_off and bool(pd),
+           "各行最后压暗帧=%r（帧数 off=%d normal=%d）" % (lastrow, pn_off, pn))
+        # 分屏 + 动画：状态复位必须挂在「整帧没画面板」这件事上，不能挂在某个窗格的
+        # else 分支里 —— 两个窗格时另一支会把状态冲掉，动画就每秒重启、屏幕永久留暗色。
+        d_off = capture_page_keys(24, 120, [b"\x02s", b"\x02-"], ini=rini("off"))
+        d_nrm = capture_page_keys(24, 120, [b"\x02s", b"\x02-"], ini=rini("normal"))
+        ck("R6b 设置页 + 左右分屏：开动画的静止屏与 off 逐格同文同色（分屏不会让动画卡住）",
+           vt_text(24, 120, d_off) == vt_text(24, 120, d_nrm)
+           and vt_sig(24, 120, d_off) == vt_sig(24, 120, d_nrm),
+           "首个差异=%r" % (next((i for i, a in enumerate(vt_text(24, 120, d_off) or [])
+                                  if a != (vt_text(24, 120, d_nrm) or [])[i]), -1),))
+
+        # 连点 40 下切页、而且是一次写进 tty（上一段动画根本没走完就来下一段）：
+        # 动画不许吞键、不许把排版碰坏，静止屏仍要与 off 逐格相同。
+        burst = b"".join(k for k in (b"\x1bOQ", b"\x1bOR", b"\x1b[15~", b"\x1bOS") for _ in range(10))
+        s_off = capture_page_keys(24, 100, [b"\x02s", burst], ini=rini("off"))
+        s_nrm = capture_page_keys(24, 100, [b"\x02s", burst], ini=rini("normal"))
+        so, sn = vt_text(24, 100, s_off), vt_text(24, 100, s_nrm)
+        ck("R7 一口气 40 次切页（动画没走完就再切）：静止屏与 off 逐格同文同色、24 行齐、无超宽行",
+           so == sn and len(sn) == 24 and all(dispw(l) <= 100 for l in sn)
+           and vt_sig(24, 100, s_off) == vt_sig(24, 100, s_nrm),
+           "行数=%d 首个差异=%r" % (len(sn), next((i for i in range(min(len(so), len(sn)))
+                                                    if so[i] != sn[i]), -1)))
+
+        ck("R5b 浮层静止屏同样与 off 一致（边框、方案名、底色都不留动画痕迹）",
+           vt_text(24, 100, p_off) == vt_text(24, 100, p_nrm)
+           and vt_sig(24, 100, p_off) == vt_sig(24, 100, p_nrm),
+           "签名差异行=%r" % (next((i for i, a in enumerate(vt_sig(24, 100, p_off) or [])
+                                    if a != (vt_sig(24, 100, p_nrm) or [])[i]), -1),))
 
     print()
     print()

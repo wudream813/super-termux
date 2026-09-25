@@ -3464,8 +3464,123 @@ static void render_settings_behavior(char *out, int bs, int *posp, int host_rows
     *posp = pos;
 }
 
+/* ==== v2.1.7：设置页的过渡动画（切页 / 浮层出现）================================
+ * 终端没有半透明，也没有地方插一帧进去，所以「淡入」只剩一条路：把**这一帧真的写给
+ * 终端的那些颜色**整体压暗，再用几帧回到原色。整套做法挂在面板出口一处，排版函数
+ * 一个都不用改：
+ *   - 只有状态变了才动：状态键 =「当前页 + 哪个浮层开着」，和上一帧比。于是切页、开
+ *     浮层会自动起动画，而 hover、滚动、改字（本来就该即时）不会触发；
+ *   - 增益按【行】给，而每一行开头都有发射器写的 CUP ⇒ 尾巴里自带行号。同一套代码出
+ *     两种曲线：切页 = 所有行同一个增益（整页一起亮）；浮层 = 增益随行号线性推迟
+ *     （自上而下逐行点亮，正好是浮层从上面「展开」的方向）；
+ *   - 只认 `%03d` 三分量的真彩色（本项目写颜色只有这一种形式，乘完仍不足 256 ⇒ 还是
+ *     3 位）⇒ **就地改写，长度一字不变**：不搬字节、不动 pos，行尾对齐、限宽、气泡登记
+ *     全都不受影响；也正因为没有新增字面量颜色，主题反查（g_theme_refs）不需要登记；
+ *   - 认不出的写法（位数不对、不是 38/48 的）整段放过：最坏是那一处不淡入，不会画花；
+ *   - anim = off（或时长已走完）时这段直接不执行 ⇒ 输出和没有这个功能时逐字节相同。
+ * 驱动靠 needs_redraw：动画期间主循环把等待降到 8ms（实测约 8ms 就画一帧），亮度按
+ * 15ms 取整分片 ⇒ 110ms 实际改变 7 档亮度，同片内的多余帧被帧差吞掉不费流量；走完的
+ * 那一帧不再自己点亮，静止时仍是原来的 25ms 轮询（不动画时一帧都不多画）。
+ * ------------------------------------------------------------------------- */
+static struct {
+    unsigned long long t0;   /* 本次过渡起点；0 = 当前没在动 */
+    int dur;                /* 本次过渡时长 ms */
+    int wave;               /* 1 = 逐行点亮（浮层）；0 = 整页一起（切页） */
+    int state;              /* 上一帧的状态键，-2 = 从没画过 */
+    int from, to, rows;     /* 本帧面板尾巴在 out 里的区间；to = -1 = 这帧没画面板 */
+} g_anim = { 0, 0, 0, -2, 0, -1, 0 };
+
+/* 状态键：低 4 位是浮层，高位是当前页。双击进详细配置这类「页内改内容」不改变键 ⇒ 不动画。 */
+static int settings_anim_state_key(void) {
+    return (g_settings_show_presets ? 1 : 0)
+         | (g_settings_show_pane_schemes ? 2 : 0)
+         | (g_hex_edit_active ? 4 : 0)
+         | ((g_settings_nav & 0x3f) << 4);
+}
+
+/* 本帧该行的增益（1000 = 原色）。起点不取 0：先黑一下再亮比直接切过去更难看。
+ * 「逐行点亮」不是把进度按行平移（那样每行都得在最后 1 帧才到位，收尾会看到一次齐刷刷
+ * 的跳变），而是给每行一条自己的时间轴：晚一点的行起点更晚、但和别的行同时收尾。 */
+static int settings_anim_gain(int row, int host_rows, long long el) {
+    if (!g_anim.t0 || g_anim.dur <= 0) return 1000;
+    int lag = 0;
+    long long span = g_anim.dur;
+    if (g_anim.wave && host_rows > 3 && row > 2) {
+        /* 每行一条自己的时间轴：越靠下越晚开始，但每行的淡入长度相同（= 总时长减去
+         * 最大错峰量）⇒ 顶行先到位、底行压着最后一帧到位，看上去是「从上往下亮过去」，
+         * 而不是整页一起提亮后又齐刷刷停住。 */
+        int cap = (g_anim.dur * 45) / 100;
+        lag = (int)(((long long)(row - 2) * cap) / host_rows);
+        if (lag > cap) lag = cap;
+        span = g_anim.dur - cap;
+    }
+    if (span < 30) span = 30;
+    long long e = el - lag;
+    if (e < 0) e = 0;
+    int p = (int)((e * 1000) / span);
+    if (p > 1000) p = 1000;
+    p = p * p * (3000 - 2 * p) / 1000000;         /* smoothstep：两端不突兀 */
+    /* 起点深浅分两种：浮层是从空里长出来的，从 1/4 亮淡上来自然；切页时屏幕上本来就有
+     * 一整页内容，压到 1/4 会读成「闪一下黑屏」，所以只压到 3/5。 */
+    int floor_ = g_anim.wave ? 250 : 600;
+    return floor_ + ((1000 - floor_) * p) / 1000;
+}
+
+/* 把 out[from..to) 里所有真彩色三分量按所在行的增益压暗。见上面注释：只吃 3 位数，
+ * 且只在原位置改数字，长度不变。 */
+static void settings_anim_dim(char *out, int from, int to, int host_rows) {
+    if (!g_anim.t0 || g_anim.dur <= 0 || to - from < 16) return;
+    /* 量化到 15ms 一片：动画期间主循环每 8~12ms 就想画一帧，可一片里屏幕上只能有一个
+     * 亮度 —— 按片取整后同片内的多余帧画出的字节与上一帧完全相同，被 framediff 整行吞掉，
+     * 既省流量也让「几帧」是实测值而不是估计值。 */
+    long long el = (long long)(GetTickCount64() - g_anim.t0);
+    if (el < 0) el = 0;
+    el = (el / 15) * 15;
+    int row = 0, crow = -1, cg = 1000;
+    for (int p = from + 2; p + 12 <= to; p++) {
+        if (out[p] == '\x1b') {
+            /* 尾巴里唯一写成 ESC<行>;<列>H 的就是行定位，认出来当行号用 */
+            int i = p + 2, r = 0, n = 0, m = 0;
+            while (i < to && out[i] >= '0' && out[i] <= '9') { r = r * 10 + (out[i] - '0'); n++; i++; }
+            if (n > 0 && i < to && out[i] == ';') {
+                i++;
+                while (i < to && out[i] >= '0' && out[i] <= '9') { m++; i++; }
+                if (m > 0 && i < to && out[i] == 'H') { row = r; p = i; }
+            }
+            continue;
+        }
+        if (out[p] != ';' || out[p + 1] != '2' || out[p + 2] != ';') continue;
+        if (!(out[p - 1] == '8' && (out[p - 2] == '3' || out[p - 2] == '4'))) continue;
+        int v[3], q = p + 3, ok = 1;
+        for (int k = 0; k < 3; k++) {
+            if (q + 3 > to) { ok = 0; break; }
+            int d[3];
+            for (int t = 0; t < 3; t++) {
+                if (out[q + t] < '0' || out[q + t] > '9') { ok = 0; break; }
+                d[t] = out[q + t] - '0';
+            }
+            if (!ok) break;
+            v[k] = d[0] * 100 + d[1] * 10 + d[2];
+            q += 3;
+            if (k < 2) { if (out[q] != ';') { ok = 0; break; } q++; }
+        }
+        if (!ok) continue;
+        if (row != crow) { crow = row; cg = settings_anim_gain(row, host_rows, el); }
+        int first = q - 11;
+        for (int k = 0; k < 3 && cg < 1000; k++) {
+            int nv = (v[k] * cg) / 1000;
+            char *w = out + first + k * 4;
+            w[0] = (char)('0' + nv / 100);
+            w[1] = (char)('0' + (nv / 10) % 10);
+            w[2] = (char)('0' + nv % 10);
+        }
+        p = q - 1;
+    }
+}
+
 void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host_cols) {
     int pos = *posp;
+    int anim_from = pos;   /* v2.1.7：本帧这条尾巴的起点，出口处按增益压暗 */
     settings_tip_reset();          /* v2.1.0：截断行登记表每帧重建 */
     g_sl_canvas_w = 0;             /* v2.1.6：本帧右栏画布宽从零起算 */
     g_sl_host_rows = host_rows;    /* v2.1.3：给 settings_line_begin 的逐行限宽用 */
@@ -3764,6 +3879,23 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
     if (hex_edit_popup_shown(host_rows, host_cols))
         render_hex_edit_popup(out, bs, &pos, host_rows, host_cols);
     render_settings_tooltip(out, bs, &pos, host_rows, host_cols);
+
+    /* v2.1.7：起一段过渡（若状态真的变了）。缩放不在这里做 —— 颜色还要经 theme_remap
+     * 覆盖成主题色，压暗必须在那之后，否则淡入的起点是「默认色 × 25%」而不是
+     * 「主题色 × 25%」，改过 [theme] 的人会看到过渡期间颜色偏一下。区间交给
+     * render_screen 在 remap 之后处理。 */
+    int st = settings_anim_state_key();
+    if (g_anim_ms > 0 && st != g_anim.state) {
+        int was_pop = (g_anim.state & 7) != 0;
+        int now_pop = (st & 7) != 0;
+        g_anim.t0 = GetTickCount64();
+        g_anim.dur = g_anim_ms;
+        g_anim.wave = (was_pop != now_pop) ? 1 : 0;
+    }
+    g_anim.state = st;
+    g_anim.from = anim_from;
+    g_anim.to = pos;
+    g_anim.rows = host_rows;
 
     *posp = pos;
 }
@@ -5591,6 +5723,14 @@ void render_screen(void) {
      * render_dump.log 的帧序错开。帧缓冲同样在帧首清空，避免提前 return 时
      * 把上一帧的残留明细带到下一帧。 */
     cell_diag_frame++;
+    g_anim.to = -1;               /* v2.1.7：本帧是否画了设置页，由 render_settings_panel 立起来 */
+    if (g_anim.t0 && (long long)(GetTickCount64() - g_anim.t0) >= g_anim.dur) {
+        /* v2.1.7：「动画走完了」必须在帧首判、而不是只在帧尾判 —— 本函数下面还有几条
+         * 提前 return（host 尺寸非法、help_mode），万一收尾那一帧正好被跳过，屏幕上就
+         * 会留下一层压暗的颜色再也没人恢复。这里清掉 t0 并再点一帧，那一帧自然按原色画。 */
+        g_anim.t0 = 0;
+        g_mux.needs_redraw = 1;
+    }
     g_cd_len = 0;
     for (int i = 0; i < MAX_PANES; i++) g_cd_pane[i].valid = 0;
     if (g_mux.host_cols < 1 || g_mux.host_rows < 1 || g_mux.total_host_rows < 1) { LeaveCriticalSection(&g_mux.cs); return; }
@@ -6239,6 +6379,20 @@ void render_screen(void) {
     LeaveCriticalSection(&g_mux.cs);
 
     theme_remap(out, pos);
+
+    if (g_anim.to >= 0) {
+        /* v2.1.7：缩放只能放在帧尾 —— theme_remap 之后（见 render_settings_panel 内的
+         * 注释：否则淡入的起点是「默认色 × 25%」而不是「主题色 × 25%」）；而
+         * needs_redraw 要在这里重新点一次，因为 render_screen 末尾会把它清掉。 */
+        settings_anim_dim(out, g_anim.from, g_anim.to, g_anim.rows);
+        if (g_anim.t0) g_mux.needs_redraw = 1;   /* 还在动 ⇒ 下一帧继续 */
+        g_anim.to = -1;
+    } else {
+        /* 这一帧整个屏幕里根本没有面板（面板关着）⇒ 状态清空，下次进来重新起一段过渡。
+         * 必须放在这种「整帧级」的位置而不是某个窗格的 else 分支里：分屏时另一个窗格的
+         * 分支会把 state 冲掉，下一帧又被当成「状态变了」⇒ 动画永远走不完（自我重启）。 */
+        g_anim.state = -1;
+    }
 
     /* 脏区输出：整帧按 CUP 切成逐行字节，只发与上一帧不同的行。
      * host 尺寸变化会让 begin_frame 检测到行数不一致并强制整帧重发。

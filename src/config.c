@@ -20,6 +20,11 @@ int g_copy_move_deselect = 1;
 int g_confirm_on_exit = 0;
 int g_confirm_on_close = 0;
 int g_search_case_sensitive = 0;
+/* v2.1.7：终端只能整格重绘、没有半透明，所以「淡入」只能靠几帧之间把颜色整体压暗来
+ * 模拟 —— 时长也就只能是帧的倍数（动画期间约 8~15ms 一帧，实测 110ms 出 7 档亮度）。
+ * 默认 110ms：够看出方向，又短到不会让人觉得要点一下等一下。
+ * ini 里 `anim = off | short | normal`，也可以直接写毫秒数（上限 600）。 */
+int g_anim_ms = 110;
 int g_settings_show_presets = 0;
 int g_preset_sel = 0;
 
@@ -168,6 +173,16 @@ int config_parse_bool(const char *val, int fallback) {
     return fallback;
 }
 
+/* 写回 ini 时优先用三个语义值；被手动改成别的毫秒数就原样写数字。 */
+static char g_anim_buf[24];
+static const char *anim_ini_text(void) {
+    if (g_anim_ms == 0) return "off";
+    if (g_anim_ms == 60) return "short";
+    if (g_anim_ms == 110) return "normal";
+    snprintf(g_anim_buf, sizeof(g_anim_buf), "%d", g_anim_ms);
+    return g_anim_buf;
+}
+
 /* [general] 段的键；返回 1 表示这一行已被消费。 */
 static int apply_general_key(const char *key, const char *val) {
     if (_stricmp(key, "default_startup") == 0) { g_default_startup = atoi(val); return 1; }
@@ -185,6 +200,19 @@ static int apply_general_key(const char *key, const char *val) {
     if (_stricmp(key, "confirm_on_exit") == 0) { g_confirm_on_exit = config_parse_bool(val, 0); return 1; }
     if (_stricmp(key, "confirm_on_close") == 0) { g_confirm_on_close = config_parse_bool(val, 0); return 1; }
     if (_stricmp(key, "search_case_sensitive") == 0) { g_search_case_sensitive = config_parse_bool(val, 0); return 1; }
+    if (_stricmp(key, "anim") == 0) {
+        /* off/none 与 0 都是关；写个认不出来的单词时不要把它当成 0 关掉动画，
+         * 按默认走 —— 用户手打 ini 打错字是常事，静默关掉功能最难查。 */
+        if (!_stricmp(val, "off") || !_stricmp(val, "none")) g_anim_ms = 0;
+        else if (!_stricmp(val, "short")) g_anim_ms = 60;
+        else if (!_stricmp(val, "normal")) g_anim_ms = 110;
+        else if (val[0] >= '0' && val[0] <= '9') {
+            int n = atoi(val);
+            if (n > 600) n = 600;            /* 再长就不是「过渡」是「等待」了 */
+            g_anim_ms = n;
+        } else g_anim_ms = 110;
+        return 1;
+    }
     return 0;
 }
 
@@ -355,7 +383,8 @@ void save_config(void) {
         "\r\n"
         "[general]\r\n"
         "# theme: github-dark | one-dark | nord | gruvbox-dark | dracula\r\n"
-        "# prefix: 前缀键，C- = Ctrl，M- = Alt，S- = Shift，例如 C-a\r\n";
+        "# prefix: 前缀键，C- = Ctrl，M- = Alt，S- = Shift，例如 C-a\r\n"
+        "# anim: 设置页过渡动画 off | short | normal（也可写毫秒数，上限 600）\r\n";
     fwrite(header, 1, strlen(header), f);
 
     len = snprintf(buf, sizeof(buf),
@@ -367,6 +396,7 @@ void save_config(void) {
         "confirm_on_exit = %s\r\n"
         "confirm_on_close = %s\r\n"
         "search_case_sensitive = %s\r\n"
+        "anim = %s\r\n"
         "default_startup = %d\r\n\r\n",
         theme_name(), keymap_prefix_text(), g_scrollback_lines,
         g_mouse_enabled ? "true" : "false",
@@ -374,6 +404,7 @@ void save_config(void) {
         g_confirm_on_exit ? "true" : "false",
         g_confirm_on_close ? "true" : "false",
         g_search_case_sensitive ? "true" : "false",
+        anim_ini_text(),
         g_default_startup);
     if (len > 0) fwrite(buf, 1, len, f);
 

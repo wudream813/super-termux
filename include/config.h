@@ -32,6 +32,7 @@ extern int g_copy_move_deselect;  /* 复制模式无 Shift/Alt 移动时丢弃�
 extern int g_confirm_on_exit;        /* 退出 termux 前是否二次确认 */
 extern int g_confirm_on_close;       /* 关闭窗格 / 标签前是否二次确认 */
 extern int g_search_case_sensitive;  /* 搜索是否锁定大小写（区分大小写） */
+extern int g_anim_ms;                /* 设置页过渡动画时长 ms；0 = 关（ini `anim`） */
 extern int g_settings_show_presets;
 extern int g_preset_sel;
 
