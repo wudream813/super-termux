@@ -138,22 +138,25 @@ for lo, hi in ((52, 54), (55, 57), (58, 61), (62, 65)):
     mouse_range = set(range(lo, hi + 1))
     ansi_range = set(range(lo + 1, hi + 2))
     check({x - 1 for x in ansi_range} == mouse_range, "设置表格按钮 hover/点击范围不一致")
-# v2.0.9：菜单表格的 [↑][↓][改][删] 按钮列改为随可用宽度收缩后，渲染与命中必须
-# 共用同一套几何函数（settings_menu_btn_col / settings_menu_show_ud），否则窄终端上
-# 按钮画在一处、点在另一处。
+# v2.0.9：菜单表格的 [↑][↓][改][删] 按钮列改为随可用宽度收缩后，渲染与命中必须共用
+# 同一套几何函数，否则窄终端上按钮画在一处、点在另一处。
+# v2.1.4：窄终端再叠一层「虚拟画布 + 横向滚动」，列宽/按钮列/是否画键统一由
+# settings_menu_table_calc() 给（渲染与命中两侧都问它），不许再各算各的。
 check("settings_menu_btn_col(host_cols, main_left)" in RENDER and
-      "settings_menu_btn_col(host_cols, main_left)" in INPUT and
       "settings_menu_show_ud(host_cols, main_left)" in RENDER and
-      "settings_menu_show_ud(host_cols, main_left)" in INPUT,
-      "菜单表格按钮列的收缩几何没有在渲染与命中两侧共用")
+      "settings_menu_table_calc(host_rows, host_cols, main_left," in INPUT and
+      "settings_menu_table_calc(host_rows, host_cols, main_left," in RENDER,
+      "菜单表格的窄终端几何没有在渲染与命中两侧共用同一支函数")
 # v2.1.3：名称列宽度也从「写死 12」变成 menu_geom 的输出（settings_menu_name_w），
 # 40 列时 12 列名称 + 按钮已经超过右栏宽度 ⇒ 整行溢出、终端折行盖掉侧栏。
 # 判据不变：两列都必须用 append_padded_utf8 按【显示列】补齐，宽度来自同一套几何函数。
+# v2.1.4：同一套列宽在两条路径上分别取自「画布几何」（非横滚）与「视口几何」
+# （settings_menu_table_geom 的输出），行渲染依旧用 append_padded_utf8 按显示列补齐。
 check("append_padded_utf8(out, bs, &pos, &row_cols, dname, mname)" in RENDER and
-      "int mname = settings_menu_name_w(host_cols, main_left)" in RENDER,
+      "settings_menu_name_w(host_cols, main_left)" in RENDER,
       "设置表格显示名称没有按终端列宽补齐（宽度须来自 settings_menu_name_w）")
 check("append_padded_utf8(out, bs, &pos, &row_cols, dcmd, mcw)" in RENDER and
-      "int mcw = settings_menu_cmd_w(host_cols, main_left)" in RENDER,
+      "settings_menu_cmd_w(host_cols, main_left)" in RENDER,
       "设置表格命令行没有按终端列宽补齐（v2.0.9：宽度随可用列收缩，窄终端上按钮才不会被裁掉）")
 check("%-12s" not in RENDER and "%-30s" not in RENDER,
       "设置表格仍使用按字节计算的 %-Ns 补齐")
@@ -273,7 +276,9 @@ check("palette_move_menu_item" in INPUT and "g_mux.palette_query_len > 0" in INP
       "!g_mux.palette_query_len" in INPUT and
       "g_mux.palette_focus == PALETTE_FOCUS_LIST && has_ctrl" in INPUT,
       "菜单项搜索期间没有禁用位置修改或排序未绑定 Ctrl+方向键")
-check("g_settings_nav == 0 && is_ctrl" in INPUT and
+# v2.1.4：调序从「启动项页 + U/D」搬到「条目管理页 + Ctrl+↑/↓」，
+# 判据改成：旧键位既不显示也不处理，且新页确实绑了 Ctrl+方向键。
+check("is_ctrl && (vk == VK_UP || vk == VK_DOWN)" in INPUT.split("static void handle_settings_items_key")[1] and
       "U/D 调顺序" not in RENDER and "U/D 调序" not in RENDER,
       "菜单项设置仍显示或处理旧的 U/D 排序快捷键")
 check("palette_delete_menu_item" in INPUT and "g_chooser_item_count--" in INPUT,

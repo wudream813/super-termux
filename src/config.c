@@ -29,6 +29,8 @@ int g_settings_pane_scheme = 0;
 int g_settings_show_pane_schemes = 0;
 int g_settings_pane_scroll = 0;
 int g_settings_appear_scroll = 0;
+int g_settings_manage_scroll = 0;        /* v2.1.4：条目管理页纵向滚动 */
+int g_settings_hscroll[6] = {0};       /* v2.1.4：右栏横向滚动量（每页一格，不写进 ini） */
 int g_settings_sidebar_scroll = 0;   /* v2.1.2：侧栏菜单项列表滚动量（不写进 ini） */
 int g_settings_behavior_scroll = 0;
 int g_settings_detail_scroll = 0;
@@ -40,23 +42,30 @@ int g_key_capture_active = 0;
 char g_hex_edit_buf[8] = {0};
 int g_hex_edit_len = 0, g_hex_edit_active = 0, g_hex_edit_role = -1;
 
-/* 侧栏顺序：启动 → 各菜单项 → 外观 → 键位 → 行为 */
-int settings_nav_order_count(void) { return g_chooser_item_count + 4; }
+/* 侧栏顺序：启动 → 各菜单项 → 条目管理 → 外观 → 键位 → 行为 → 窗格配色。
+ * v2.1.4：多一页「条目管理」（[M]），新建/预设库/每行 ↑↓改删 都收进去。
+ * Tab 循环走的就是这两个函数（input.c 里 ↑/↓ 换页唯一入口），漏一格就跳不到那页 ——
+ * 原先 case 只到 3、default 回落 BEHAVIOR，窗格配色页只能靠热键 [W] 进。 */
+int settings_nav_order_count(void) { return g_chooser_item_count + 5; }
 
 int settings_nav_at(int idx) {
     if (idx <= 0) return SETTINGS_NAV_STARTUP;
     if (idx <= g_chooser_item_count) return idx;              /* 菜单项详情 */
     switch (idx - g_chooser_item_count) {
-        case 1: return SETTINGS_NAV_APPEARANCE;
-        case 2: return SETTINGS_NAV_KEYS;
-        default: return SETTINGS_NAV_BEHAVIOR;
+        case 1: return SETTINGS_NAV_ITEMS;
+        case 2: return SETTINGS_NAV_APPEARANCE;
+        case 3: return SETTINGS_NAV_KEYS;
+        case 4: return SETTINGS_NAV_BEHAVIOR;
+        default: return SETTINGS_NAV_PANE;
     }
 }
 
 int settings_nav_index_of(int nav) {
-    if (nav == SETTINGS_NAV_APPEARANCE) return g_chooser_item_count + 1;
-    if (nav == SETTINGS_NAV_KEYS) return g_chooser_item_count + 2;
-    if (nav == SETTINGS_NAV_BEHAVIOR) return g_chooser_item_count + 3;
+    if (nav == SETTINGS_NAV_ITEMS) return g_chooser_item_count + 1;
+    if (nav == SETTINGS_NAV_APPEARANCE) return g_chooser_item_count + 2;
+    if (nav == SETTINGS_NAV_KEYS) return g_chooser_item_count + 3;
+    if (nav == SETTINGS_NAV_BEHAVIOR) return g_chooser_item_count + 4;
+    if (nav == SETTINGS_NAV_PANE) return g_chooser_item_count + 5;
     if (nav >= 1 && nav <= g_chooser_item_count) return nav;
     return 0;
 }

@@ -169,6 +169,46 @@ void settings_tip_reset(void);
 int  settings_tip_count(void);
 const SettingsTip *settings_tip_at(int row, int col);   /* 命中返回登记项，否则 NULL */
 /* 有滚动时在行右端画 (first-last/total) 位置指示 */
+/* ---- v2.1.4：设置页右栏横向滚动（Shift+滚轮 / 触控板横滚）---- */
+typedef struct { const char *sgr; const char *text; int pad_to_col; } SettingsSeg;
+int  settings_hscroll_slot(int nav);
+int  settings_hscroll(void);                     /* 当前页的横向滚动量（列） */
+int  settings_canvas_w(int host_cols, int main_left);
+void settings_hscroll_clamp(int host_rows, int host_cols, int main_left, int content_w);
+void settings_hscroll_reveal(int host_rows, int host_cols, int main_left, int content_w,
+                             int col, int w);
+void settings_hscroll_by(int delta);
+/* lpin/rpin = 视口左/右两端【钉住不随横滚移动】的列数（行首序号、行尾按钮）。 */
+void settings_hline2(char *out, int bs, int *posp, int row, int main_left, int host_cols,
+                     int content_w, const SettingsSeg *seg, int nseg, int tip_row_len,
+                     int lpin, int rpin);
+#define settings_hline(o, bs, p, row, ml, hc, cw, sg, ns, tip)     settings_hline2((o), (bs), (p), (row), (ml), (hc), (cw), (sg), (ns), (tip), 0, 0)
+void settings_menu_table_geom(int host_rows, int host_cols, int main_left,
+                              int *cw_out, int *name_w, int *cmd_w, int *btn_col,
+                              int *show_ud, int *show_btn);
+/* v2.1.4：窄终端表格的单一口径（画布列宽 + 视口按钮位置）；返回 1 = 开了横向滚动。 */
+int  settings_menu_table_calc(int host_rows, int host_cols, int main_left,
+                        int *name_w, int *cmd_w, int *btn_col,
+                        int *show_ud, int *show_btn);
+void settings_h_wheel(int delta);
+void settings_hscroll_follow(int host_rows, int host_cols, int main_left,
+                             int col, int width);
+/* v2.1.4：启动项页与条目管理页共用的表。 */
+typedef int (*SettingsRowView)(int host_rows, int natural);
+typedef struct {
+    char *out; int bs; int *pos;
+    int host_rows, host_cols, main_left;
+    int sel;                        /* 聚焦行（-1 = 无） */
+    SettingsRowView row_view;       /* 该页的行号换算 */
+    int h_on, h_sc;                 /* 横滚是否生效 / 当前滚动量 */
+    int cw, nw, cw2, bc, ud, btn;   /* 表几何（画布口径） */
+    int show_ops;                  /* v2.1.4：0 = 只读表（启动项页），不画 ▶ 与 [↑][↓][改][删] */
+} MenuRowCtx;
+void render_menu_rows(MenuRowCtx *rc);
+
+void settings_hscroll_mark(char *out, int bs, int *posp, int row, int right_col,
+                           int h, int vw, int content_w, int host_rows);
+
 void settings_scroll_mark(char *out, int bs, int *posp, int row, int right_col,
                           int first_vis, int last_vis, int total, int host_rows);
 void settings_page_mark(char *out, int bs, int *posp, int row, int right_col, int host_rows,
@@ -187,13 +227,15 @@ int  settings_behavior_sel_natural(int host_rows);
 int  settings_behavior_natural_at(int host_rows, int row);
 int  settings_detail_row_view(int host_rows, int natural);
 int  settings_startup_row_view(int host_rows, int natural);
+int  settings_manage_row_view(int host_rows, int natural);   /* v2.1.4：条目管理页 */
+int  settings_manage_natural_at(int host_rows, int row);
 int  settings_startup_natural_at(int host_rows, int row);
 int  settings_detail_natural_at(int host_rows, int row);
 typedef struct {
     int hdr, nav_label, sep1, start, sep2;
-    int items_row0, items_cap, add, presets;   /* presets = 0 表示隐藏 */
+    int items_row0, items_cap, items;     /* v2.1.4：items = 「[M] 条目管理」那一行 */
     int app, keys, beh, pane, save;
-    int compact, hide_presets;
+    int compact, nav_tight;   /* nav_tight = 矮终端把底部那一排再挤紧一档（沿用上一版 hide_presets 的触发条件） */
     int items_scroll;                          /* v2.1.2：菜单项列表滚动量（已夹好） */
 } SettingsSidebarGeom;
 void settings_sidebar_geom(int host_rows, int item_count, SettingsSidebarGeom *g);

@@ -701,17 +701,19 @@ def main():
             # (页键, needle, 说明, 是否要求该行左侧 20 列为空)
             #   只有窗格配色页能要求 leftblank：它滚到底时左侧对应的是侧栏空白区；
             #   键位/启动/行为页左侧本来就有侧栏菜单，只断言按钮没被裁出屏幕。
+            # v2.1.4：[+] [P] 与每行的 [改][删] 从「启动」页搬进新的「条目管理」页，
+            # 所以这一项先按 m 进那一页，再找 [改]。
             for page, needle, label, need_lb in [
                 (b"W", "亮白", "窗格配色页：最后一项「亮白」在右侧区域内", 1),
                 (b"K", "[改]", "键位页：[改] 按钮在屏幕内", 0),
-                (b"", "[改]", "启动/菜单项页：[改] 按钮在屏幕内", 0),
+                ((b"m",), "[改]", "条目管理页：[改] 按钮在屏幕内", 0),
                 (b"B", "[-]", "行为页：scrollback [-] 按钮在屏幕内", 0),
             ]:
                 d = os.path.join(td, "i.bin")
                 with open(d, "wb") as f:
                     keys = [b"\x02s"]
                     if page:
-                        keys.append(page)
+                        keys.extend(page if isinstance(page, tuple) else [page])
                     if page == b"W":
                         keys += [b"\x1b[B"] * 20
                     f.write(capture_page_keys(24, 60, keys))
@@ -833,8 +835,10 @@ int main(int argc, char **argv) {
         # v2.1.2 起侧栏列表是「可滚动的窗口」，不再用「添加(共5项)」这种死提示；
         # 还剩几项由表头/提示行的 (a-b/N) 说明。这里改判：[+] 行回到普通的「添加新条目」，
         # 第 4/5 项能不能滚进来看 N1。
-        ck("K1 12 行 × 5 个菜单项：不再出现「添加(共N项)」死提示，[+] 行是普通的添加条目",
-           "添加(共" not in jk1 and "[+] 添加新条目" in jk1, jk1[:400])
+        # v2.1.4：侧栏底部那条变成「[M] 条目管理」（新建/预设库/↑↓改删都在那一页里）。
+        ck("K1 12 行 × 5 个菜单项：不再出现「添加(共N项)」死提示，底部入口是「条目管理」",
+           "添加(共" not in jk1 and "[M] 条目管理" in jk1
+           and "[+] 添加新条目" not in jk1 and "[P] 快速预设库" not in jk1, jk1[:400])
         # 一整串 ↓ 一次写入：31 个动作全部滚一遍，比逐键 0.4s 快两个数量级
         k2 = capture_page_keys(12, 100, [b"\x02s", b"\x1bOQ", b"\x1b[B" * 24])
         tk2 = vt_text(12, 100, k2) or []
@@ -927,8 +931,10 @@ int main(int argc, char **argv) {
         m3b = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", wheel(60, 8, 3)], ini=ini3)) or [])
         ck("M3 12 行 × 启动项页：滚轮向下能把第 3 个菜单项滚进可见区",
            "three" not in m3a and "three" in m3b, "")
+        # v2.1.4：启动项页的 Enter 只设「启动默认」，进详情页要先 m 去条目管理页再 Enter。
         m3c = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", wheel(60, 8, 3),
-                                                                      b"\r", wheel(60, 8, 2)], ini=ini3)) or [])
+                                                                      b"m", b"\r", wheel(60, 8, 2)],
+                                                              ini=ini3)) or [])
         ck("M3 12 行 × 菜单项详情页：滚轮能滚到第 3 个字段（启动目录）",
            "3. 启动目录" in m3c and "4. 启动默认颜色" not in m3a, "实际 %r" % m3c[:80])
         # M4 窗格配色页滚轮
@@ -953,7 +959,8 @@ int main(int argc, char **argv) {
         # M7 详情页色块条按宽度限格：窄到放不下 8 格时少画几格并标 +N，不再越界
         ini7 = "[menu]\n1 = sh, /bin/sh\n"
         def colorrow(rows, cols):
-            t = vt_text(rows, cols, capture_page_keys(rows, cols, [b"\x02s", b"\r"], ini=ini7)) or []
+            t = vt_text(rows, cols, capture_page_keys(rows, cols,
+                                                       [b"\x02s", b"m", b"\r"], ini=ini7)) or []
             return next((l for l in t if re.search(r"默认\s+\[?1\]?\s", l)), "")
         r40, r60, r100 = colorrow(24, 40), colorrow(24, 60), colorrow(24, 100)
         ck("M7 40 列 × 详情页：色块条只画放得下的几格 + 标 +N（第 8 格不再被裁出屏幕）",
@@ -1030,13 +1037,13 @@ int main(int argc, char **argv) {
     n1col = [l.split("│")[0] for l in n1h]          # 只看侧栏那一列，右侧画什么不影响判据
     _cand = [i for i, l in enumerate(n1col) if re.search(r"\[\d\]", l)]
     n1last = max(_cand) if _cand else -1            # v2.1.3：没有 libvterm 时 n1h 为空 ⇒ 别再 ValueError
-    n1add = next((i for i, l in enumerate(n1col) if "[+] 添加新条目" in l), -1)
-    ck("N1 24 行 × 条目全都放得下 → 表头不带 (a-b/N)，[+] 紧贴列表末行（侧栏不空出一段）",
+    n1add = next((i for i, l in enumerate(n1col) if "[M] 条目管理" in l), -1)   # v2.1.4：原 [+] 行
+    ck("N1 24 行 × 条目全都放得下 → 表头不带 (a-b/N)，[M] 紧贴列表末行（侧栏不空出一段）",
        any("导航选项" in l and "(" not in l for l in n1col)
        and n1add == n1last + 1 and "  [5] five" in "\n".join(n1col),
        "末项行=%d [+]行=%d" % (n1last + 1, n1add + 1))
 
-    n2 = vt_text(24, 50, capture_page_keys(24, 50, [b"\x02s", b"\r"], ini=nini5)) or []
+    n2 = vt_text(24, 50, capture_page_keys(24, 50, [b"\x02s", b"m", b"\r"], ini=nini5)) or []
     n2j = "\n".join(n2)
     ck("N2 50 列 × 详情页：四个字段标签都在（不再被硬切掉）",
        all(k in n2j for k in ["2. 启动命令行", "3. 启动目录", "4. 启动默认颜色"]), n2j[:200])
@@ -1117,7 +1124,9 @@ int main(int argc, char **argv) {
            "3 = three, /bin/sh\n4 = four, /bin/sh\n5 = five, /bin/sh\n")
     OPAGES = (("启动项页", [b"\x02s"]), ("外观页", [b"\x02s", b"a"]),
               ("键位页", [b"\x02s", b"k"]), ("行为页", [b"\x02s", b"b"]),
-              ("窗格页", [b"\x02s", b"w"]), ("菜单项详情页", [b"\x02s", b"\r"]))
+              ("窗格页", [b"\x02s", b"w"]), ("菜单项详情页", [b"\x02s", b"m", b"\r"]),
+              # v2.1.4 新增的一页（增删改都在里面），同样要满足「不折行 / 不盖侧栏」。
+              ("条目管理页", [b"\x02s", b"m"]))
     for oc in (40, 50):
         osb = 22 if oc >= 44 else max(15, oc // 2)
         for oname, okeys in OPAGES:
@@ -1156,6 +1165,41 @@ int main(int argc, char **argv) {
         ck("O %d 列 × 14 行：滚动后的行窗口标记 (a-b/N) 不越界、不盖掉 col %d 的分隔线"
            % (oc, osb), not [x for x in omark if x[1] > oc] and not obad2,
            "越界=%r 缺│=%r" % ([x for x in omark if x[1] > oc][:2], obad2[:2]))
+
+    # ======================= P 组：窄终端 Shift+滚轮横向滚动（v2.1.4）=======================
+    # 窄视口放不下「名称列 + 按钮」时按固定阶梯让位：命令行 → 列间隔 → 收窄名称列 →
+    # 丢 [↑][↓] → 连 [改][删] 一起丢（退成纯键盘）。40 列正好落在最后一档，56 列画得下。
+    # 注意：ini 里的命令行必须是能跑起来的程序，否则 pane 一开就退 ⇒ 沙箱里整个 app 跟着
+    # 退出，一帧都抓不到（「长内容」改用启动目录那一列造）。
+    pini = "[menu]" + chr(10) + "1 = sh, /bin/sh, /home/user/projects/super-termux-workdir-for-hscroll" + chr(10) + "2 = two, /bin/sh" + chr(10)
+    ph = "\x1b[<69;30;10M\x1b[<69;30;10m"      # Shift+滚轮向下（b=69：64=滚轮 + 1=下 + 4=Shift）
+    p0 = vt_text(24, 40, capture_page_keys(24, 40, [b"\x02s", b"m"], ini=pini)) or []
+    p2 = vt_text(24, 40, capture_page_keys(24, 40, [b"\x02s", b"m", ph.encode(), ph.encode()],
+                                             ini=pini)) or []
+    j0, j2 = "\n".join(p0), "\n".join(p2)
+    ck("P 40 列 × 条目管理页：只有序号 + 名称（这一档按设计不画按钮），且不折行不盖侧栏",
+       bool(p0) and "[1] sh" in j0 and "[改]" not in j0 and "[删]" not in j0
+       and "»" in j0 and all(dispw(l) <= 40 for l in p0),
+       "最长=%d" % (max([dispw(l) for l in p0] or [0])))
+    ck("P 40 列 × Shift+滚轮：画面跟着左右滚，序号仍钉在视口左端，行窗口标记不动",
+       bool(p2) and p0 != p2 and "\u25b6[1]" in j2 and "(3-23/24)" in j2
+       and all(dispw(l) <= 40 for l in p2),
+       "滚后=%r" % j2[:160])
+    q0 = vt_text(24, 56, capture_page_keys(24, 56, [b"\x02s", b"m"], ini=pini)) or []
+    q2 = vt_text(24, 56, capture_page_keys(24, 56, [b"\x02s", b"m", ph.encode(), ph.encode()],
+                                            ini=pini)) or []
+    k0, k2 = "\n".join(q0), "\n".join(q2)
+    ck("P 56 列 × 条目管理页：默认就同时看得见序号 / 名称 / [改][删]（按钮贴视口右端）",
+       bool(q0) and "[1] sh" in k0 and "[改][删]" in k0
+       and all(dispw(l) <= 56 for l in q0),
+       "最长=%d" % (max([dispw(l) for l in q0] or [0])))
+    # 按钮是「钉在视口右端」的（滚到底也一直在），滚的是中间那截：名称尾部被推出去、
+    # 后面的内容滚进来 —— 所以判据是「画面变了 + 行窗口没变 + 不折行」。
+    ck("P 56 列 × Shift+滚轮：中段跟着滚（按钮钉右端不消失），行窗口不变、不折行",
+       bool(q2) and q0 != q2 and "[改][删]" in k2 and "▶[1]" in k2
+       and "(3-23/24)" in k2 and all(dispw(l) <= 56 for l in q2),
+       "滚后=%r" % k2[:200])
+    print()
     print()
     if FAILS:
         print("%d 项失败：%s" % (len(FAILS), "；".join(FAILS)))

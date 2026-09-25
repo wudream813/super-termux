@@ -98,9 +98,14 @@ for sym in ("settings_theme_row(", "settings_role_row(", "settings_role_col(",
             "SETTINGS_BEHAVIOR_ROW0", "SETTINGS_SB_MINUS_COL", "SETTINGS_SB_PLUS_COL"):
     check(sym in new_pages, f"命中测试通过 {sym} 复用渲染侧几何")
 menu_page = mouse_body.split("if (g_settings_nav == 0)", 1)[1]
-check("settings_menu_btn_col(host_cols, main_left)" in menu_page and
-      "settings_menu_show_ud(host_cols, main_left)" in menu_page,
-      "菜单项表格的按钮命中同样复用渲染侧收缩几何（窄终端下 [改]/[删] 不会画点分离）")
+# v2.1.4：启动项页的表改成只读（没有按钮热区），增删迁到「条目管理」页；两侧的列宽
+# 统一由 settings_menu_table_calc() 给（渲染 render_menu_rows 也问它），比原先「命中
+# 侧自己再调一遍 settings_menu_btn_col / show_ud」更严：只有一处几何来源。
+check("settings_menu_table_calc(host_rows, host_cols, main_left," in menu_page and
+      "settings_menu_table_calc(host_rows, host_cols, main_left," in RENDER and
+      "settings_menu_btn_col(host_cols, main_left)" in RENDER and
+      "settings_menu_show_ud(host_cols, main_left)" in RENDER,
+      "菜单项表格的按钮命中没有与渲染共用同一支收缩几何（窄终端下 [改]/[删] 会画点分离）")
 literal_rows = re.findall(r"r == (\d+)", new_pages)
 check(not literal_rows, f"命中测试没有写死行号（发现 {literal_rows}）")
 check("settings_sidebar_extra_rows(" in mouse_body and "settings_sidebar_extra_rows(" in RENDER,

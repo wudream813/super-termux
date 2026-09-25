@@ -15,6 +15,10 @@ extern int g_chooser_item_count;
 #define SETTINGS_NAV_KEYS       101
 #define SETTINGS_NAV_BEHAVIOR   102
 #define SETTINGS_NAV_PANE       103   /* v2.0.7：窗格配色（pane_*） */
+#define SETTINGS_NAV_ITEMS      104   /* v2.1.4：条目管理（新建 / 预设库 / 每行 ↑↓改删） */
+#define SETTINGS_MANAGE_FIRST   3     /* v2.1.4：条目管理页可见带 */
+#define SETTINGS_MANAGE_LAST      26
+
 
 extern int g_settings_nav;
 extern int g_settings_field;
@@ -37,6 +41,8 @@ extern int g_settings_pane_scheme;  /* 窗格配色页：方案行当前指向�
 extern int g_settings_show_pane_schemes;  /* v2.1.0：方案选择浮层（预设方案列表）是否打开 */
 extern int g_settings_pane_scroll;  /* 窗格配色页：单列模式下的行滚动（矮终端） */
 extern int g_settings_appear_scroll;    /* v2.1.0：外观页纵向滚动（终端太矮时） */
+extern int g_settings_manage_scroll;      /* v2.1.4：条目管理页纵向滚动 */
+extern int g_settings_hscroll[6];       /* v2.1.4：设置页右栏横向滚动量（列；每页各存一格，不写进 ini） */
 extern int g_settings_sidebar_scroll;     /* v2.1.2：设置页侧栏菜单项列表的滚动量 */
 extern int g_settings_behavior_scroll;  /* v2.1.0：行为页纵向滚动 */
 extern int g_settings_detail_scroll;    /* v2.1.0：菜单项详细配置页纵向滚动 */

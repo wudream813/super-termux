@@ -2178,6 +2178,119 @@ static void settings_scrollback_step(int delta) {
     g_mux.needs_redraw = 1;
 }
 
+/* v2.1.4：条目管理页 —— 新建 / 预设库 / 每行 ↑↓改删 全在这一页。
+ * 表与「启动」页那一支渲染函数共用几何，所以这里的行号换算、按钮热区都走
+ * settings_manage_row_view() / settings_menu_*()。 */
+static void handle_settings_items_key(WORD vk, WCHAR uc, BOOL is_ctrl) {
+    if (vk == VK_ESCAPE) { settings_leave_subpage(); return; }
+    int n = g_chooser_item_count;
+    if (n > 0 && (g_settings_table_sel < 0 || g_settings_table_sel >= n))
+        g_settings_table_sel = 0;
+    if (vk == VK_UP || vk == VK_DOWN) {
+        if (vk == VK_UP) { if (g_settings_table_sel > 0) g_settings_table_sel--; }
+        else if (g_settings_table_sel < n - 1) g_settings_table_sel++;
+        settings_sidebar_clamp_sel(g_mux.host_rows, n);
+        settings_hscroll_follow(g_mux.host_rows, g_mux.host_cols,
+                               settings_host_sidebar_w(g_mux.host_cols) + 3, 4, 20);
+        g_mux.needs_redraw = 1;
+        return;
+    }
+    if (vk == VK_F2) { g_settings_nav = SETTINGS_NAV_APPEARANCE; g_mux.needs_redraw = 1; return; }
+    if (vk == VK_F3 || uc == 'k' || uc == 'K') { g_settings_nav = SETTINGS_NAV_KEYS; g_mux.needs_redraw = 1; return; }
+    if (vk == VK_F4 || uc == 'b' || uc == 'B') { g_settings_nav = SETTINGS_NAV_BEHAVIOR; g_mux.needs_redraw = 1; return; }
+    if (vk == VK_F5 || uc == 'w' || uc == 'W') { g_settings_nav = SETTINGS_NAV_PANE; g_mux.needs_redraw = 1; return; }
+    if (vk == VK_PRIOR || vk == VK_NEXT) {
+        int page = (g_mux.host_rows > 8) ? g_mux.host_rows - 7 : 1;
+        int step = (vk == VK_NEXT) ? page : -page;
+        g_settings_table_sel += step;
+        if (g_settings_table_sel < 0) g_settings_table_sel = 0;
+        if (g_settings_table_sel > n - 1) g_settings_table_sel = n > 0 ? n - 1 : 0;
+        g_mux.needs_redraw = 1;
+        return;
+    }
+    if (is_ctrl && (vk == VK_UP || vk == VK_DOWN)) {
+        int i = g_settings_table_sel;
+        int target = i + (vk == VK_UP ? -1 : 1);
+        if (i >= 0 && target >= 0 && target < n) {
+            ChooserItem tmp = g_chooser_items[i];
+            g_chooser_items[i] = g_chooser_items[target];
+            g_chooser_items[target] = tmp;
+            g_settings_table_sel = target;
+            save_config();
+        }
+        g_mux.needs_redraw = 1;
+        return;
+    }
+    if (vk == VK_RETURN || uc == 'e' || uc == 'E') {
+        int i = g_settings_table_sel;
+        if (i >= 0 && i < n) {
+            g_settings_nav = i + 1;            /* 进该条的详细配置页 */
+            load_item_to_editor(i);
+            g_mux.needs_redraw = 1;
+        }
+        return;
+    }
+    if (vk == VK_DELETE || vk == VK_BACK || uc == 'x' || uc == 'X') {
+        int i = g_settings_table_sel;
+        if (n > 1 && i >= 0 && i < n) {
+            for (int k = i; k < n - 1; k++) g_chooser_items[k] = g_chooser_items[k + 1];
+            g_chooser_item_count--;
+            if (g_settings_table_sel >= g_chooser_item_count)
+                g_settings_table_sel = g_chooser_item_count - 1;
+            save_config();
+            g_mux.needs_redraw = 1;
+        }
+        return;
+    }
+    if (uc == '+' || uc == '=' || uc == 'a' || uc == 'A') {
+        if (g_chooser_item_count < MAX_CHOOSER_ITEMS) {
+            int idx = g_chooser_item_count++;
+            snprintf(g_chooser_items[idx].name, sizeof(g_chooser_items[0].name), "新终端");
+            snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[0].cmd), TERMUX_DEFAULT_SHELL_U8);
+            g_chooser_items[idx].workdir[0] = 0;
+            g_chooser_items[idx].color = 0;
+            save_config();
+            g_settings_table_sel = idx;
+            g_settings_nav = idx + 1;
+            load_item_to_editor(idx);
+            g_mux.needs_redraw = 1;
+        }
+        return;
+    }
+    if (uc == 'p' || uc == 'P') {
+        g_settings_show_presets = 1;
+        g_preset_sel = 0;
+        g_mux.needs_redraw = 1;
+        return;
+    }
+    if (uc == 'd' || uc == 'D') {   /* 复制当前行（新条目排在它后面） */
+        int i = g_settings_table_sel;
+        if (i >= 0 && i < n && g_chooser_item_count < MAX_CHOOSER_ITEMS) {
+            int idx = i + 1;
+            for (int k = g_chooser_item_count; k > idx; k--) g_chooser_items[k] = g_chooser_items[k - 1];
+            g_chooser_items[idx] = g_chooser_items[i];
+            char nm[64];
+            snprintf(nm, sizeof(nm), "%s (副本)", g_chooser_items[i].name);
+            snprintf(g_chooser_items[idx].name, sizeof(g_chooser_items[idx].name), "%s", nm);
+            g_chooser_item_count++;
+            g_settings_table_sel = idx;
+            save_config();
+            g_mux.needs_redraw = 1;
+        }
+        return;
+    }
+    if ((uc >= '1' && uc <= '9') || (vk >= '1' && vk <= '9') || (vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9)) {
+        int num = (uc >= '1' && uc <= '9') ? (uc - '0') : ((vk >= '1' && vk <= '9') ? (vk - '0') : (vk - VK_NUMPAD1 + 1));
+        if (num <= n) { g_settings_table_sel = num - 1; g_mux.needs_redraw = 1; return; }
+    }
+    if (uc == 't' || uc == 'T') {    /* 把当前行设为启动默认项（不用回启动页） */
+        g_default_startup = 0;
+        save_config();
+        g_mux.needs_redraw = 1;
+        return;
+    }
+}
+
 static void handle_settings_behavior_key(WORD vk, WCHAR uc) {
     if (vk == VK_ESCAPE) { settings_leave_subpage(); return; }
     if (vk == VK_UP) {
@@ -2201,6 +2314,13 @@ static void handle_settings_behavior_key(WORD vk, WCHAR uc) {
             settings_behavior_toggle(g_settings_behavior_sel);
         return;
     }
+}
+
+/* 是否停在「某个菜单项的详情页」上。v2.1.4 起 g_settings_nav 除了 1..N 还可能是
+ * 100+ 的页号（含新的 104=条目管理），所以老的「>= 1」判据必须收窄，否则 104 会被
+ * 当成第 104 项：预设会写进 g_chooser_items[103]。 */
+static int settings_nav_is_item_detail(void) {
+    return g_settings_nav >= 1 && g_settings_nav <= g_chooser_item_count;
 }
 
 void handle_settings_key(KEY_EVENT_RECORD *ke) {
@@ -2259,7 +2379,7 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
         if (vk == VK_RETURN) {
             int i = g_preset_sel;
             if (i >= 0 && i < g_preset_count) {
-                if (g_settings_nav >= 1) {
+                if (settings_nav_is_item_detail()) {
                     int idx = g_settings_nav - 1;
                     if (idx >= 0 && idx < g_chooser_item_count) {
                         strncpy(g_edit_name, g_presets[i].name, sizeof(g_edit_name) - 1);
@@ -2286,7 +2406,7 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
         for (int i = 0; i < g_preset_count; i++) {
             char digit = (char)('1' + i);
             if (uc == digit || vk == ('1' + i) || vk == (VK_NUMPAD1 + i)) {
-                if (g_settings_nav >= 1) {
+                if (settings_nav_is_item_detail()) {
                     int idx = g_settings_nav - 1;
                     if (idx >= 0 && idx < g_chooser_item_count) {
                         strncpy(g_edit_name, g_presets[i].name, sizeof(g_edit_name) - 1);
@@ -2314,7 +2434,7 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
     }
 
     if ((vk == 'S' && is_ctrl) || (uc == 0x13)) {
-        if (g_settings_nav >= 1 && g_settings_nav <= g_chooser_item_count) {
+        if (settings_nav_is_item_detail()) {
             save_editor_to_item(g_settings_nav - 1);
         } else {
             save_config();
@@ -2330,26 +2450,14 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
         return;
     }
 
-    if (g_settings_nav == 0 && is_ctrl &&
-        (vk == VK_UP || vk == VK_DOWN)) {
-        int i = g_settings_table_sel;
-        int target = i + (vk == VK_UP ? -1 : 1);
-        if (i >= 0 && target >= 0 && target < g_chooser_item_count) {
-            ChooserItem tmp = g_chooser_items[i];
-            g_chooser_items[i] = g_chooser_items[target];
-            g_chooser_items[target] = tmp;
-            g_settings_table_sel = target;
-            save_config();
-        }
-        g_mux.needs_redraw = 1;
-        return;
-    }
+    /* v2.1.4：启动项页只读 —— Ctrl+↑/↓ 调顺序、X 删除、+ 新建这些编辑动作全部搬到
+     * 「[M] 条目管理」页；这一页只留「设为启动默认」的单选与 ↑/↓ 选中。 */
 
     if ((is_ctrl || is_alt) && (vk == VK_UP || vk == VK_DOWN)) {
         int idx = settings_nav_index_of(g_settings_nav) + (vk == VK_UP ? -1 : 1);
         if (idx >= 0 && idx < settings_nav_order_count()) {
             g_settings_nav = settings_nav_at(idx);
-            if (g_settings_nav >= 1 && g_settings_nav <= g_chooser_item_count)
+            if (settings_nav_is_item_detail())
                 load_item_to_editor(g_settings_nav - 1);
             g_mux.needs_redraw = 1;
         }
@@ -2359,6 +2467,7 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
     if (g_settings_nav == SETTINGS_NAV_APPEARANCE) { handle_settings_appearance_key(vk, uc, is_ctrl); return; }
     if (g_settings_nav == SETTINGS_NAV_KEYS) { handle_settings_keys_key(vk, uc, is_ctrl); return; }
     if (g_settings_nav == SETTINGS_NAV_BEHAVIOR) { handle_settings_behavior_key(vk, uc); return; }
+    if (g_settings_nav == SETTINGS_NAV_ITEMS) { handle_settings_items_key(vk, uc, is_ctrl); return; }
     if (g_settings_nav == SETTINGS_NAV_PANE) { handle_settings_pane_key(vk, uc, is_ctrl); return; }
 
     if (g_settings_nav == 0) {
@@ -2404,64 +2513,33 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
             return;
         }
 
-        if (vk == VK_RETURN || uc == 'e' || uc == 'E') {
-            int i = g_settings_table_sel;
-            if (i >= 0 && i < g_chooser_item_count) {
-                g_settings_nav = i + 1;
-                load_item_to_editor(i);
-                g_mux.needs_redraw = 1;
-                return;
-            }
-        }
-
-        if (vk == VK_DELETE || vk == VK_BACK || uc == 'x' || uc == 'X') {
-            int i = g_settings_table_sel;
-            if (g_chooser_item_count > 1 && i >= 0 && i < g_chooser_item_count) {
-                for (int k = i; k < g_chooser_item_count - 1; k++)
-                    g_chooser_items[k] = g_chooser_items[k + 1];
-                g_chooser_item_count--;
-                if (g_settings_table_sel >= g_chooser_item_count) g_settings_table_sel = g_chooser_item_count - 1;
-                save_config();
-                g_mux.needs_redraw = 1;
-                return;
-            }
-        }
-
-        if (uc == '+' || uc == '=' || uc == 'a' || uc == 'A' || uc == 'n' || uc == 'N') {
-            if (g_chooser_item_count < MAX_CHOOSER_ITEMS) {
-                int idx = g_chooser_item_count++;
-                snprintf(g_chooser_items[idx].name, sizeof(g_chooser_items[0].name), "新终端");
-                snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[0].cmd), TERMUX_DEFAULT_SHELL_U8);
-                g_chooser_items[idx].workdir[0] = 0;
-                g_chooser_items[idx].color = 0;
-                save_config();
-                g_settings_table_sel = idx;
-                g_settings_nav = idx + 1;
-                load_item_to_editor(idx);
-                g_mux.needs_redraw = 1;
-                return;
-            }
-        }
-
-        if (uc == 'p' || uc == 'P') {
-            g_settings_show_presets = 1;
-            g_preset_sel = 0;
+        if (vk == VK_RETURN || uc == 'e' || uc == 'E' || uc == 'm' || uc == 'M') {
+            /* v2.1.4：Enter / E / M = 去「条目管理」页（选中行带过去）。 */
+            g_settings_nav = SETTINGS_NAV_ITEMS;
             g_mux.needs_redraw = 1;
             return;
         }
 
-        /* 三个分类页的快捷入口：F2 外观 / F3 键位 / F4 行为，字母 K / B 同义 */
+        if (uc == 'p' || uc == 'P') {
+            /* v2.1.4：预设库也从这一页收进「条目管理」页，P 键直接过去。 */
+            g_settings_nav = SETTINGS_NAV_ITEMS;
+            g_mux.needs_redraw = 1;
+            return;
+        }
+
+        /* 分类页快捷入口：F2 外观 / F3 键位 / F4 行为 / F5 窗格，字母同义 */
         if (vk == VK_F2) { g_settings_nav = SETTINGS_NAV_APPEARANCE; g_mux.needs_redraw = 1; return; }
         if (vk == VK_F3 || uc == 'k' || uc == 'K') { g_settings_nav = SETTINGS_NAV_KEYS; g_mux.needs_redraw = 1; return; }
         if (vk == VK_F4 || uc == 'b' || uc == 'B') { g_settings_nav = SETTINGS_NAV_BEHAVIOR; g_mux.needs_redraw = 1; return; }
         if (vk == VK_F5 || uc == 'w' || uc == 'W') { g_settings_nav = SETTINGS_NAV_PANE; g_mux.needs_redraw = 1; return; }
+        if (uc == 'm' || uc == 'M') { g_settings_nav = SETTINGS_NAV_ITEMS; g_mux.needs_redraw = 1; return; }
 
         if ((uc >= '1' && uc <= '9') || (vk >= '1' && vk <= '9') || (vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9)) {
             int num = (uc >= '1' && uc <= '9') ? (uc - '0') : ((vk >= '1' && vk <= '9') ? (vk - '0') : (vk - VK_NUMPAD1 + 1));
             if (num <= g_chooser_item_count) {
+                /* v2.1.4：数字键 = 选中那一行并去「条目管理」页改它。 */
                 g_settings_table_sel = num - 1;
-                g_settings_nav = num;
-                load_item_to_editor(num - 1);
+                g_settings_nav = SETTINGS_NAV_ITEMS;
                 g_mux.needs_redraw = 1;
                 return;
             }
@@ -2469,7 +2547,7 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
         return;
     }
 
-    if (g_settings_nav >= 1) {
+    if (settings_nav_is_item_detail()) {
         if (vk == VK_ESCAPE) {
             g_settings_nav = 0;
             g_mux.needs_redraw = 1;
@@ -2618,6 +2696,12 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
     if (me->dwEventFlags == MOUSE_WHEELED || me->dwEventFlags == MOUSE_HWHEELED) {
         int d = (short)HIWORD(me->dwButtonState);
         if (g_key_capture_active) return;             /* 录键时不滚页 */
+        /* v2.1.4：Shift+滚轮 = 右栏横向滚动（表格被裁掉的命令行列 / 按钮滚得回来）。
+         * 指针在左半屏（侧栏）时保持原样滚侧栏，不抢这个手势。 */
+        if (me->dwEventFlags == MOUSE_WHEELED && (me->dwControlKeyState & SHIFT_PRESSED)) {
+            int sh_w = settings_host_sidebar_w(host_cols);
+            if (mx + 1 > sh_w + 2) { settings_h_wheel(d); return; }
+        }
         if (g_hex_edit_active) {                      /* 编辑中滚轮 = 先收下当前值再滚 */
             g_hex_edit_active = 0;
             if (g_hex_edit_len == 6) {
@@ -2676,7 +2760,7 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
         if (in_box) {
             for (int i = 0; i < g_preset_count; i++) {
                 if (r == top + 1 + i) {
-                    if (g_settings_nav >= 1) {
+                    if (settings_nav_is_item_detail()) {
                         int idx = g_settings_nav - 1;
                         if (idx >= 0 && idx < g_chooser_item_count) {
                             strncpy(g_edit_name, g_presets[i].name, sizeof(g_edit_name) - 1);
@@ -2725,23 +2809,11 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             g_mux.needs_redraw = 1;
             return;
         }
-        if (r == sbg.add) {
-            if (g_chooser_item_count < MAX_CHOOSER_ITEMS) {
-                int idx = g_chooser_item_count++;
-                snprintf(g_chooser_items[idx].name, sizeof(g_chooser_items[0].name), "新终端");
-                snprintf(g_chooser_items[idx].cmd, sizeof(g_chooser_items[0].cmd), TERMUX_DEFAULT_SHELL_U8);
-                g_chooser_items[idx].workdir[0] = 0;
-                g_chooser_items[idx].color = 0;
-                save_config();
-                g_settings_nav = idx + 1;
-                load_item_to_editor(idx);
-                g_mux.needs_redraw = 1;
-                return;
-            }
-        }
-        if (sbg.presets && r == sbg.presets) {
-            g_settings_show_presets = 1;
-            g_preset_sel = 0;
+        if (r == sbg.items) {              /* v2.1.4：[M] 条目管理 */
+            g_key_capture_active = 0;
+            g_hex_edit_active = 0;
+            g_settings_nav = SETTINGS_NAV_ITEMS;
+            g_settings_show_pane_schemes = 0;
             g_mux.needs_redraw = 1;
             return;
         }
@@ -2760,7 +2832,7 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             }
         }
         if (r == host_rows) {
-            if (g_settings_nav >= 1) {
+            if (settings_nav_is_item_detail()) {
                 save_editor_to_item(g_settings_nav - 1);
             } else {
                 save_config();
@@ -2882,66 +2954,76 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                     return;
                 }
             }
+            /* v2.1.4：表只读 —— 点行 = 选中（▶），要改东西去「[M] 条目管理」页。
+             * 双击仍然直接进那一条的详细配置页（老手的手感不丢）。 */
             for (int i = 0; i < g_chooser_item_count; i++) {
                 if (snat == 10 + i) {
-                    int mbtn = settings_menu_btn_col(host_cols, main_left);
-                    int mud = settings_menu_show_ud(host_cols, main_left);
-                    int mbtn_on = settings_menu_show_btn(host_cols, main_left);   /* v2.1.3：与渲染同源 */
-                    int ecol = mbtn + (mud ? 6 : 0);
-                    int h_up = (mud && mbtn_on && c >= main_left + mbtn && c <= main_left + mbtn + 2);
-                    int h_dn = (mud && mbtn_on && c >= main_left + mbtn + 3 && c <= main_left + mbtn + 5);
-                    int h_ed = (mbtn_on && c >= main_left + ecol && c <= main_left + ecol + 3);
-                    int h_del = (mbtn_on && c >= main_left + ecol + 4 && c <= main_left + ecol + 7);
-                    if (h_up) {
-                        if (i > 0) {
-                            ChooserItem tmp = g_chooser_items[i];
-                            g_chooser_items[i] = g_chooser_items[i - 1];
-                            g_chooser_items[i - 1] = tmp;
-                            g_settings_table_sel = i - 1;
-                            save_config();
-                            g_mux.needs_redraw = 1;
-                        }
-                        return;
-                    }
-                    if (h_dn) {
-                        if (i < g_chooser_item_count - 1) {
-                            ChooserItem tmp = g_chooser_items[i];
-                            g_chooser_items[i] = g_chooser_items[i + 1];
-                            g_chooser_items[i + 1] = tmp;
-                            g_settings_table_sel = i + 1;
-                            save_config();
-                            g_mux.needs_redraw = 1;
-                        }
-                        return;
-                    }
-                    if (h_ed) {
-                        g_settings_table_sel = i;
+                    g_settings_table_sel = i;
+                    if (me->dwEventFlags == DOUBLE_CLICK) {
                         g_settings_nav = i + 1;
                         load_item_to_editor(i);
-                        g_mux.needs_redraw = 1;
-                        return;
                     }
-                    if (h_del) {
-                        if (g_chooser_item_count > 1) {
-                            for (int k = i; k < g_chooser_item_count - 1; k++)
-                                g_chooser_items[k] = g_chooser_items[k + 1];
-                            g_chooser_item_count--;
-                            if (g_settings_table_sel >= g_chooser_item_count) g_settings_table_sel = g_chooser_item_count - 1;
-                            save_config();
-                            g_mux.needs_redraw = 1;
-                        }
-                        return;
-                    }
-                    g_settings_table_sel = i;
-                    g_settings_nav = i + 1;
-                    load_item_to_editor(i);
                     g_mux.needs_redraw = 1;
                     return;
                 }
             }
-            int btn_r = 10 + g_chooser_item_count + 1;
-            if (snat == btn_r) {
-                if (c >= main_left && c < main_left + 14) {
+        } else if (g_settings_nav == SETTINGS_NAV_ITEMS) {
+            /* v2.1.4：条目管理页 —— 行内 [↑][↓][改][删] + 底部 [+] / [P] 动作条。
+             * 列口径与渲染同源（settings_menu_*），横滚时再减去 hscroll。 */
+            int snat = settings_manage_natural_at(host_rows, r);
+            int h_sc = settings_hscroll();
+            int mname, mcw, mbtn, mud, mbtn_on, ecol;
+            /* 列口径与渲染完全同源（含横滚与否），否则「点得中的」和「画出来的」不是一张表。 */
+            int h_on = settings_menu_table_calc(host_rows, host_cols, main_left,
+                                                &mname, &mcw, &mbtn, &mud, &mbtn_on);
+            if (!h_on) h_sc = 0;
+            /* 横滚时按钮钉在视口右端（与 settings_menu_table_geom / render_menu_rows 同一式）。 */
+            int vbc = h_on ? (host_cols - main_left - (mud ? 14 : 8)) : mbtn;
+            ecol = vbc + (mud ? 6 : 0);
+            int vc = c - main_left + (h_on ? 0 : h_sc);
+            for (int i = 0; i < g_chooser_item_count; i++) {
+                if (snat != 10 + i) continue;
+                int h_up = (mud && mbtn_on && vc >= vbc && vc <= vbc + 2);
+                int h_dn = (mud && mbtn_on && vc >= vbc + 3 && vc <= vbc + 5);
+                int h_ed = (mbtn_on && vc >= ecol && vc <= ecol + 3);
+                int h_del = (mbtn_on && vc >= ecol + 4 && vc <= ecol + 7);
+                if (h_up && i > 0) {
+                    ChooserItem tmp = g_chooser_items[i];
+                    g_chooser_items[i] = g_chooser_items[i - 1];
+                    g_chooser_items[i - 1] = tmp;
+                    g_settings_table_sel = i - 1;
+                    save_config(); g_mux.needs_redraw = 1; return;
+                }
+                if (h_dn && i < g_chooser_item_count - 1) {
+                    ChooserItem tmp = g_chooser_items[i];
+                    g_chooser_items[i] = g_chooser_items[i + 1];
+                    g_chooser_items[i + 1] = tmp;
+                    g_settings_table_sel = i + 1;
+                    save_config(); g_mux.needs_redraw = 1; return;
+                }
+                if (h_ed) {
+                    g_settings_table_sel = i;
+                    g_settings_nav = i + 1;
+                    load_item_to_editor(i);
+                    g_mux.needs_redraw = 1; return;
+                }
+                if (h_del) {
+                    if (g_chooser_item_count > 1) {
+                        for (int k = i; k < g_chooser_item_count - 1; k++)
+                            g_chooser_items[k] = g_chooser_items[k + 1];
+                        g_chooser_item_count--;
+                        if (g_settings_table_sel >= g_chooser_item_count)
+                            g_settings_table_sel = g_chooser_item_count - 1;
+                        save_config(); g_mux.needs_redraw = 1;
+                    }
+                    return;
+                }
+                g_settings_table_sel = i;
+                g_mux.needs_redraw = 1;
+                return;
+            }
+            if (snat == 10 + g_chooser_item_count + 1) {      /* 动作条：[+] / [P] */
+                if (vc >= 0 && vc < 14) {
                     if (g_chooser_item_count < MAX_CHOOSER_ITEMS) {
                         int idx = g_chooser_item_count++;
                         snprintf(g_chooser_items[idx].name, sizeof(g_chooser_items[0].name), "新终端");
@@ -2949,19 +3031,21 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                         g_chooser_items[idx].workdir[0] = 0;
                         g_chooser_items[idx].color = 0;
                         save_config();
+                        g_settings_table_sel = idx;
                         g_settings_nav = idx + 1;
                         load_item_to_editor(idx);
                         g_mux.needs_redraw = 1;
                         return;
                     }
                 }
-                if (c >= main_left + 16 && c < main_left + 30) {
+                if (vc >= 15 && vc < 29) {
                     g_settings_show_presets = 1;
                     g_preset_sel = 0;
                     g_mux.needs_redraw = 1;
                     return;
                 }
             }
+            (void)mname; (void)mcw;
         } else {
             int item_idx = g_settings_nav - 1;
             /* v2.1.0：本页会纵向滚动，先把屏幕行反查成「自然行」再比较 */
@@ -3309,7 +3393,7 @@ static int key_input_modal_active(void) {
         /* 文本编辑（菜单项详情 / 颜色十六进制）与键位录制期间独占键盘，
          * 否则外观 / 键位 / 行为页仍然允许全局 Ctrl+B 前缀。 */
         if (g_settings_show_presets || g_key_capture_active || g_hex_edit_active) return 1;
-        if (g_settings_nav >= 1 && g_settings_nav <= g_chooser_item_count) return 1;
+        if (settings_nav_is_item_detail()) return 1;
     }
     return 0;
 }
