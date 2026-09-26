@@ -1271,6 +1271,30 @@ int main(int argc, char **argv) {
               ("窗格页", [b"\x02s", b"\x1bOT"]), ("菜单项详情页", [b"\x02s", b"m", b"\r"]),
               # v2.1.4 新增的一页（增删改都在里面），同样要满足「不折行 / 不盖侧栏」。
               ("条目管理页", [b"\x02s", b"m"]))
+    def side_prefix_set():
+        """侧栏「自己会画」的串集合（含前缀）。见下面 O 组的使用处。"""
+        try:
+            txt = open(os.path.join(ROOT, "src", "render.c"), encoding="utf-8").read()
+        except OSError:
+            return {"─", "│", "┌", "┐", "└", "┘"}
+        m = re.search(r"sb_label\[[^\]]*\]\s*=\s*\{(.*?)\}\s*;", txt, re.S)
+        out = {"─", "│", "┌", "┐", "└", "┘", ""}
+        if not m:
+            return out
+        for lt in re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1)):
+            t = re.sub(r"\s+", "", lt.replace("%s", ""))
+            tails = [t]
+            j = t.find("]")                 # 选中行写成「▶ + 名字」⇒ 名字段也是合法串
+            if j >= 0:
+                tails.append(t[j + 1:])
+            for b in tails:
+                for cut in range(1, len(b) + 1):
+                    out.add(b[:cut])
+        return out
+    # 白名单 = 侧栏自己会画的串（含被 sidebar_clip 裁过的前缀）；整行都是框线/分隔线的
+    # 也算合法（老判据是靠 startswith("─") 放过它的，这里换个不依赖前缀的写法）。
+    oallow = side_prefix_set()
+    O_BORDER_CHARS = set("─│┌┐└┘")
     for oc in (40, 50):
         osb = 22 if oc >= 44 else max(15, oc // 2)
         for oname, okeys in OPAGES:
@@ -1307,11 +1331,12 @@ int main(int argc, char **argv) {
                         break
                     zone += ch
                     acc += 2 if ord(ch) > 0x2E80 else 1
-                z = zone.strip().lstrip("▶").strip()
-                if z and not any(z.startswith(k) for k in
-                                 ("导航选项", "─", "启动 (Startup)", "[M] 条目管理",
-                                  "[A] 外观", "[K] 键位", "[B] 行为", "[W] 窗格配色",
-                                  "[Ctrl+S] 保存配置", "┌", "│", "└", "┐", "┘")):
+                z = re.sub(r"\s+", "", zone.strip().lstrip("▶").strip())
+                # 白名单从 src/render.c 的 sb_label[] 生成（含「选中行只写名字」那种写法），
+                # 并把每个串的【所有前缀】都算上 —— 窄终端上侧栏文本本来就要按列裁
+                # （sidebar_clip），裁出来是前缀不是整串。这样改侧栏文案不用两头改，
+                # 而「正文挤进侧栏」照旧拦得住：外来串不是任何侧栏串的前缀。
+                if z and z not in oallow and not set(z) <= O_BORDER_CHARS:
                     ozs.append((r, z[:18]))
             ck("O %d 列 × %s：侧栏那一段（col 1..%d）只有侧栏自己的字符串，没有正文挤进来"
                % (oc, oname, osb - 1), not ozs, "越界行=%r" % ozs[:3])
@@ -1908,6 +1933,48 @@ int main(int argc, char **argv) {
         k0 = next((i for i, f in enumerate(fr) if mark in f), None)
         return None if k0 is None else len(fr) - k0
 
+    # ---- v2.1.9 用的三个小工具：淡入的「列」视角 ----
+    def rA_chunk_tris(block):
+        """[(行, 起始列, set(三分量))]：按 CUP 切块，每块记住自己从第几列起。
+        只看行会把「框左边的侧栏正文」和「框右边的 [↑][↓][改][删]」一起算进来 ——
+        v2.1.8 的淡入正是这么误伤的，所以这一层必须按 (行,列) 判。"""
+        got = []
+        for m in rA_cup_r.finditer(block):
+            nxt = rA_cup_r.search(block, m.end())
+            seg = block[m.end(): nxt.start() if nxt else len(block)]
+            got.append((int(m.group(1)), int(m.group(2)),
+                        {(int(a), int(b), int(c)) for a, b, c in rA_tri_any.findall(seg)}))
+        return got
+
+    def rA_true_colors(data):
+        """{行: set(三分量)}：anim=off 那一屏的真色集合（= 淡入不许碰的分界线）。"""
+        ref = {}
+        for blk in rA_frames25(data):
+            for r, ts in rA_rowscan(blk).items():
+                ref.setdefault(r, set()).update(ts)
+        return ref
+
+    def rA_box_cols(frames, k):
+        """从「画了 ┌ 的那一帧」里量气泡框的列窗口（c0, c1，1 基含端点）：左边界 = ┌ 前那个
+        CUP 的列，宽度 = ┌ 到 ┐ 之间 ─ 的个数 + 2 ⇒ 数字全来自字节流，不跟着 C 改。"""
+        t = frames[k].decode("utf-8", "replace")
+        m = re.search(r"\x1b\[(\d+);(\d+)H(?:\x1b\[[0-9;]*m)*┌(─*)┐", t)
+        if not m:
+            return None
+        left, w = int(m.group(2)), len(m.group(3)) + 2
+        return (left, left + w - 1)
+
+    def rA_last_chunk_at(data, row, col=1):
+        """第 row 行第 col 列「最后一次」写出的那个 chunk（静止态 = 屏幕真正留下的样子）。"""
+        last = b""
+        for f in rA_frames25(data):
+            for m in rA_cup_r.finditer(f):
+                if int(m.group(1)) == row and int(m.group(2)) == col:
+                    nxt = rA_cup_r.search(f, m.end())
+                    last = f[m.end(): nxt.start() if nxt else len(f)]
+        return last
+
+
     tip_ini_off, tip_ini_nrm = nini5 + rini("off"), nini5 + rini("normal")
     tip_base_scr = vt_text(ROWS_C, COLS_C, capture_page_keys(ROWS_C, COLS_C, [b"\x02s", b"m"],
                                                              ini=tip_ini_nrm)) or []
@@ -1922,6 +1989,29 @@ int main(int argc, char **argv) {
        bool(tip_mv) and k_tip is not None and len(rows_tip) >= 2 and bool(d_tip)
        and set(d_tip) <= rows_tip and max(len(v) for v in d_tip.values()) >= 3,
        "气泡行=%r 被淡行=%r 悬停序列=%r" % (sorted(rows_tip), d_tip, tip_mv))
+    # R17（v2.1.9 用户第 1 条）：淡入只能碰「框自己占的那几格」。框左边是侧栏正文、框右边
+    # 是 [↑][↓][改][删] 那一串 —— 它们跟着一起被混向页面底色，读起来就是「气泡挡住了旁边」。
+    win_tip = rA_box_cols(rA_frames25(tip_nrm), k_tip) if k_tip is not None else None
+    true_tip = rA_true_colors(tip_off)
+    viol_tip, dim_in = [], 0
+    if win_tip and rows_tip:
+        for i, f in enumerate(rA_frames25(tip_nrm)):
+            if i < k_tip:
+                continue
+            for r, c, ts in rA_chunk_tris(f):
+                if r not in rows_tip or not ts:
+                    continue
+                extra = ts - true_tip.get(r, set())
+                if not extra:
+                    continue
+                if win_tip[0] <= c <= win_tip[1]:
+                    dim_in += 1
+                else:
+                    viol_tip.append((i, r, c, sorted(extra)[0]))
+    rA_ck("R17 淡入只碰气泡框内的格子：框占第 %s~%s 列，框外被改过的 chunk = %d 个（框内在淡的 = %d 个）"
+       % (win_tip[0] if win_tip else "—", win_tip[1] if win_tip else "—", len(viol_tip), dim_in),
+       win_tip is not None and not viol_tip and dim_in >= 1,
+       "列窗口=%r 越界样本(帧,行,列,色)=%r" % (win_tip, viol_tip[:3]))
     n_t_off, n_t_nrm = rA_tail_chunks(tip_off, BOX_TOP), rA_tail_chunks(tip_nrm, BOX_TOP)
     rA_ck("R12b anim=off 时气泡一帧都不多画（气泡出现后 off=%s 帧、normal=%s 帧）" % (n_t_off, n_t_nrm),
        n_t_off is not None and n_t_nrm is not None and n_t_off <= 2 and n_t_nrm - n_t_off >= 2,
@@ -1932,7 +2022,8 @@ int main(int argc, char **argv) {
        "0~8，永远到不了 13/17/23）" % (sorted(near)[:2],),
        bool(near), "淡入期间的非原色=%r" % sorted(seen_tip)[:8])
 
-    # 气泡已在、指针从甲行挪到乙行（两行都被截断）：全文跟着换，但不许再来一段动画。
+    # 气泡已在、指针从乙行挪到丙行（两行都被截断）：全文跟着换，而且丙那一段要重新淡一次
+    # （v2.1.9 用户第 2 条 —— 上一版「扫过多行不许重播」被明确推翻：挪行就该看得见。）
     # 两个长名字必须放在第 2、3 项：第 1 项的名字也会出现在标签栏那一行，tip_move 会先
     # 命中标签栏 —— 那就变成「气泡从无到有」，测不到「搬行不许重播」。
     nini_two = ("[menu]\n1 = sh, /bin/sh\n2 = %s, /bin/bash\n3 = %s, /bin/sh\n"
@@ -1955,14 +2046,34 @@ int main(int argc, char **argv) {
         d_sw = {r: [k for k in v if k >= k_b] for r, v in d_sw_all.items()}
         d_sw = {r: v for r, v in d_sw.items() if v}
     sn_sw = "\n".join(vt_text(ROWS_C, COLS_C, sw_nrm) or [])
-    rA_ck("R12c 气泡从乙行挪到丙行：全文跟着换（屏上只剩丙那串），但不重播淡入",
+    rA_ck("R12c 气泡从乙行挪到丙行：全文跟着换（屏上只剩丙那串），丙那一段还重播了淡入",
        bool(mv_a) and bool(mv_b) and mv_a != mv_b and bool(box_fr) and k_b is not None
        and k_b > box_fr[0] and ("丙" * 12) in sn_sw and ("乙" * 12) not in sn_sw
-       # 前半：第一次出现必须真淡（不淡的判据在 v2.1.7 上也会绿，等于没测）；后半：搬行不许再淡
-       and bool(d_sw_all) and not d_sw,
+       # 前半：第一次出现必须真淡（不淡的判据在 v2.1.7 上也会绿，等于没测）；
+       # 后半：挪行之后还要有 ≥3 帧在渐变 —— 一两帧是「顺手重画」，看不出淡入。
+       and bool(d_sw_all) and max((len(v) for v in d_sw.values()), default=0) >= 3,
        "气泡帧=%s..%s 首次淡入=%r 丙文首帧=%s 搬行后又淡的=%r" %
        (box_fr[0] if box_fr else None, box_fr[-1] if box_fr else None,
         {r: len(v) for r, v in d_sw_all.items()}, k_b, d_sw))
+
+    # R18（同一条要求的另一半）：气泡不换锚点行 ⇒ 不重播。鼠标在同一行里左右挪两格，
+    # 气泡只是跟着挪位置，不许再来一段淡入（否则一路挪一路闪）。
+    # 量法用「混合帧数」（这一帧里出现过 off 屏上没有的颜色 ⇒ 它属于某段淡入），不看时序、
+    # 也不设固定窗口：一次触发 = 一段，两次触发 = 两段，帧数会明显翻倍。
+    _ma = re.match(rb"\x1b\[<35;(\d+);(\d+)M", mv_a) if mv_a else None
+    mv_a2 = ("%s" % ("\x1b[<35;%d;%dM" % (int(_ma.group(1)) + 2, int(_ma.group(2))))).encode() if _ma else b""
+    one_on = capture_page_keys(ROWS_C, COLS_C, [b"\x02s", b"m", mv_a], ini=nini_two + rini("normal"))
+    rp_on = capture_page_keys(ROWS_C, COLS_C, [b"\x02s", b"m", mv_a, mv_a2], ini=nini_two + rini("normal"))
+    ref_two = rA_true_colors(sw_off)
+
+    def rA_mix(data):
+        return sum(1 for f in rA_frames25(data)
+                   if any(ts - ref_two.get(r, set()) for r, ts in rA_rowscan(f).items()))
+    n_one, n_rp, n_sw = rA_mix(one_on), rA_mix(rp_on), rA_mix(sw_nrm)
+    rA_ck("R18 淡入按「一次出现一段」数：一次触发 %d 帧、同行再动一下 %d 帧、换到别的行 %d 帧"
+       % (n_one, n_rp, n_sw),
+       bool(mv_a2) and n_one >= 3 and abs(n_rp - n_one) <= 2 and n_sw - n_rp >= 3,
+       "一次=%d 同行=%d 换行=%d（混合帧数，参照色取双气泡场景的 anim=off 屏）" % (n_one, n_rp, n_sw))
 
     T_TOAST = [b"\x02s", b"\x02-"]          # 设置页里按 Ctrl+B - ⇒「设置 / 帮助页面不能分屏」
     TO_MARK = "不能分屏".encode()
@@ -1982,6 +2093,134 @@ int main(int argc, char **argv) {
        and all(dispw(l) <= COLS_C for l in (vt_text(ROWS_C, COLS_C, to_nrm) or [])),
        "首个差异=%r" % (next((i for i, a in enumerate(vt_text(ROWS_C, COLS_C, to_off) or [])
                               if a != (vt_text(ROWS_C, COLS_C, to_nrm) or [])[i]), -1),))
+
+    # R13c：toast 只能淡它自己那一横条。同一条上，横条左边（表格正文/尾巴上的按钮）与右边
+    # 都不许跟着变暗 —— 量法：从字节流里把那一横条的起止列读出来，再看窗口外的 chunk。
+    def rA_span_cols(frames, k, needle):
+        """needle 所在那一横条的列窗口：往前找它自己的 CUP 取起点，往后到 \x1b[0m 的
+        可见宽度取长度（都是终端语义层面的事实，不照抄 C 里的公式）。"""
+        t = frames[k].decode("utf-8", "replace")
+        j = t.find(needle)
+        if j < 0:
+            return None
+        m = None
+        for mm in re.finditer(r"\x1b\[(\d+);(\d+)H", t[:j]):
+            m = mm                       # needle 前面可能夹着好几个 SGR ⇒ 要的是最后一个「行定位」
+        if m is None:
+            return None
+        e = t.find("\x1b[0m", j)
+        vis = re.sub(r"\x1b\[[0-9;]*m", "", t[m.end() + c: e if e > 0 else len(t)])
+        return (int(m.group(2)), int(m.group(2)) + dispw(vis) - 1)
+    fr_to = rA_frames25(to_nrm)
+    win_to = rA_span_cols(fr_to, k_to, "不能分屏") if k_to is not None else None
+    true_to = rA_true_colors(to_off)
+    viol_to, dim_to = [], 0
+    if win_to and to_row > 0:
+        for i, f in enumerate(rA_frames25(to_nrm)):
+            if i < k_to:
+                continue
+            for r, c, ts in rA_chunk_tris(f):
+                if r != to_row or not ts:
+                    continue
+                extra = ts - true_to.get(r, set())
+                if not extra:
+                    continue
+                if win_to[0] <= c <= win_to[1]:
+                    dim_to += 1
+                else:
+                    viol_to.append((i, c, sorted(extra)[0]))
+    rA_ck("R13c toast 只淡自己那一横条：横条占第 %s~%s 列，窗口外被改过的 chunk = %d 个（条内在淡的 = %d 个）"
+       % (win_to[0] if win_to else "—", win_to[1] if win_to else "—", len(viol_to), dim_to),
+       win_to is not None and not viol_to and dim_to >= 1,
+       "列窗口=%r 越界样本(帧,列,色)=%r" % (win_to, viol_to[:3]))
+
+    # ---- v2.1.9 用户第 3、4 条：侧栏「选中行平时就有底色 + 划过的行要亮」+「名字同列」 ----
+    sb_off = capture_page_keys(ROWS_C, COLS_C, [b"\x02s"], ini=rini("off"))
+    sb_scr = vt_text(ROWS_C, COLS_C, sb_off) or []
+    NAMES = ("启动 (Startup)", "条目管理", "外观", "键位设置", "行为开关", "窗格配色")
+
+    def rA_side_rows(lines):
+        """{条目名: (屏幕行号 1 基, 名字起始列 1 基, 分隔线的 0 基列)}。行号与列都从屏上量：
+        写死行号就成了「只在这一档屏高成立」的判据。"""
+        got = {}
+        for nm in NAMES:
+            for i, l in enumerate(lines):
+                jd, jn = l.find("│"), l.find(nm)
+                if jn >= 0 and 0 <= jd and jn < jd:
+                    got[nm] = (i + 1, dispw(l[:jn]) + 1, dispw(l[:jd]))
+                    break
+        return got
+
+    def rA_col_ch(line, col):
+        """取该行「第 col 个显示列」上的字符（col 从 0 数）：CJK 占两格 ⇒ 不能用下标。"""
+        acc = 0
+        for ch in line:
+            if acc >= col:
+                return ch
+            acc += 2 if ord(ch) > 0x2E80 else 1
+        return " "
+    side0 = rA_side_rows(sb_scr)
+    colset = sorted({v[1] for v in side0.values()})
+    rA_ck("R19a 侧栏六个入口的名字都从同一列起（实测第 %s 列，%d 个入口全对上；「▶ 启动」那行不再靠左两格）" % (colset, len(side0)),
+       len(side0) == 6 and len(colset) == 1,
+       "各入口名字列=%r 行号=%r" % ({k: v[1] for k, v in sorted(side0.items())},
+                                    {k: v[0] for k, v in sorted(side0.items())}))
+
+    def rA_side_bg(data, row):
+        """该行最后一个 chunk 的背景色（None = 没涂底）与它的可见文本宽度。"""
+        ch = rA_last_chunk_at(data, row)
+        m = re.search(rb"[^3]48;2;(\d{1,3});(\d{1,3});(\d{1,3})", ch)
+        # 可见宽度：剥掉【所有】CSI（不只是 SGR）—— 该行是帧里最后一段时，尾巴上还挂着
+        # 光标段（?7h / ?25h），只剥 m 结尾的会把那几个字母算进宽度里（本机实测多出 5 列）。
+        vis = re.sub(rb"\x1b\[[0-9;?]*[a-zA-Z]", b"", ch).decode("utf-8", "replace")
+        return ((int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None,
+                dispw(vis), ch)
+    BG_PAGE = (13, 17, 23)
+    sel_nm = next((k for k in side0 if k.startswith("启动")), "启动 (Startup)")
+    sel_row, _, sel_body = side0[sel_nm]
+    bg_sel0, w_sel0, _ = rA_side_bg(sb_off, sel_row)
+    flat = {nm: rA_side_bg(sb_off, side0[nm][0])[0] for nm in side0 if nm != sel_nm}
+    rA_ck("R19b 侧栏选中行不 hover 也有底色（第 %d 行涂成 %r，页面底色 %r），底色条铺满 %d 列、正好停在分隔线（第 %d 列）前一格"
+       % (sel_row, bg_sel0, BG_PAGE, w_sel0, sel_body + 1),
+       bg_sel0 is not None and bg_sel0 != BG_PAGE and w_sel0 == sel_body
+       and all(dispw(l) <= COLS_C for l in sb_scr),
+       "可见宽度=%d 分隔线 0 基列=%d 超宽行=%r" % (w_sel0, sel_body,
+            [i + 1 for i, l in enumerate(sb_scr) if dispw(l) > COLS_C]))
+    rA_ck("R19c 其余五个入口平时仍不涂底色（v2.1.6「侧栏别乱涂」这一半要留着）：%r" % (flat,),
+       all(v is None for v in flat.values()) and len(flat) == 5,
+       "各入口底色=%r" % (flat,))
+    hov_nm = "条目管理"
+    hov_row = side0[hov_nm][0]
+    sb_hov = capture_page_keys(ROWS_C, COLS_C, [b"\x02s", ("\x1b[<35;6;%dM" % hov_row).encode()],
+                               ini=rini("off"))
+    bg_hov1, _, _ = rA_side_bg(sb_off, hov_row)
+    bg_hov2, w_hov2, _ = rA_side_bg(sb_hov, hov_row)
+    bg_sel1, _, _ = rA_side_bg(sb_hov, sel_row)
+    hv_scr = vt_text(ROWS_C, COLS_C, sb_hov) or []
+    bar_ok = (len(hv_scr) >= sel_row and rA_col_ch(hv_scr[sel_row - 1], sel_body) == "│"
+              and rA_col_ch(hv_scr[hov_row - 1], side0[hov_nm][2]) == "│")
+    rA_ck("R19d 鼠标划过第 %d 行才亮底（划前 %r ⇒ 划后 %r），且不会把选中行的底色冲掉（仍是 %r），分隔线那一列仍是 │"
+       % (hov_row, bg_hov1, bg_hov2, bg_sel1),
+       bg_hov1 is None and bg_hov2 is not None and bg_hov2 != BG_PAGE
+       and bg_sel1 == bg_sel0 and bg_hov2 != bg_sel0 and bar_ok
+       and all(dispw(l) <= COLS_C for l in hv_scr),
+       "行%d 划前=%r 划后=%r（铺满 %d 列）选中行底色前后=%r/%r 分隔线在位=%s"
+       % (hov_row, bg_hov1, bg_hov2, w_hov2, bg_sel0, bg_sel1, bar_ok))
+
+    # R19e：hover 的列范围必须与命中范围一致 —— 分隔线那一格点下去也翻这一页（input.c
+    # 是 c <= sb_w），所以划过它同样该亮；而底色条不许越过那一格。
+    hov_bar = capture_page_keys(ROWS_C, COLS_C,
+                                [b"\x02s", ("\x1b[<35;%d;%dM" % (side0[hov_nm][2] + 1, hov_row)).encode()],
+                                ini=rini("off"))
+    bg_bar, w_bar, _ = rA_side_bg(hov_bar, hov_row)
+    bar_scr = vt_text(ROWS_C, COLS_C, hov_bar) or []
+    rA_ck("R19e 指针停在分隔线那一格（第 %d 列，点它也会翻页）⇒ 这一行同样亮底 %r，且分隔线仍是 │"
+       % (side0[hov_nm][2] + 1, bg_bar),
+       bg_bar is not None and bg_bar != BG_PAGE and w_bar == side0[hov_nm][2]
+       and bool(bar_scr) and rA_col_ch(bar_scr[hov_row - 1], side0[hov_nm][2]) == "│"
+       and all(dispw(l) <= COLS_C for l in bar_scr),
+       "铺到 %d 列（分隔线 0 基列 %d）行宽越界=%r"
+       % (w_bar, side0[hov_nm][2], [i + 1 for i, l in enumerate(bar_scr) if dispw(l) > COLS_C]))
 
     # 窄屏：横滑期间的裁剪必须仍守得住屏宽（右侧被裁掉是设计，越界折行不是）
     for rows, cols in ((24, 40), (12, 100)):

@@ -1338,32 +1338,43 @@ static struct {
     int tip, toast;         /* 本帧是否画了截断气泡 / toast */
     int tip_r0, tip_r1;     /* 气泡占的行（1 基，含端点） */
     int toast_r;            /* toast 占的行 */
-} g_anim = { 0, 0, 0, 0, -2, -2, 0, 250, 0, 0, 0, 0, 0 };
+    /* v2.1.9：浮层各自占哪几「列」（1 基，含端点）。淡入只许作用在框内 —— 原先只按行裁剪，
+     * 于是框左边（侧栏正文、底色）与框右边（[↑][↓][改][删] 那一串）被一起混向页面底色，
+     * 看上去就像气泡把旁边的东西盖住了。0 = 不设列边界（整行）。 */
+    int tip_c0, tip_c1, toast_c0, toast_c1;
+} g_anim = { 0, 0, 0, 0, -2, -2, 0, 250, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 /* 状态键：低 3 位是浮层，接着一位是气泡、一位是 toast，高位是当前页。双击进详细配置这类
  * 「页内改内容」不改变键 ⇒ 不动画。 */
 static int settings_anim_state_key(void) {
-    return (g_settings_show_presets ? 1 : 0)
-         | (g_settings_show_pane_schemes ? 2 : 0)
-         | (g_hex_edit_active ? 4 : 0)
-         | (g_anim.tip ? 8 : 0)
-         | (g_anim.toast ? 16 : 0)
-         | ((g_settings_nav & 0x3f) << 6);
+    int k = (g_settings_show_presets ? 1 : 0)
+          | (g_settings_show_pane_schemes ? 2 : 0)
+          | (g_hex_edit_active ? 4 : 0)
+          | (g_anim.tip ? 8 : 0)
+          | (g_anim.toast ? 16 : 0)
+          | ((g_settings_nav & 0x3f) << 6);
+    /* v2.1.9：气泡「挪到别的行」算一次新的出现 ⇒ 键里带上它锚定的那一行（bit 12..16）。
+     * 鼠标在同一行里反复移动不改键 ⇒ 同一行内不会一个事件重播一次。 */
+    if (g_anim.tip) k |= ((g_anim.tip_r0 & 0x1f) << 12);
+    return k;
 }
 
-static int anim_in_scope(int row) {
+static int anim_in_scope(int row, int col) {
     if (!g_anim.only) return 1;
-    if (g_anim.tip && row >= g_anim.tip_r0 && row <= g_anim.tip_r1) return 1;
-    if (g_anim.toast && row == g_anim.toast_r) return 1;
+    /* 框占几列就淡几列，框外一格都不动；列窗口为 0 才退化成整行。 */
+    if (g_anim.tip && row >= g_anim.tip_r0 && row <= g_anim.tip_r1 &&
+        (g_anim.tip_c0 <= 0 || (col >= g_anim.tip_c0 && col <= g_anim.tip_c1))) return 1;
+    if (g_anim.toast && row == g_anim.toast_r &&
+        (g_anim.toast_c0 <= 0 || (col >= g_anim.toast_c0 && col <= g_anim.toast_c1))) return 1;
     return 0;
 }
 
 /* 本帧该行的增益（1000 = 原色，越小越贴近页面底色）。
  * 「逐行点亮」不是把进度按行平移（那样每行都得在最后 1 帧才到位，收尾会看到一次齐刷刷
  * 的跳变），而是给每行一条自己的时间轴：晚一点的行起点更晚、但和别的行同时收尾。 */
-static int anim_gain(int row, int host_rows, long long el) {
+static int anim_gain(int row, int col, int host_rows, long long el) {
     if (!g_anim.t0 || g_anim.dur <= 0) return 1000;
-    if (!anim_in_scope(row)) return 1000;
+    if (!anim_in_scope(row, col)) return 1000;
     int lag = 0;
     long long span = g_anim.dur;
     if (g_anim.wave && host_rows > 3 && row > 2) {
@@ -1403,16 +1414,17 @@ static void anim_fade(char *out, int end, int host_rows, long long el) {
     int br = 13, bg = 17, bb = 23;
     theme_role_rgb(TH_BG0, &br, &bg, &bb);
     int b3[3] = { br, bg, bb };
-    int row = 0, crow = -1, cg = 1000;
+    int row = 0, col = 1, crow = -1, ccol = -1, cg = 1000;
     for (int p = 0; p + 12 <= end; p++) {
         if (out[p] == '\x1b') {
             /* 帧里唯一写成 ESC<行>;<列>H 的就是行定位，认出来当行号用 */
-            int i = p + 2, r = 0, n = 0, m = 0;
+            int i = p + 2, r = 0, cv = 0, n = 0, m = 0;
             while (i < end && out[i] >= '0' && out[i] <= '9') { r = r * 10 + (out[i] - '0'); n++; i++; }
             if (n > 0 && i < end && out[i] == ';') {
                 i++;
-                while (i < end && out[i] >= '0' && out[i] <= '9') { m++; i++; }
-                if (m > 0 && i < end && out[i] == 'H') { row = r; p = i; }
+                while (i < end && out[i] >= '0' && out[i] <= '9') { cv = cv * 10 + (out[i] - '0'); m++; i++; }
+                /* v2.1.9：列号也留下 —— 淡入只能碰浮层自己占的那几列，得知道每段从第几列起 */
+                if (m > 0 && i < end && out[i] == 'H') { row = r; col = cv > 0 ? cv : 1; p = i; }
             }
             continue;
         }
@@ -1432,7 +1444,9 @@ static void anim_fade(char *out, int end, int host_rows, long long el) {
             if (k < 2) { if (out[q] != ';') { ok = 0; break; } q++; }
         }
         if (!ok) continue;
-        if (row != crow) { crow = row; cg = anim_gain(row, host_rows, el); }
+        if (row != crow || col != ccol) {
+            crow = row; ccol = col; cg = anim_gain(row, col, host_rows, el);
+        }
         int first = q - 11;
         for (int k = 0; k < 3 && cg < 1000; k++) {
             int nv = b3[k] + ((v[k] - b3[k]) * cg) / 1000;
@@ -1617,9 +1631,11 @@ static void anim_on_frame(int host_cols) {
     if (g_anim_ms > 0 && g_anim.state != -2 && (st != g_anim.state || ti != g_anim.tab)) {
         int wasp = (g_anim.state & 7) != 0, nowp = (st & 7) != 0;
         int wasf = (g_anim.state & 24) != 0, nowf = (st & 24) != 0;
+        int tip_moved = (g_anim.state ^ st) & (0x1f << 12);     /* 气泡锚定行变了 */
         if (ti != g_anim.tab) mode = 1;             /* 切标签：整页横滑 + 一起淡入 */
         else if (wasp != nowp) mode = 2;             /* 浮层开/关：自上而下逐行点亮 */
         else if (nowf != wasf) mode = nowf ? 4 : 0;  /* 气泡/toast：出现才淡，消失即时 */
+        else if (tip_moved && nowf) mode = 4;        /* v2.1.9：气泡挪行 ⇒ 再淡一次 */
         else mode = 3;                               /* 换页：整页一起淡 */
         /* 气泡/toast 消失不动画：它们本来就该即时不见，淡出在终端里只会读成整屏闪一下。 */
     }
@@ -1733,10 +1749,11 @@ static void render_settings_tooltip(char *out, int bs, int *posp, int host_rows,
     pos += snprintf(out + pos, bs - pos, "┘\x1b[0m");
     *posp = pos;
     /* v2.1.8：气泡是「跟着鼠标瞬现」的东西，用户反馈「淡入完全看不出来」——因为原先它
-     * 一帧动画都没有。这里只把它占的行登记给帧尾的动画（不碰它写出的任何字节）：状态键
-     * 里带一位「本帧有没有气泡」，从无到有的那一帧起一段淡入；鼠标在行与行之间扫过去
-     * 不重播（键不变），所以不会一路闪。 */
+     * 一帧动画都没有。这里只把它占的格子登记给帧尾的动画（不碰它写出的任何字节）：状态键
+     * 里带一位「本帧有没有气泡」+ 它锚定的那一行，从无到有、或换到别的行，都起一段淡入
+     * （v2.1.9 用户要求）；同一行里鼠标再动也不改键 ⇒ 不会一个事件闪一次。 */
     g_anim.tip = 1; g_anim.tip_r0 = top; g_anim.tip_r1 = top + bh - 1;
+    g_anim.tip_c0 = left; g_anim.tip_c1 = left + bw - 1;
 }
 
 int settings_theme_row(int idx) { return SETTINGS_THEME_ROW0 + idx; }
@@ -3842,7 +3859,7 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
      * 第 2 条：删掉「默认：终端」那一行（条目管理页的标题里已经写着「当前默认：xxx」）。 */
     {
         static const char *const sb_label[SETTINGS_SB_NAT_ROWS + 1] = {
-            "", "  导航选项", "", "  %s 启动 (Startup)", "  [M] 条目管理",
+            "", "  导航选项", "", "  %s   启动 (Startup)", "  [M] 条目管理",
             "  [A] 外观 / 主题", "  [K] 键位设置", "  [B] 行为开关", "  [W] 窗格配色",
             " [Ctrl+S] 保存配置",
         };
@@ -3863,13 +3880,15 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
                 }
                 continue;
             }
-            /* 第 3 条：侧栏不再「一条一个颜色 + hover 起底色」。六个入口一律同色，
-             * 当前在哪一页只由行首那一格 ▶ 说明（宽度与空格一模一样 ⇒ 任何终端都不多占列）。 */
+            /* v2.1.6 第 3 条：六个入口一律同字色（不是一条一个颜色）。v2.1.9 用户第 4 条：
+             * 名字要同列 —— 原先「▶ 启动」那行拿 1 格的 %s 去顶别人的 3 格 [X]，名字比其余
+             * 条目靠左两格；而选中其它页时写成 " ▶[A] …"，▶ 直接和快捷键挤在一块儿。
+             * 现在一律「两格缩进 + 四格记号位 + 名字」，名字都从第 7 列起。 */
             char lab[64], fit[96];
             int cur = (n == 3) ? (g_settings_nav == 0)
                                : (navs[n] >= 0 && g_settings_nav == navs[n]);
             if (n == 3) snprintf(lab, sizeof(lab), sb_label[3], cur ? "▶" : " ");
-            else if (cur) snprintf(lab, sizeof(lab), " ▶%s", sb_label[n] + 2);
+            else if (cur) snprintf(lab, sizeof(lab), "  ▶   %s", sb_label[n] + 6);
             else snprintf(lab, sizeof(lab), "%s", sb_label[n]);
             /* 侧栏每行都必须停在分隔线之前（v2.1.3：写死的定宽串在 30 列终端上会折行，
              * 把侧栏自己的条目顶掉）。 */
@@ -3877,7 +3896,29 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
             const char *sgr = (n == 1)   ? "\x1b[038;2;110;118;129;1m"      /* 小标题 */
                               : (n == 9) ? "\x1b[038;2;139;148;158m"        /* 保存行 */
                                          : "\x1b[038;2;230;237;243m";        /* 六个入口同色 */
-            pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H%s%s\x1b[0m", row, sgr, fit);
+            /* v2.1.9 用户第 3 条：侧栏「划过要有颜色」+「选中行平时就该有底色」。
+             * v2.1.6 曾把 hover 底色整条撤掉，结果侧栏连一点鼠标反馈都没有 ⇒ 现在只给
+             * 条目行上底色：当前页那一行常态用 accent 浅底，鼠标划过的行用 BG1 浅底，
+             * 两者都在时用 accent（不让 hover 把「你在哪一页」冲掉）。用色全是已登记的
+             * 主题角色（022;062;128 = TH_ACCENT→BG1 45%、022;027;034 = TH_BG1）⇒ 改
+             * [theme] 的人会跟着变，也不引入新的字面量。底色铺满整行（到分隔线前一格），
+             * 否则只有一小截有底、看着像贴了块胶带。 */
+            /* n >= 3：只有「按行号真能点出东西」的那些行才给反馈 —— 「导航选项」是表头，
+             * 点它什么都不做（input.c 里没这一支），亮起来反而像它是个按钮。
+             * 列范围与命中判定取同一份（input.c 是「c <= sb_w ⇒ 算在这一行上」）：点分隔线
+             * 那一格也会翻页，那划过它就该亮。底色条本身只铺到 sb_w-1 列，分隔线那一列
+             * 由条子自己画（在下面），不会被这行涂掉。 */
+            int hov = (n >= 3 && g_mouse_x >= 0 && g_mouse_y == row - 1 && g_mouse_x <= sb_w - 1);
+            const char *bgr = cur ? "\x1b[048;2;022;062;128m"
+                          : (hov ? "\x1b[048;2;022;027;034m" : "");
+            char pad[128];
+            pad[0] = 0;
+            if (bgr[0]) {
+                int used = utf8_cols(fit, (int)strlen(fit));
+                if (used < sb_w - 1) sidebar_fill(pad, sizeof(pad), " ", sb_w - 1 - used);
+            }
+            pos += snprintf(out + pos, bs - pos, "\x1b[%d;1H%s%s%s%s\x1b[0m",
+                            row, bgr, sgr, fit, pad);
         }
         /* 侧栏那根细滚动条：与终端同款（接近才画、按距离渐变、滑块整格反白）。
          * 画在分隔线那一列 = 侧栏正文之外的唯一一格，不啃任何标签的收尾字符。 */
@@ -6323,6 +6364,7 @@ void render_screen(void) {
                         trow, tcol, g_toast_msg);
         /* v2.1.8：toast 与气泡同款处理 —— 出现那一帧淡入，消失仍是即时（只登记行号） */
         g_anim.toast = 1; g_anim.toast_r = trow;
+        g_anim.toast_c0 = tcol; g_anim.toast_c1 = tcol + box_w - 1;
     } else if (g_toast_until) {
         g_toast_until = 0;
         g_toast_msg[0] = 0;
