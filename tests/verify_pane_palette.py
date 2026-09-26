@@ -2109,7 +2109,7 @@ int main(int argc, char **argv) {
         if m is None:
             return None
         e = t.find("\x1b[0m", j)
-        vis = re.sub(r"\x1b\[[0-9;]*m", "", t[m.end() + c: e if e > 0 else len(t)])
+        vis = re.sub(r"\x1b\[[0-9;]*m", "", t[m.end(): e if e > 0 else len(t)])
         return (int(m.group(2)), int(m.group(2)) + dispw(vis) - 1)
     fr_to = rA_frames25(to_nrm)
     win_to = rA_span_cols(fr_to, k_to, "不能分屏") if k_to is not None else None
@@ -2160,9 +2160,10 @@ int main(int argc, char **argv) {
             acc += 2 if ord(ch) > 0x2E80 else 1
         return " "
     side0 = rA_side_rows(sb_scr)
+    ok_side = len(side0) == len(NAMES)     # 没有 libvterm 时 sb_scr 是空的 ⇒ 后面全走空值
     colset = sorted({v[1] for v in side0.values()})
     rA_ck("R19a 侧栏六个入口的名字都从同一列起（实测第 %s 列，%d 个入口全对上；「▶ 启动」那行不再靠左两格）" % (colset, len(side0)),
-       len(side0) == 6 and len(colset) == 1,
+       ok_side and len(colset) == 1,
        "各入口名字列=%r 行号=%r" % ({k: v[1] for k, v in sorted(side0.items())},
                                     {k: v[0] for k, v in sorted(side0.items())}))
 
@@ -2177,31 +2178,38 @@ int main(int argc, char **argv) {
                 dispw(vis), ch)
     BG_PAGE = (13, 17, 23)
     sel_nm = next((k for k in side0 if k.startswith("启动")), "启动 (Startup)")
-    sel_row, _, sel_body = side0[sel_nm]
-    bg_sel0, w_sel0, _ = rA_side_bg(sb_off, sel_row)
-    flat = {nm: rA_side_bg(sb_off, side0[nm][0])[0] for nm in side0 if nm != sel_nm}
+    sel_row, _, sel_body = side0.get(sel_nm, (0, 0, 0))
+    bg_sel0, w_sel0, _ = rA_side_bg(sb_off, sel_row) if ok_side else (None, 0, b"")
+    flat = ({nm: rA_side_bg(sb_off, side0[nm][0])[0] for nm in side0 if nm != sel_nm}
+            if ok_side else {})
     rA_ck("R19b 侧栏选中行不 hover 也有底色（第 %d 行涂成 %r，页面底色 %r），底色条铺满 %d 列、正好停在分隔线（第 %d 列）前一格"
        % (sel_row, bg_sel0, BG_PAGE, w_sel0, sel_body + 1),
-       bg_sel0 is not None and bg_sel0 != BG_PAGE and w_sel0 == sel_body
+       ok_side and bg_sel0 is not None and bg_sel0 != BG_PAGE and w_sel0 == sel_body
        and all(dispw(l) <= COLS_C for l in sb_scr),
        "可见宽度=%d 分隔线 0 基列=%d 超宽行=%r" % (w_sel0, sel_body,
             [i + 1 for i, l in enumerate(sb_scr) if dispw(l) > COLS_C]))
     rA_ck("R19c 其余五个入口平时仍不涂底色（v2.1.6「侧栏别乱涂」这一半要留着）：%r" % (flat,),
-       all(v is None for v in flat.values()) and len(flat) == 5,
+       ok_side and all(v is None for v in flat.values()) and len(flat) == 5,
        "各入口底色=%r" % (flat,))
     hov_nm = "条目管理"
-    hov_row = side0[hov_nm][0]
-    sb_hov = capture_page_keys(ROWS_C, COLS_C, [b"\x02s", ("\x1b[<35;6;%dM" % hov_row).encode()],
-                               ini=rini("off"))
-    bg_hov1, _, _ = rA_side_bg(sb_off, hov_row)
-    bg_hov2, w_hov2, _ = rA_side_bg(sb_hov, hov_row)
-    bg_sel1, _, _ = rA_side_bg(sb_hov, sel_row)
-    hv_scr = vt_text(ROWS_C, COLS_C, sb_hov) or []
-    bar_ok = (len(hv_scr) >= sel_row and rA_col_ch(hv_scr[sel_row - 1], sel_body) == "│"
-              and rA_col_ch(hv_scr[hov_row - 1], side0[hov_nm][2]) == "│")
+    hov_row = side0.get(hov_nm, (0, 0, 0))[0]
+    bar_col = side0.get(hov_nm, (0, 0, 0))[2]     # 分隔线的 0 基显示列（取不到就是 0）
+    if ok_side:
+        sb_hov = capture_page_keys(ROWS_C, COLS_C,
+                                   [b"\x02s", ("\x1b[<35;6;%dM" % hov_row).encode()], ini=rini("off"))
+        bg_hov1, _, _ = rA_side_bg(sb_off, hov_row)
+        bg_hov2, w_hov2, _ = rA_side_bg(sb_hov, hov_row)
+        bg_sel1, _, _ = rA_side_bg(sb_hov, sel_row)
+        hv_scr = vt_text(ROWS_C, COLS_C, sb_hov) or []
+        bar_ok = (len(hv_scr) >= sel_row and rA_col_ch(hv_scr[sel_row - 1], sel_body) == "│"
+                  and rA_col_ch(hv_scr[hov_row - 1], side0[hov_nm][2]) == "│")
+    else:
+        bg_hov1 = bg_hov2 = bg_sel1 = None
+        w_hov2 = 0
+        hv_scr, bar_ok = [], False
     rA_ck("R19d 鼠标划过第 %d 行才亮底（划前 %r ⇒ 划后 %r），且不会把选中行的底色冲掉（仍是 %r），分隔线那一列仍是 │"
        % (hov_row, bg_hov1, bg_hov2, bg_sel1),
-       bg_hov1 is None and bg_hov2 is not None and bg_hov2 != BG_PAGE
+       ok_side and bg_hov1 is None and bg_hov2 is not None and bg_hov2 != BG_PAGE
        and bg_sel1 == bg_sel0 and bg_hov2 != bg_sel0 and bar_ok
        and all(dispw(l) <= COLS_C for l in hv_scr),
        "行%d 划前=%r 划后=%r（铺满 %d 列）选中行底色前后=%r/%r 分隔线在位=%s"
@@ -2209,18 +2217,21 @@ int main(int argc, char **argv) {
 
     # R19e：hover 的列范围必须与命中范围一致 —— 分隔线那一格点下去也翻这一页（input.c
     # 是 c <= sb_w），所以划过它同样该亮；而底色条不许越过那一格。
-    hov_bar = capture_page_keys(ROWS_C, COLS_C,
-                                [b"\x02s", ("\x1b[<35;%d;%dM" % (side0[hov_nm][2] + 1, hov_row)).encode()],
-                                ini=rini("off"))
-    bg_bar, w_bar, _ = rA_side_bg(hov_bar, hov_row)
-    bar_scr = vt_text(ROWS_C, COLS_C, hov_bar) or []
+    if ok_side:
+        hov_bar = capture_page_keys(ROWS_C, COLS_C,
+                                    [b"\x02s", ("\x1b[<35;%d;%dM" % (bar_col + 1, hov_row)).encode()],
+                                    ini=rini("off"))
+        bg_bar, w_bar, _ = rA_side_bg(hov_bar, hov_row)
+        bar_scr = vt_text(ROWS_C, COLS_C, hov_bar) or []
+    else:
+        bg_bar, w_bar, bar_scr = None, 0, []
     rA_ck("R19e 指针停在分隔线那一格（第 %d 列，点它也会翻页）⇒ 这一行同样亮底 %r，且分隔线仍是 │"
-       % (side0[hov_nm][2] + 1, bg_bar),
-       bg_bar is not None and bg_bar != BG_PAGE and w_bar == side0[hov_nm][2]
+       % (bar_col + 1, bg_bar),
+       ok_side and bg_bar is not None and bg_bar != BG_PAGE and w_bar == bar_col
        and bool(bar_scr) and rA_col_ch(bar_scr[hov_row - 1], side0[hov_nm][2]) == "│"
        and all(dispw(l) <= COLS_C for l in bar_scr),
        "铺到 %d 列（分隔线 0 基列 %d）行宽越界=%r"
-       % (w_bar, side0[hov_nm][2], [i + 1 for i, l in enumerate(bar_scr) if dispw(l) > COLS_C]))
+       % (w_bar, bar_col, [i + 1 for i, l in enumerate(bar_scr) if dispw(l) > COLS_C]))
 
     # 窄屏：横滑期间的裁剪必须仍守得住屏宽（右侧被裁掉是设计，越界折行不是）
     for rows, cols in ((24, 40), (12, 100)):
