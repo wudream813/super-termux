@@ -104,7 +104,11 @@ def main():
     #   改成【等到本步的断言真的满足】为止，超时才判失败：测试不再依赖机器速度。
     #   注意不能只等「帧数增加」—— 启动阶段本来就在出帧，那样第一步会立刻返回、
     #   还没等到命令回显（我自己先踩了这一次）。
-    FRAME_TIMEOUT = float(os.environ.get("TERMUX_SMOKE_FRAME_TIMEOUT", "10"))
+    # 这是「最多等多久」而不是「固定睡多久」⇒ 调大只会让慢机器跟得上，不会让快机器变慢，
+    # 也不会放宽任何断言：判据仍然是「某一帧里必须出现该子串」。CI 的 macOS runner 是共享
+    # 虚拟化核，整轮跑下来每步只推进一帧（本地是 2~5 帧），新标签页里那条 shell 起来得比
+    # 10s 还慢过一次 ⇒ 「回滚：先灌 200 行」在那台机器上误红过一轮。
+    FRAME_TIMEOUT = float(os.environ.get("TERMUX_SMOKE_FRAME_TIMEOUT", "25"))
 
     def step(label, keys, wait=1.0, checks=()):
         drain(0.05)
@@ -213,6 +217,9 @@ def main():
                     # 失败时把标签栏那一行也打出来，省得再去猜实际渲染成什么样
                     lines = [ln for ln in grid.split("\n") if ln.strip()]
                     extra += "；标签栏实际是 %r" % (lines[0].strip()[:60] if lines else "(空帧)")
+                    # 再附上最后三行：分不清「shell 已经退出（屏上是「进程已退出」）」和
+                    # 「输出还没到」时，这两个字节能省掉一整轮 CI 的猜测。
+                    extra += "；末三行=%r" % ([ln.strip()[-46:] for ln in lines[-3:]] if lines else [])
                 ck(name, ok, extra)
         if any("不是 cmd" in n for n, _ in checks):
             first = next((ln.strip() for ln in grid.split("\n") if ln.strip()), "")
