@@ -1302,6 +1302,334 @@ int settings_detail_natural_at(int host_rows, int row) {
                                     SETTINGS_DETAIL_LAST, &g_settings_detail_scroll, sel);
 }
 
+/* ==== v2.1.7/8：过渡动画（切页淡入 / 浮层逐行点亮 / 切标签横滑 / 气泡与 toast 淡入）====
+ * 终端里既没有半透明也没有地方插一帧进去，所以「淡入」只有一条路：把【这一帧真的写给
+ * 终端的那些颜色】按进度往页面底色混合，再用几帧回到原色。整套做法挂在帧尾一处，排版
+ * 函数一个都不用改：
+ *   - 只有状态变了才动：状态键 =「当前页 + 哪个浮层开着 + 气泡/toast 在不在」，再加一个
+ *     「当前标签的锚点 pane」。于是切页、开浮层、气泡出现、切标签都会起动画，而 hover
+ *     在行与行之间移动、滚动、改字（本来就该即时）不会触发。
+ *   - v2.1.8 把「向黑压暗」换成「向 TH_BG0 混合」。浮层/气泡是一实心底色画在页面上，
+ *     压暗 25% 之后仍然是一个完整的框，肉眼读不出「浮现」（用户原话：「气泡的淡入完全
+ *     没有看出来」——那时它连一帧动画都没有）；改成从页面底色渐变到真色，第一帧它几乎与
+ *     页面同色才真的看得见。gain=1000 时 bg + (v-bg)*1000/1000 == v 是整数恒等 ⇒ 静止
+ *     那一帧逐字节不变，也不新增任何字面量颜色（g_theme_refs 不用登记）。
+ *   - 切标签的横滑：正文每个 chunk 都以 ESC<行>;<列>H 起笔 ⇒ 把列号加一个位移量、再把
+ *     落到屏外的格子丢掉，整页就从右边「推进来」（上一个标签则从左边进）。只丢字节不改
+ *     字节的顺序 ⇒ 行宽永远不超过 host_cols，不会折行溢出。铺底/清行那类「只有空格没有
+ *     正文」的 chunk 一律不位移：整行底色留在原位，页面没推进来的那一截就是干净的页面
+ *     底色，不会残留上一页的字节。
+ *   - 命中判定一概不动：动画只改交给 framediff 的那份字节，不碰 g_mux.tab_info /
+ *     g_tab_hit / g_settings_* 的任何矩形，也不改输入时序。
+ *   - anim = off（或时长已走完）时这一段完全不执行 ⇒ 输出与没有这个功能时逐字节相同。
+ * 驱动靠 needs_redraw：动画期间主循环把等待降到 8ms（实测约 8ms 画一帧），亮度按 15ms
+ * 取整分片 ⇒ 110ms 实际改变 7 档，同片内的多余帧被帧差吞掉不费流量；走完那一帧不再自己
+ * 点亮，静止时仍是原来的 25ms 轮询。
+ * ------------------------------------------------------------------------- */
+static struct {
+    unsigned long long t0;   /* 本次过渡起点；0 = 当前没在动 */
+    int dur;                /* 本次过渡时长 ms */
+    int wave;               /* 1 = 逐行点亮（浮层）；0 = 整页一起 */
+    int only;               /* 1 = 只淡气泡/toast 自己那几行，别的行一格不动 */
+    int state;              /* 上一帧的状态键，-2 = 从没画过 */
+    int tab;                /* 上一帧的标签锚点，-2 = 从没画过 */
+    int dist;               /* 横滑总位移（列，带符号：>0 从右进）；0 = 这一帧不滑 */
+    int floor_;             /* 起点与页面底色的混合比例（千分比，越小越贴底） */
+    int tip, toast;         /* 本帧是否画了截断气泡 / toast */
+    int tip_r0, tip_r1;     /* 气泡占的行（1 基，含端点） */
+    int toast_r;            /* toast 占的行 */
+} g_anim = { 0, 0, 0, 0, -2, -2, 0, 250, 0, 0, 0, 0, 0 };
+
+/* 状态键：低 3 位是浮层，接着一位是气泡、一位是 toast，高位是当前页。双击进详细配置这类
+ * 「页内改内容」不改变键 ⇒ 不动画。 */
+static int settings_anim_state_key(void) {
+    return (g_settings_show_presets ? 1 : 0)
+         | (g_settings_show_pane_schemes ? 2 : 0)
+         | (g_hex_edit_active ? 4 : 0)
+         | (g_anim.tip ? 8 : 0)
+         | (g_anim.toast ? 16 : 0)
+         | ((g_settings_nav & 0x3f) << 6);
+}
+
+static int anim_in_scope(int row) {
+    if (!g_anim.only) return 1;
+    if (g_anim.tip && row >= g_anim.tip_r0 && row <= g_anim.tip_r1) return 1;
+    if (g_anim.toast && row == g_anim.toast_r) return 1;
+    return 0;
+}
+
+/* 本帧该行的增益（1000 = 原色，越小越贴近页面底色）。
+ * 「逐行点亮」不是把进度按行平移（那样每行都得在最后 1 帧才到位，收尾会看到一次齐刷刷
+ * 的跳变），而是给每行一条自己的时间轴：晚一点的行起点更晚、但和别的行同时收尾。 */
+static int anim_gain(int row, int host_rows, long long el) {
+    if (!g_anim.t0 || g_anim.dur <= 0) return 1000;
+    if (!anim_in_scope(row)) return 1000;
+    int lag = 0;
+    long long span = g_anim.dur;
+    if (g_anim.wave && host_rows > 3 && row > 2) {
+        int cap = (g_anim.dur * 45) / 100;
+        lag = (int)(((long long)(row - 2) * cap) / host_rows);
+        if (lag > cap) lag = cap;
+        span = g_anim.dur - cap;
+    }
+    if (span < 30) span = 30;
+    long long e = el - lag;
+    if (e < 0) e = 0;
+    int p = (int)((e * 1000) / span);
+    if (p > 1000) p = 1000;
+    p = p * p * (3000 - 2 * p) / 1000000;         /* smoothstep：两端不突兀 */
+    return g_anim.floor_ + ((1000 - g_anim.floor_) * p) / 1000;
+}
+
+/* 本帧的横移列数（带符号）。与亮度共用一条缓动曲线 ⇒ 位移和淡入同时收尾；量化到 15ms
+ * 一片也是同一个 el ⇒ 不会出现「屏幕上是最后一档亮度、位移却还在动」的错位。 */
+static int anim_shift(int host_cols, long long el) {
+    if (!g_anim.dist || g_anim.dur <= 0) return 0;
+    int p = (int)((el * 1000) / g_anim.dur);
+    if (p > 1000) p = 1000;
+    p = p * p * (3000 - 2 * p) / 1000000;
+    int mag = g_anim.dist < 0 ? -g_anim.dist : g_anim.dist;
+    int s = (int)(((long long)mag * (1000 - p)) / 1000);
+    if (s > host_cols) s = host_cols;
+    return g_anim.dist < 0 ? -s : s;
+}
+
+/* 把 out[0..end) 里所有真彩色三分量按所在行的增益往页面底色（TH_BG0）混。见上面注释：
+ * 只认 %03d 三分量（UI 配色都是这一种写法），且只在原位置改数字，长度一字不变 ⇒ 行尾
+ * 对齐、限宽、气泡登记全都不受影响。认不出的写法（位数不对、不是 38/48 的）整段放过：
+ * 最坏是那一处不淡入，不会画花。 */
+static void anim_fade(char *out, int end, int host_rows, long long el) {
+    if (!g_anim.t0 || g_anim.dur <= 0 || end < 16) return;
+    int br = 13, bg = 17, bb = 23;
+    theme_role_rgb(TH_BG0, &br, &bg, &bb);
+    int b3[3] = { br, bg, bb };
+    int row = 0, crow = -1, cg = 1000;
+    for (int p = 0; p + 12 <= end; p++) {
+        if (out[p] == '\x1b') {
+            /* 帧里唯一写成 ESC<行>;<列>H 的就是行定位，认出来当行号用 */
+            int i = p + 2, r = 0, n = 0, m = 0;
+            while (i < end && out[i] >= '0' && out[i] <= '9') { r = r * 10 + (out[i] - '0'); n++; i++; }
+            if (n > 0 && i < end && out[i] == ';') {
+                i++;
+                while (i < end && out[i] >= '0' && out[i] <= '9') { m++; i++; }
+                if (m > 0 && i < end && out[i] == 'H') { row = r; p = i; }
+            }
+            continue;
+        }
+        if (out[p] != ';' || out[p + 1] != '2' || out[p + 2] != ';') continue;
+        if (!(out[p - 1] == '8' && (out[p - 2] == '3' || out[p - 2] == '4'))) continue;
+        int v[3], q = p + 3, ok = 1;
+        for (int k = 0; k < 3; k++) {
+            if (q + 3 > end) { ok = 0; break; }
+            int d[3];
+            for (int t = 0; t < 3; t++) {
+                if (out[q + t] < '0' || out[q + t] > '9') { ok = 0; break; }
+                d[t] = out[q + t] - '0';
+            }
+            if (!ok) break;
+            v[k] = d[0] * 100 + d[1] * 10 + d[2];
+            q += 3;
+            if (k < 2) { if (out[q] != ';') { ok = 0; break; } q++; }
+        }
+        if (!ok) continue;
+        if (row != crow) { crow = row; cg = anim_gain(row, host_rows, el); }
+        int first = q - 11;
+        for (int k = 0; k < 3 && cg < 1000; k++) {
+            int nv = b3[k] + ((v[k] - b3[k]) * cg) / 1000;
+            if (nv < 0) nv = 0; else if (nv > 255) nv = 255;
+            char *w = out + first + k * 4;
+            w[0] = (char)('0' + nv / 100);
+            w[1] = (char)('0' + (nv / 10) % 10);
+            w[2] = (char)('0' + nv % 10);
+        }
+        p = q - 1;
+    }
+}
+
+/* 认 i 处的一条转义序列。是「光标绝对定位」（ESC[Pr;PcH / ESC[Pr;Pf）时把行列填进去，
+ * 否则 *row = -1。返回 0 = 这一段认不出来（上层就把 ESC 当普通字节搬走，绝不跳过任何
+ * 字节，否则会漏发内容）。OSC 单独处理：它里面的字符是标题文本，不能当正文计数。 */
+static int anim_esc(const char *b, int i, int end, int *row, int *col) {
+    *row = -1; *col = 1;
+    if (i + 1 >= end || b[i] != '\x1b') return 0;
+    if (b[i + 1] == ']') {
+        int j = i + 2;
+        while (j < end) {
+            if (b[j] == 7) return j - i + 1;
+            if (b[j] == '\x1b' && j + 1 < end && b[j + 1] == '\\') return j - i + 2;
+            j++;
+        }
+        return end - i;
+    }
+    if (b[i + 1] != '[') return 2;
+    int j = i + 2, priv = 0, grp = 0, r = 0, c = 0;
+    while (j < end) {
+        unsigned char ch = (unsigned char)b[j];
+        if (ch >= '0' && ch <= '9') {
+            if (grp > 1) priv = 1;                    /* 三个以上参数：不是 CUP */
+            if (grp == 0) r = r * 10 + (ch - '0'); else c = c * 10 + (ch - '0');
+            j++; continue;
+        }
+        if (ch == ';') { grp++; j++; continue; }
+        if (ch == '?' || ch == '>' || ch == '<' || ch == '!' || ch == '"' || ch == '\'') { priv = 1; j++; continue; }
+        if (ch >= 0x40 && ch <= 0x7e) {
+            if (!priv && grp <= 1 && (ch == 'H' || ch == 'f')) {
+                *row = r ? r : 1;
+                *col = grp >= 1 ? (c ? c : 1) : 1;
+            }
+            return j - i + 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+/* 从 i 起扫到下一条 CUP（或 end）：这条 chunk 里有没有「非空格正文」？只有空格的 chunk
+ * 是整行铺底 / 清行尾，必须留在原位 —— 它跟着位移的话，页面还没推进来的那一截就没人铺
+ * 底色，会露出上一帧的字节。*next 回的是 chunk 的终点（仅供诊断）。 */
+static int anim_chunk_has_text(const char *b, int i, int end, int *next) {
+    int has = 0, j = i;
+    while (j < end) {
+        if (b[j] == '\x1b') {
+            int r = -1, c = 1;
+            int L = anim_esc(b, j, end, &r, &c);
+            if (L <= 0) { j++; continue; }
+            if (r >= 0) break;
+            j += L; continue;
+        }
+        if (b[j] != ' ') has = 1;
+        j++;
+    }
+    *next = j;
+    return has;
+}
+
+static char *g_slide_buf;
+static int g_slide_cap;
+
+/* 重写整段正文要往另一个缓冲里搬字节：每一处写入都先验长度，装不下就整段放弃（这一帧
+ * 只剩淡入、没有位移），绝不在缓冲区里越界。 */
+#define SLIDE_PUTF(...) do { int _w = snprintf(tmp + n, need - n, __VA_ARGS__);          \
+                             if (_w < 0 || _w >= need - n) { goto slide_fail; } else { n += _w; } } while (0)
+#define SLIDE_PUTN(src, k) do { if ((k) > 0) { if (n + (k) > need) { goto slide_fail; }   \
+                                else { memcpy(tmp + n, (src), (size_t)(k)); n += (k); } } } while (0)
+
+/* 按位移 d 重写 out[0..*endp)（正文）并搬走光标段；成功后把两个长度写回去。
+ * 失败（缓冲不够 / 没内存在）时原样返回 0，这一帧就是「只有淡入、没有位移」，
+ * 下一帧还会再试 ⇒ 最坏是某一次切标签少了滑动，绝不会画错。 */
+static int anim_slide_rewrite(char *out, int bs, int *posp, int *endp, int host_rows, int host_cols, int d) {
+    int end = *endp, total = *posp;
+    int need = total + (total >> 2) + 4096;
+    if (need > g_slide_cap) {
+        char *nb = (char *)realloc(g_slide_buf, (size_t)need);
+        if (!nb) return 0;
+        g_slide_buf = nb; g_slide_cap = need;
+    }
+    char *tmp = g_slide_buf;
+    int i = 0, n = 0, dcur = 0, vcol = 1, pend = 1, crow = 1;
+    while (i < end) {
+        if (out[i] == '\x1b') {
+            int r = -1, c = 1;
+            int L = anim_esc(out, i, end, &r, &c);
+            if (L <= 0) { SLIDE_PUTN(out + i, 1); i++; continue; }
+            if (r >= 0) {
+                int has = 0, next = end;
+                if (d && r >= 2 && r <= host_rows + 1) has = anim_chunk_has_text(out, i + L, end, &next);
+                if (has) {
+                    int nc = c + d;
+                    if (nc < 1) nc = 1;
+                    if (nc > host_cols) nc = host_cols;
+                    SLIDE_PUTF("\x1b[%d;%dH", r, nc);
+                    dcur = d; vcol = c; pend = nc; crow = r;
+                    i += L; continue;
+                }
+                dcur = 0;
+            }
+            SLIDE_PUTN(out + i, L); i += L; continue;
+        }
+        if (!dcur) { SLIDE_PUTN(out + i, 1); i++; continue; }
+        int adv = 0;
+        unsigned int cp = utf8_decode_cp(out + i, end - i, &adv);
+        if (adv <= 0) { SLIDE_PUTN(out + i, 1); i++; continue; }
+        int w = is_zero_width_cp(cp) ? 0 : (is_wide_cp(cp) ? 2 : 1);
+        int t = vcol + dcur;
+        if (t >= 1 && t + w - 1 <= host_cols) {
+            if (t != pend) { SLIDE_PUTF("\x1b[%d;%dH", crow, t); pend = t; }
+            SLIDE_PUTN(out + i, adv);
+            pend += (w > 0 ? w : 0);
+        }
+        vcol += w;
+        i += adv;
+    }
+    /* 光标段 [end,total)：只把首条 CUP 的列一起平移（否则动画期间光标会停在还没推过来
+     * 的那一截上），?25h / ?7h 之类一律原样追加在末尾 —— 与不做差分的那条约定一致。 */
+    int done = 0;
+    for (int j = end; j < total; ) {
+        int r = -1, c = 1;
+        int L = (out[j] == '\x1b') ? anim_esc(out, j, total, &r, &c) : 0;
+        if (!done && L > 0 && r >= 2 && r <= host_rows + 1) {
+            int nc = c + d;
+            if (nc < 1) nc = 1;
+            if (nc > host_cols) nc = host_cols;
+            if (nc != c) {
+                SLIDE_PUTF("\x1b[%d;%dH", r, nc);
+                j += L; done = 1; continue;
+            }
+        }
+        SLIDE_PUTN(out + j, (L > 0) ? L : 1);
+        j += (L > 0) ? L : 1;
+    }
+    /* 重写只会让正文变短（丢掉屏外的格子），多的只是极少数「重新对齐」用的 CUP；
+     * 光标段原封不动接在后面，两个长度一起回写，framediff 看到的就是这一帧的真身。 */
+    if (n + (total - end) > bs) goto slide_fail;
+    memcpy(out, tmp, (size_t)(n + (total - end)));
+    *endp = n;
+    *posp = n + (total - end);
+    return 1;
+slide_fail:
+    return 0;
+#undef SLIDE_PUTF
+#undef SLIDE_PUTN
+}
+
+/* 帧尾统一起动画：谁变了、该用哪一种曲线，都在这里说定。挂在 render_screen 的帧尾而不是
+ * render_settings_panel 的出口，有两个原因：一是切标签时整帧可能根本没有面板（终端视图），
+ * 二是分屏时面板只由一个窗格画，挂在窗格分支上会被另一支冲掉状态 ⇒ 动画自我重启。 */
+static void anim_on_frame(int host_cols) {
+    int st = settings_anim_state_key();
+    int ti = (g_mux.active_pane >= 0 && g_mux.active_pane < g_mux.pane_count)
+             ? split_tab_of_pane(g_mux.active_pane) : -1;
+    int mode = 0;         /* 0 = 这一帧不起动画 */
+    if (g_anim_ms > 0 && g_anim.state != -2 && (st != g_anim.state || ti != g_anim.tab)) {
+        int wasp = (g_anim.state & 7) != 0, nowp = (st & 7) != 0;
+        int wasf = (g_anim.state & 24) != 0, nowf = (st & 24) != 0;
+        if (ti != g_anim.tab) mode = 1;             /* 切标签：整页横滑 + 一起淡入 */
+        else if (wasp != nowp) mode = 2;             /* 浮层开/关：自上而下逐行点亮 */
+        else if (nowf != wasf) mode = nowf ? 4 : 0;  /* 气泡/toast：出现才淡，消失即时 */
+        else mode = 3;                               /* 换页：整页一起淡 */
+        /* 气泡/toast 消失不动画：它们本来就该即时不见，淡出在终端里只会读成整屏闪一下。 */
+    }
+    if (mode) {
+        g_anim.t0 = GetTickCount64();
+        g_anim.dur = g_anim_ms;
+        g_anim.dist = 0; g_anim.wave = 0; g_anim.only = 0;
+        g_anim.floor_ = 600;
+        if (mode == 1) {
+            int delta = ti - g_anim.tab;
+            g_anim.dist = (delta > 0 ? 1 : -1) * (host_cols * 3 / 5);
+            /* 时长不另开一档：还是 anim 说了算（用户 v2.1.7 定的「约 110ms / 7 帧」）。
+             * 位移与淡入共用同一条缓动曲线 ⇒ 收尾同帧，不会出现「亮到位了还在滑」。 */
+            g_anim.floor_ = 700;                /* 已经有位移，亮度只压一点点，别糊成一片 */
+        } else if (mode == 2) {
+            g_anim.wave = 1; g_anim.floor_ = 200;
+        } else if (mode == 4) {
+            g_anim.only = 1; g_anim.floor_ = 120;
+        }
+    }
+    g_anim.state = st;
+    g_anim.tab = ti;
+}
+
 /* 截断气泡：跟随鼠标的小浮层，最多 3 行、按显示宽度折行。 */
 static void render_settings_tooltip(char *out, int bs, int *posp, int host_rows, int host_cols) {
     if (g_mouse_x < 0 || g_mouse_y < 0) return;
@@ -1390,6 +1718,11 @@ static void render_settings_tooltip(char *out, int bs, int *posp, int host_rows,
     for (int c = 1; c < bw - 1 && pos < bs - 3; c++) { out[pos++]='\xe2'; out[pos++]='\x94'; out[pos++]='\x80'; }
     pos += snprintf(out + pos, bs - pos, "┘\x1b[0m");
     *posp = pos;
+    /* v2.1.8：气泡是「跟着鼠标瞬现」的东西，用户反馈「淡入完全看不出来」——因为原先它
+     * 一帧动画都没有。这里只把它占的行登记给帧尾的动画（不碰它写出的任何字节）：状态键
+     * 里带一位「本帧有没有气泡」，从无到有的那一帧起一段淡入；鼠标在行与行之间扫过去
+     * 不重播（键不变），所以不会一路闪。 */
+    g_anim.tip = 1; g_anim.tip_r0 = top; g_anim.tip_r1 = top + bh - 1;
 }
 
 int settings_theme_row(int idx) { return SETTINGS_THEME_ROW0 + idx; }
@@ -3464,123 +3797,8 @@ static void render_settings_behavior(char *out, int bs, int *posp, int host_rows
     *posp = pos;
 }
 
-/* ==== v2.1.7：设置页的过渡动画（切页 / 浮层出现）================================
- * 终端没有半透明，也没有地方插一帧进去，所以「淡入」只剩一条路：把**这一帧真的写给
- * 终端的那些颜色**整体压暗，再用几帧回到原色。整套做法挂在面板出口一处，排版函数
- * 一个都不用改：
- *   - 只有状态变了才动：状态键 =「当前页 + 哪个浮层开着」，和上一帧比。于是切页、开
- *     浮层会自动起动画，而 hover、滚动、改字（本来就该即时）不会触发；
- *   - 增益按【行】给，而每一行开头都有发射器写的 CUP ⇒ 尾巴里自带行号。同一套代码出
- *     两种曲线：切页 = 所有行同一个增益（整页一起亮）；浮层 = 增益随行号线性推迟
- *     （自上而下逐行点亮，正好是浮层从上面「展开」的方向）；
- *   - 只认 `%03d` 三分量的真彩色（本项目写颜色只有这一种形式，乘完仍不足 256 ⇒ 还是
- *     3 位）⇒ **就地改写，长度一字不变**：不搬字节、不动 pos，行尾对齐、限宽、气泡登记
- *     全都不受影响；也正因为没有新增字面量颜色，主题反查（g_theme_refs）不需要登记；
- *   - 认不出的写法（位数不对、不是 38/48 的）整段放过：最坏是那一处不淡入，不会画花；
- *   - anim = off（或时长已走完）时这段直接不执行 ⇒ 输出和没有这个功能时逐字节相同。
- * 驱动靠 needs_redraw：动画期间主循环把等待降到 8ms（实测约 8ms 就画一帧），亮度按
- * 15ms 取整分片 ⇒ 110ms 实际改变 7 档亮度，同片内的多余帧被帧差吞掉不费流量；走完的
- * 那一帧不再自己点亮，静止时仍是原来的 25ms 轮询（不动画时一帧都不多画）。
- * ------------------------------------------------------------------------- */
-static struct {
-    unsigned long long t0;   /* 本次过渡起点；0 = 当前没在动 */
-    int dur;                /* 本次过渡时长 ms */
-    int wave;               /* 1 = 逐行点亮（浮层）；0 = 整页一起（切页） */
-    int state;              /* 上一帧的状态键，-2 = 从没画过 */
-    int from, to, rows;     /* 本帧面板尾巴在 out 里的区间；to = -1 = 这帧没画面板 */
-} g_anim = { 0, 0, 0, -2, 0, -1, 0 };
-
-/* 状态键：低 4 位是浮层，高位是当前页。双击进详细配置这类「页内改内容」不改变键 ⇒ 不动画。 */
-static int settings_anim_state_key(void) {
-    return (g_settings_show_presets ? 1 : 0)
-         | (g_settings_show_pane_schemes ? 2 : 0)
-         | (g_hex_edit_active ? 4 : 0)
-         | ((g_settings_nav & 0x3f) << 4);
-}
-
-/* 本帧该行的增益（1000 = 原色）。起点不取 0：先黑一下再亮比直接切过去更难看。
- * 「逐行点亮」不是把进度按行平移（那样每行都得在最后 1 帧才到位，收尾会看到一次齐刷刷
- * 的跳变），而是给每行一条自己的时间轴：晚一点的行起点更晚、但和别的行同时收尾。 */
-static int settings_anim_gain(int row, int host_rows, long long el) {
-    if (!g_anim.t0 || g_anim.dur <= 0) return 1000;
-    int lag = 0;
-    long long span = g_anim.dur;
-    if (g_anim.wave && host_rows > 3 && row > 2) {
-        /* 每行一条自己的时间轴：越靠下越晚开始，但每行的淡入长度相同（= 总时长减去
-         * 最大错峰量）⇒ 顶行先到位、底行压着最后一帧到位，看上去是「从上往下亮过去」，
-         * 而不是整页一起提亮后又齐刷刷停住。 */
-        int cap = (g_anim.dur * 45) / 100;
-        lag = (int)(((long long)(row - 2) * cap) / host_rows);
-        if (lag > cap) lag = cap;
-        span = g_anim.dur - cap;
-    }
-    if (span < 30) span = 30;
-    long long e = el - lag;
-    if (e < 0) e = 0;
-    int p = (int)((e * 1000) / span);
-    if (p > 1000) p = 1000;
-    p = p * p * (3000 - 2 * p) / 1000000;         /* smoothstep：两端不突兀 */
-    /* 起点深浅分两种：浮层是从空里长出来的，从 1/4 亮淡上来自然；切页时屏幕上本来就有
-     * 一整页内容，压到 1/4 会读成「闪一下黑屏」，所以只压到 3/5。 */
-    int floor_ = g_anim.wave ? 250 : 600;
-    return floor_ + ((1000 - floor_) * p) / 1000;
-}
-
-/* 把 out[from..to) 里所有真彩色三分量按所在行的增益压暗。见上面注释：只吃 3 位数，
- * 且只在原位置改数字，长度不变。 */
-static void settings_anim_dim(char *out, int from, int to, int host_rows) {
-    if (!g_anim.t0 || g_anim.dur <= 0 || to - from < 16) return;
-    /* 量化到 15ms 一片：动画期间主循环每 8~12ms 就想画一帧，可一片里屏幕上只能有一个
-     * 亮度 —— 按片取整后同片内的多余帧画出的字节与上一帧完全相同，被 framediff 整行吞掉，
-     * 既省流量也让「几帧」是实测值而不是估计值。 */
-    long long el = (long long)(GetTickCount64() - g_anim.t0);
-    if (el < 0) el = 0;
-    el = (el / 15) * 15;
-    int row = 0, crow = -1, cg = 1000;
-    for (int p = from + 2; p + 12 <= to; p++) {
-        if (out[p] == '\x1b') {
-            /* 尾巴里唯一写成 ESC<行>;<列>H 的就是行定位，认出来当行号用 */
-            int i = p + 2, r = 0, n = 0, m = 0;
-            while (i < to && out[i] >= '0' && out[i] <= '9') { r = r * 10 + (out[i] - '0'); n++; i++; }
-            if (n > 0 && i < to && out[i] == ';') {
-                i++;
-                while (i < to && out[i] >= '0' && out[i] <= '9') { m++; i++; }
-                if (m > 0 && i < to && out[i] == 'H') { row = r; p = i; }
-            }
-            continue;
-        }
-        if (out[p] != ';' || out[p + 1] != '2' || out[p + 2] != ';') continue;
-        if (!(out[p - 1] == '8' && (out[p - 2] == '3' || out[p - 2] == '4'))) continue;
-        int v[3], q = p + 3, ok = 1;
-        for (int k = 0; k < 3; k++) {
-            if (q + 3 > to) { ok = 0; break; }
-            int d[3];
-            for (int t = 0; t < 3; t++) {
-                if (out[q + t] < '0' || out[q + t] > '9') { ok = 0; break; }
-                d[t] = out[q + t] - '0';
-            }
-            if (!ok) break;
-            v[k] = d[0] * 100 + d[1] * 10 + d[2];
-            q += 3;
-            if (k < 2) { if (out[q] != ';') { ok = 0; break; } q++; }
-        }
-        if (!ok) continue;
-        if (row != crow) { crow = row; cg = settings_anim_gain(row, host_rows, el); }
-        int first = q - 11;
-        for (int k = 0; k < 3 && cg < 1000; k++) {
-            int nv = (v[k] * cg) / 1000;
-            char *w = out + first + k * 4;
-            w[0] = (char)('0' + nv / 100);
-            w[1] = (char)('0' + (nv / 10) % 10);
-            w[2] = (char)('0' + nv % 10);
-        }
-        p = q - 1;
-    }
-}
-
 void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host_cols) {
     int pos = *posp;
-    int anim_from = pos;   /* v2.1.7：本帧这条尾巴的起点，出口处按增益压暗 */
     settings_tip_reset();          /* v2.1.0：截断行登记表每帧重建 */
     g_sl_canvas_w = 0;             /* v2.1.6：本帧右栏画布宽从零起算 */
     g_sl_host_rows = host_rows;    /* v2.1.3：给 settings_line_begin 的逐行限宽用 */
@@ -3880,23 +4098,8 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
         render_hex_edit_popup(out, bs, &pos, host_rows, host_cols);
     render_settings_tooltip(out, bs, &pos, host_rows, host_cols);
 
-    /* v2.1.7：起一段过渡（若状态真的变了）。缩放不在这里做 —— 颜色还要经 theme_remap
-     * 覆盖成主题色，压暗必须在那之后，否则淡入的起点是「默认色 × 25%」而不是
-     * 「主题色 × 25%」，改过 [theme] 的人会看到过渡期间颜色偏一下。区间交给
-     * render_screen 在 remap 之后处理。 */
-    int st = settings_anim_state_key();
-    if (g_anim_ms > 0 && st != g_anim.state) {
-        int was_pop = (g_anim.state & 7) != 0;
-        int now_pop = (st & 7) != 0;
-        g_anim.t0 = GetTickCount64();
-        g_anim.dur = g_anim_ms;
-        g_anim.wave = (was_pop != now_pop) ? 1 : 0;
-    }
-    g_anim.state = st;
-    g_anim.from = anim_from;
-    g_anim.to = pos;
-    g_anim.rows = host_rows;
-
+    /* v2.1.8：过渡动画的触发点从「面板出口」上移到 render_screen 的帧尾 —— 切标签时
+     * 整帧可能根本没有面板，而且分屏时面板只由一个窗格画。见 anim_on_frame。 */
     *posp = pos;
 }
 
@@ -5723,12 +5926,13 @@ void render_screen(void) {
      * render_dump.log 的帧序错开。帧缓冲同样在帧首清空，避免提前 return 时
      * 把上一帧的残留明细带到下一帧。 */
     cell_diag_frame++;
-    g_anim.to = -1;               /* v2.1.7：本帧是否画了设置页，由 render_settings_panel 立起来 */
+    g_anim.tip = 0; g_anim.toast = 0;   /* v2.1.8：本帧画没画气泡 / toast，由各自绘制处登记 */
     if (g_anim.t0 && (long long)(GetTickCount64() - g_anim.t0) >= g_anim.dur) {
         /* v2.1.7：「动画走完了」必须在帧首判、而不是只在帧尾判 —— 本函数下面还有几条
          * 提前 return（host 尺寸非法、help_mode），万一收尾那一帧正好被跳过，屏幕上就
          * 会留下一层压暗的颜色再也没人恢复。这里清掉 t0 并再点一帧，那一帧自然按原色画。 */
         g_anim.t0 = 0;
+        g_anim.dist = 0;          /* 位移也要一起归零：收尾那一帧必须是原色 + 原位 */
         g_mux.needs_redraw = 1;
     }
     g_cd_len = 0;
@@ -6103,6 +6307,8 @@ void render_screen(void) {
         pos += snprintf(out + pos, bs - pos,
                         "\x1b[%d;%dH\x1b[048;2;033;038;045m\x1b[038;2;210;153;034;1m  %s  \x1b[0m",
                         trow, tcol, g_toast_msg);
+        /* v2.1.8：toast 与气泡同款处理 —— 出现那一帧淡入，消失仍是即时（只登记行号） */
+        g_anim.toast = 1; g_anim.toast_r = trow;
     } else if (g_toast_until) {
         g_toast_until = 0;
         g_toast_msg[0] = 0;
@@ -6380,18 +6586,21 @@ void render_screen(void) {
 
     theme_remap(out, pos);
 
-    if (g_anim.to >= 0) {
-        /* v2.1.7：缩放只能放在帧尾 —— theme_remap 之后（见 render_settings_panel 内的
-         * 注释：否则淡入的起点是「默认色 × 25%」而不是「主题色 × 25%」）；而
-         * needs_redraw 要在这里重新点一次，因为 render_screen 末尾会把它清掉。 */
-        settings_anim_dim(out, g_anim.from, g_anim.to, g_anim.rows);
+    /* v2.1.8：位移与淡入都只能放在帧尾 —— theme_remap 之后（否则淡入的起点是「默认色
+     * 混出来的底色」而不是「主题色」，改过 [theme] 的人会看到过渡期间颜色偏一下）；而
+     * needs_redraw 要在这里重新点一次，因为 render_screen 末尾会把它清掉。
+     * 两处都必须作用在交给 framediff 的那份 out 上：只改发出去的增量、不改逻辑帧，
+     * 差分基准就会和屏幕实际状态不一致，动画一收尾就留下残影。 */
+    anim_on_frame(g_mux.host_cols);
+    if (g_anim.t0 && g_anim.dur > 0) {
+        long long el = (long long)(GetTickCount64() - g_anim.t0);
+        if (el < 0) el = 0;
+        el = (el / 15) * 15;          /* 量化到 15ms 一片：亮度与位移同片，不会错位 */
+        int slided = anim_shift(g_mux.host_cols, el);
+        if (slided)
+            anim_slide_rewrite(out, bs, &pos, &cursor_pos, g_mux.host_rows, g_mux.host_cols, slided);
+        anim_fade(out, cursor_pos, g_mux.host_rows, el);
         if (g_anim.t0) g_mux.needs_redraw = 1;   /* 还在动 ⇒ 下一帧继续 */
-        g_anim.to = -1;
-    } else {
-        /* 这一帧整个屏幕里根本没有面板（面板关着）⇒ 状态清空，下次进来重新起一段过渡。
-         * 必须放在这种「整帧级」的位置而不是某个窗格的 else 分支里：分屏时另一个窗格的
-         * 分支会把 state 冲掉，下一帧又被当成「状态变了」⇒ 动画永远走不完（自我重启）。 */
-        g_anim.state = -1;
     }
 
     /* 脏区输出：整帧按 CUP 切成逐行字节，只发与上一帧不同的行。

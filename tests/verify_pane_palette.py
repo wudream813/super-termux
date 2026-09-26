@@ -1566,6 +1566,51 @@ int main(int argc, char **argv) {
                 per[r] = hits
         return per, len(bon)
 
+    def rA_frames25(data):
+        """按「帧尾光标段」切帧：?25h / ?25l 每帧必发且只发一次，静止帧一字节都不发。"""
+        return [f for f in re.split(rb"(?=\x1b\[\?25[hl])", data) if f]
+
+    def rA_pad(lines, cols):
+        return [l.ljust(cols)[:cols] for l in lines]
+
+    def rA_shift_d(a, rest, cols, lo=1):
+        """a 这一屏相对 rest 是横移几列（+右进 / −左进 / 0 就是同一屏 / None 不匹配公式）。"""
+        a = rA_pad(a, cols); rest = rA_pad(rest, cols)
+        if len(a) != len(rest) or not a:
+            return None
+        n = len(a) - lo
+        if n <= 0:
+            return 0
+        if a == rest:
+            return 0
+        best = (0, None)
+        for d in range(1, min(cols, 96) + 1):
+            rig = sum(1 for i in range(lo, lo + n) if a[i] == " " * d + rest[i][:cols - d])
+            if rig > best[0]:
+                best = (rig, d)
+            lef = sum(1 for i in range(lo, lo + n) if a[i] == rest[i][d:].ljust(cols))
+            if lef > best[0]:
+                best = (lef, -d)
+        return best[1] if best[0] >= 4 else None
+
+    rA_screens = {}
+    def rA_screen_at(rows, cols, tag, frames, k):
+        key = (tag, k)
+        if key not in rA_screens:
+            rA_screens[key] = vt_text(rows, cols, b"".join(frames[:k])) or []
+        return rA_screens[key]
+
+    def rA_slide_scan(tag, data, rows, cols, want):
+        """在最后 12 帧里找一个「整页横移 want 方向」的动画帧，返回 (帧号, 列数) 或 None。"""
+        fr = rA_frames25(data)
+        rest = rA_screen_at(rows, cols, tag + "rest", fr, len(fr))
+        got = None
+        for k in range(max(1, len(fr) - 12), len(fr)):
+            d = rA_shift_d(rA_screen_at(rows, cols, tag, fr, k), rest, cols)
+            if d is not None and (d > 0) == (want > 0) and abs(d) >= 2:
+                got = (k, d)
+        return got, len(fr), rest
+
     def rini(anim):
         return "[general]" + chr(10) + "anim = " + anim + chr(10)
 
@@ -1584,7 +1629,7 @@ int main(int argc, char **argv) {
     ck("R1 anim=off：整个过程没有一帧写过 normal 里不存在的颜色，也只画了 %d 帧（不多花一帧）" % n_boff,
        not d_off and n_boff <= 10,
        "off 多出的压暗行=%r 帧数=%d" % ({r: v for r, v in d_off.items()}, n_boff))
-    ck("R2 anim=normal（110ms）：切页时确有行被逐帧压暗，最多 %d 档（4~12 档，够看出渐变又不到 1/8 秒）" % lv(d_nrm),
+    ck("R2 anim=normal（110ms）：切页/切标签确有行在一档一档地亮起来，最多 %d 档（4~12 档，够看出渐变又不到 1/8 秒）" % lv(d_nrm),
        4 <= lv(d_nrm) <= 12 and len(d_nrm) >= 8,
        "档数=%d 参与行=%d" % (lv(d_nrm), len(d_nrm)))
     # 「整页一起淡」的准确说法：所有行都是在【同一帧】回到原色的（没有谁排队在后面），
@@ -1663,6 +1708,268 @@ int main(int argc, char **argv) {
            and vt_sig(24, 100, p_off) == vt_sig(24, 100, p_nrm),
            "签名差异行=%r" % (next((i for i, a in enumerate(vt_sig(24, 100, p_off) or [])
                                     if a != (vt_sig(24, 100, p_nrm) or [])[i]), -1),))
+
+
+    # ============ R 组续（v2.1.8）：切标签左右滑入 / 气泡与 toast 淡入 / 向底色混合 ============
+    # 滑动的量法不重新实现 C 里的位移，而是拿「整屏文本」套一条闭式：
+    #   从右进（d>0）：第 r 行 = d 个空格 + 静止那一屏第 r 行的前 cols-d 列
+    #   从左进（d<0）：第 r 行 = 静止那一屏第 r 行去掉前 |d| 列，右边补 |d| 个空格
+    # 之所以成立：铺底/清行那一类 chunk（只有空格）故意不位移 ⇒ 页面没推进来的那一截必然是
+    # 干净的底色空格。于是「存在这样一帧」=「整页确实横移过」，方向 = 两套公式谁唯一匹配，
+    # 全是终端语义层面的事实，不看 C 的实现细节。
+    rA_cup_r = re.compile(rb"\x1b\[(\d+);(\d+)H")
+    rA_tri_any = re.compile(rb"[34]8;2;(\d{1,3});(\d{1,3});(\d{1,3})")
+
+    def rA_frames25(data):
+        """按「帧尾光标段」切帧：?25h / ?25l 每帧必发且只发一次，静止帧一字节都不发。"""
+        return [f for f in re.split(rb"(?=\x1b\[\?25[hl])", data) if f]
+
+    def rA_rowscan(block):
+        """{行: set(三分量)}：这一帧每条行定位之后写过的所有真彩色（1~3 位都认）。"""
+        got = {}
+        for m in rA_cup_r.finditer(block):
+            nxt = rA_cup_r.search(block, m.end())
+            seg = block[m.end(): nxt.start() if nxt else len(block)]
+            st = got.setdefault(int(m.group(1)), set())
+            st |= {(int(a), int(b), int(c)) for a, b, c in rA_tri_any.findall(seg)}
+        return got
+
+    def rA_pad(lines, cols):
+        return [l.ljust(cols)[:cols] for l in lines]
+
+    def rA_shift_d(a, rest, cols, lo=1):
+        """a 相对 rest 横移了几列（+右进 / −左进 / 0 同一屏 / None 不匹配公式）。
+        只接受「唯一最大值」：整屏空白那些行对任何 d 都成立，靠正文行把真的那个 d 顶出来。"""
+        a = rA_pad(a, cols); rest = rA_pad(rest, cols)
+        if len(a) != len(rest) or not a or a == rest:
+            return None
+        idx = range(lo, len(a))
+        score = []
+        for d in range(1, min(cols, 96) + 1):
+            score.append((sum(1 for i in idx if a[i] == " " * d + rest[i][:cols - d]), d))
+            score.append((sum(1 for i in idx if a[i] == rest[i][d:].ljust(cols)), -d))
+        score.sort(reverse=True)
+        if not score or score[0][0] < 4:
+            return None
+        if len(score) > 1 and score[1][0] == score[0][0]:
+            return None
+        return score[0][1]
+
+    rA_screens = {}
+
+    def rA_screen_at(rows, cols, tag, frames, k):
+        key = (tag, k)
+        if key not in rA_screens:
+            rA_screens[key] = vt_text(rows, cols, b"".join(frames[:k])) or []
+        return rA_screens[key]
+
+    def rA_slide_scan(tag, data, rows, cols, want):
+        """在最后 14 帧里找「整页向 want 方向横移」的动画帧 ⇒ (首帧, 末帧, 帧数, 静止屏, 各帧结果)。
+        首帧位移最大，判「裁掉了多少」比末帧好看得多。"""
+        fr = rA_frames25(data)
+        rest = rA_screen_at(rows, cols, tag + "rest", fr, len(fr))
+        first, last, ds = None, None, []
+        for k in range(max(1, len(fr) - 14), len(fr)):
+            d = rA_shift_d(rA_screen_at(rows, cols, tag, fr, k), rest, cols)
+            ds.append(d)
+            if d is not None and (d > 0) == (want > 0) and abs(d) >= 2:
+                if first is None:
+                    first = (k, d)
+                last = (k, d)
+        return first, last, len(fr), rest, ds
+
+    ROWS_C, COLS_C = 24, 100
+    SHELL_TXT = b"seq 1 14\r"              # 让 shell 那一屏有正文，位移公式才有唯一解
+    t_next = capture_page_keys(ROWS_C, COLS_C, [b"\x02s"], ini=rini("normal"))
+    t_next_off = capture_page_keys(ROWS_C, COLS_C, [b"\x02s"], ini=rini("off"))
+    t_prev = capture_page_keys(ROWS_C, COLS_C, [SHELL_TXT, b"\x02s", b"\x02p"], ini=rini("normal"))
+    g_next, g_next_last, n_next, rest_next, ds_n = rA_slide_scan("gn", t_next, ROWS_C, COLS_C, +1)
+    g_prev, g_prev_last, n_prev, rest_prev, ds_p = rA_slide_scan("gp", t_prev, ROWS_C, COLS_C, -1)
+    g_no = rA_slide_scan("gno", t_next_off, ROWS_C, COLS_C, +1)[0]
+    ck("R8 切到下一个标签 = 整页横向滑入（首帧 %s 起整页右移 %+d 列，一路滑到 %+d 列），关动画时一帧都没有"
+       % (g_next[0] if g_next else None, g_next[1] if g_next else 0, g_next_last[1] if g_next_last else 0),
+       g_next is not None and g_no is None, "off 也匹配到位移=%r normal 各帧=%r" % (g_no, ds_n))
+    ck("R8b 切回上一个标签方向是反的（首帧 %s 整页左移 %d 列）—— 不是所有切换都从右边推"
+       % (g_prev[0] if g_prev else None, g_prev[1] if g_prev else 0),
+       g_prev is not None, "各帧位移=%r 静止屏非空行=%d"
+       % (ds_p, sum(1 for l in rA_pad(rest_prev, COLS_C) if l.strip())))
+
+    ck("R9 滑动收尾后不留残影：静止屏与 anim=off 同文同色（含标签栏那行）",
+       vt_text(ROWS_C, COLS_C, t_next) == vt_text(ROWS_C, COLS_C, t_next_off)
+       and vt_sig(ROWS_C, COLS_C, t_next) == vt_sig(ROWS_C, COLS_C, t_next_off),
+       "首个差异=%r" % (next((i for i, a in enumerate(vt_text(ROWS_C, COLS_C, t_next) or [])
+                              if a != (vt_text(ROWS_C, COLS_C, t_next_off) or [])[i]), -1),))
+    fr_next = rA_frames25(t_next)
+    wide = [(k, c) for k in range(len(fr_next))
+            for _, c in re.findall(rb"\x1b\[(\d+);(\d+)H", fr_next[k]) if int(c) > COLS_C]
+    ck("R10 动画期间每条 CUP 的列号都在屏内（%d 帧里没有一个越界列 ⇒ 不会折行溢出到下一行）"
+       % len(fr_next), not wide, "越界=%r" % wide[:4])
+
+    # 标签栏那一行不参与位移。量法：把每条行的可见字节（抹掉所有 CSI 之后）比一比 ——
+    # 正文被裁短（右移 d 列 ⇒ 尾巴掉 d 列），标签栏一格不少。
+    rA_csi = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
+
+    def rA_vis_bytes(block, row):
+        """某一行写过的「可见字节」数：按 CUP 切开，把属于该行的片段拼起来再抹掉所有 CSI。"""
+        pieces, cur, pos = [], None, 0
+        while pos < len(block):
+            mm = rA_cup_r.search(block, pos)
+            if not mm:
+                if cur == row:
+                    pieces.append(block[pos:])
+                break
+            if cur == row:
+                pieces.append(block[pos:mm.start()])
+            cur = int(mm.group(1))
+            pos = mm.end()
+        return len(rA_csi.sub(b"", rA_cup_r.sub(b"", b"".join(pieces))))
+    k_slide = (g_next or (max(1, len(fr_next) - 4), 0))[0]
+    k_rest = max((i for i, f in enumerate(fr_next) if b"\x1b[1;1H" in f), default=len(fr_next) - 1)
+    v1a, v1r = rA_vis_bytes(fr_next[k_slide], 1), rA_vis_bytes(fr_next[k_rest], 1)
+    v2a, v2r = rA_vis_bytes(fr_next[k_slide], 2), rA_vis_bytes(fr_next[k_rest], 2)
+    ck("R10b 标签栏只跟着亮、不跟着滑：位移最大那帧（帧 %s，%+d 列）标签栏可见字节 %d 与静止帧 %d "
+       "一样多，而正文第 2 行从 %d 被裁到 %d" % (k_slide, (g_next or (0, 0))[1], v1a, v1r, v2r, v2a),
+       v1a == v1r and v1r > 0 and 0 < v2a < v2r,
+       "标签栏=%r/%r 第2行=%r/%r" % (v1a, v1r, v2a, v2r))
+
+    # ---- 气泡 / toast 的淡入：从「它出现的那一帧」起算，不靠固定窗口（帧数随时长抖） ----
+    BOX_TOP, BOX_BOT = "┌".encode(), "└".encode()
+    BG0 = (13, 17, 23)
+
+    def rA_float_fade(data_off, data_on, mark, box=False, lo=2, hi=26):
+        """(气泡/toast 出现的帧号, {行: 淡入帧数}, 允许的帧集合, 淡入期间出现过的颜色)。"""
+        bon, boff = rA_frames25(data_on), rA_frames25(data_off)
+        k0 = next((i for i, f in enumerate(bon) if mark in f), None)
+        if k0 is None:
+            return None, {}, set(), set()
+        rows0 = set()
+        if box:
+            seg = bon[k0]
+            for sym, nm in ((BOX_TOP, "top"), (BOX_BOT, "bot")):
+                mm = re.search(rb"\x1b\[(\d+);\d+H(?:(?!\x1b\[\d+;\d+H).)*?" + re.escape(sym), seg, re.S)
+                if mm:
+                    rows0.add(int(mm.group(1)))
+            if len(rows0) == 2:
+                rows0 = set(range(min(rows0), max(rows0) + 1))
+        if not rows0:
+            rows0 = {int(a) for a, c in rA_cup_r.findall(bon[k0])}
+        true = {}
+        for blk in boff:
+            for r, ts in rA_rowscan(blk).items():
+                true.setdefault(r, set()).update(ts)
+        dim, seen = {}, set()
+        for i in range(k0, len(bon)):
+            for r, ts in rA_rowscan(bon[i]).items():
+                if not (lo <= r <= hi):
+                    continue
+                ex = ts - true.get(r, set())
+                if ex:
+                    dim.setdefault(r, set()).add(i)
+                    seen |= ex
+        return k0, {r: sorted(v) for r, v in dim.items()}, rows0, seen
+
+    def rA_tail_chunks(data, mark):
+        """mark 出现之后还发了几帧（= 有没有为它多画动画）。"""
+        fr = rA_frames25(data)
+        k0 = next((i for i, f in enumerate(fr) if mark in f), None)
+        return None if k0 is None else len(fr) - k0
+
+    tip_ini_off, tip_ini_nrm = nini5 + rini("off"), nini5 + rini("normal")
+    tip_base_scr = vt_text(ROWS_C, COLS_C, capture_page_keys(ROWS_C, COLS_C, [b"\x02s", b"m"],
+                                                             ini=tip_ini_nrm)) or []
+    tip_mv = tip_move(tip_base_scr, "一个非...")
+    T_ON = [b"\x02s", b"m", tip_mv]
+    tip_off = capture_page_keys(ROWS_C, COLS_C, T_ON, ini=tip_ini_off)
+    tip_nrm = capture_page_keys(ROWS_C, COLS_C, T_ON, ini=tip_ini_nrm)
+    k_tip, d_tip, rows_tip, seen_tip = rA_float_fade(tip_off, tip_nrm, BOX_TOP, box=True)
+    ck("R12 悬停气泡出现那一帧起确有淡入：只淡气泡占的第 %s~%s 行，最多 %d 帧在渐变（首帧 %s）"
+       % (min(rows_tip) if rows_tip else "—", max(rows_tip) if rows_tip else "—",
+          max((len(v) for v in d_tip.values()), default=0), k_tip),
+       bool(tip_mv) and k_tip is not None and len(rows_tip) >= 2 and bool(d_tip)
+       and set(d_tip) <= rows_tip and max(len(v) for v in d_tip.values()) >= 3,
+       "气泡行=%r 被淡行=%r 悬停序列=%r" % (sorted(rows_tip), d_tip, tip_mv))
+    n_t_off, n_t_nrm = rA_tail_chunks(tip_off, BOX_TOP), rA_tail_chunks(tip_nrm, BOX_TOP)
+    ck("R12b anim=off 时气泡一帧都不多画（气泡出现后 off=%s 帧、normal=%s 帧）" % (n_t_off, n_t_nrm),
+       n_t_off is not None and n_t_nrm is not None and n_t_off <= 2 and n_t_nrm - n_t_off >= 2,
+       "off=%s normal=%s" % (n_t_off, n_t_nrm))
+    # 淡入是「向页面底色混合」而不是「向黑压暗」：淡到最狠那一帧应该贴到 (13,17,23) 上。
+    near = [t for t in seen_tip if all(abs(t[i] - BG0[i]) <= 2 for i in range(3))]
+    ck("R11 混合基准是页面底色：淡入期间写出过 %r 这类「贴着底色」的颜色（向黑压暗会掉到 "
+       "0~8，永远到不了 13/17/23）" % (sorted(near)[:2],),
+       bool(near), "淡入期间的非原色=%r" % sorted(seen_tip)[:8])
+
+    # 气泡已在、指针从甲行挪到乙行（两行都被截断）：全文跟着换，但不许再来一段动画。
+    # 两个长名字必须放在第 2、3 项：第 1 项的名字也会出现在标签栏那一行，tip_move 会先
+    # 命中标签栏 —— 那就变成「气泡从无到有」，测不到「搬行不许重播」。
+    nini_two = ("[menu]\n1 = sh, /bin/sh\n2 = %s, /bin/bash\n3 = %s, /bin/sh\n"
+                "4 = four, /bin/sh\n5 = five, /bin/sh\n" % ("乙" * 24, "丙" * 24))
+    tb2 = vt_text(ROWS_C, COLS_C, capture_page_keys(ROWS_C, COLS_C, [b"\x02s", b"m"],
+                                                     ini=nini_two + rini("normal"))) or []
+    mv_a = tip_move(tb2, "乙乙")
+    mv_b = tip_move(tb2, "丙丙")
+    sw_on = [b"\x02s", b"m", mv_a, mv_b]
+    sw_off = capture_page_keys(ROWS_C, COLS_C, sw_on, ini=nini_two + rini("off"))
+    sw_nrm = capture_page_keys(ROWS_C, COLS_C, sw_on, ini=nini_two + rini("normal"))
+    fr_sw = rA_frames25(sw_nrm)
+    box_fr = [i for i, f in enumerate(fr_sw) if BOX_TOP in f]
+    # 气泡里的名字最多画 20 字（框宽所限），所以判「一长串同一个字」在不在屏上，不判整串
+    k_b = next((i for i, f in enumerate(fr_sw) if ("丙" * 12).encode() in f), None)
+    k_sw, d_sw_all, _, _ = rA_float_fade(sw_off, sw_nrm, BOX_TOP, box=True)
+    d_sw = {}
+    if box_fr and k_b is not None and k_b > box_fr[0]:
+        # 只问「丙那串第一次出现之后」还发没发暗帧：发了就是搬行被当成了新一次出现
+        d_sw = {r: [k for k in v if k >= k_b] for r, v in d_sw_all.items()}
+        d_sw = {r: v for r, v in d_sw.items() if v}
+    sn_sw = "\n".join(vt_text(ROWS_C, COLS_C, sw_nrm) or [])
+    ck("R12c 气泡从乙行挪到丙行：全文跟着换（屏上只剩丙那串），但不重播淡入",
+       bool(mv_a) and bool(mv_b) and mv_a != mv_b and bool(box_fr) and k_b is not None
+       and k_b > box_fr[0] and ("丙" * 12) in sn_sw and ("乙" * 12) not in sn_sw
+       # 前半：第一次出现必须真淡（不淡的判据在 v2.1.7 上也会绿，等于没测）；后半：搬行不许再淡
+       and bool(d_sw_all) and not d_sw,
+       "气泡帧=%s..%s 首次淡入=%r 丙文首帧=%s 搬行后又淡的=%r" %
+       (box_fr[0] if box_fr else None, box_fr[-1] if box_fr else None,
+        {r: len(v) for r, v in d_sw_all.items()}, k_b, d_sw))
+
+    T_TOAST = [b"\x02s", b"\x02-"]          # 设置页里按 Ctrl+B - ⇒「设置 / 帮助页面不能分屏」
+    TO_MARK = "不能分屏".encode()
+    to_off = capture_page_keys(ROWS_C, COLS_C, T_TOAST, ini=rini("off"))
+    to_nrm = capture_page_keys(ROWS_C, COLS_C, T_TOAST, ini=rini("normal"))
+    k_to, d_to, rows_to, seen_to = rA_float_fade(to_off, to_nrm, TO_MARK)
+    to_scr = vt_text(ROWS_C, COLS_C, to_nrm) or []
+    to_row = next((i + 1 for i, l in enumerate(to_scr) if "不能分屏" in l), -1)
+    ck("R13 底部 toast 出现也有淡入：只淡 toast 自己那一行（屏幕第 %d 行），其余 %d 行一格不动"
+       % (to_row, ROWS_C - (1 if to_row in d_to else 0)),
+       k_to is not None and to_row > 0 and set(d_to) == {to_row}
+       and max((len(v) for v in d_to.values()), default=0) >= 3,
+       "toast 行=%d 被淡行=%r 档=%r" % (to_row, d_to, max((len(v) for v in d_to.values()), default=0)))
+    ck("R13b toast 的静止屏与 anim=off 同文同色（淡完不留一丝痕迹，行宽也没被碰）",
+       vt_text(ROWS_C, COLS_C, to_off) == vt_text(ROWS_C, COLS_C, to_nrm)
+       and vt_sig(ROWS_C, COLS_C, to_off) == vt_sig(ROWS_C, COLS_C, to_nrm)
+       and all(dispw(l) <= COLS_C for l in (vt_text(ROWS_C, COLS_C, to_nrm) or [])),
+       "首个差异=%r" % (next((i for i, a in enumerate(vt_text(ROWS_C, COLS_C, to_off) or [])
+                              if a != (vt_text(ROWS_C, COLS_C, to_nrm) or [])[i]), -1),))
+
+    # 窄屏：横滑期间的裁剪必须仍守得住屏宽（右侧被裁掉是设计，越界折行不是）
+    for rows, cols in ((24, 40), (12, 100)):
+        nrow = capture_page_keys(rows, cols, [b"\x02s"], ini=rini("normal"))
+        f2 = rA_frames25(nrow)
+        ov = [c for fr in f2 for _, c in re.findall(rb"\x1b\[(\d+);(\d+)H", fr) if int(c) > cols]
+        ln = vt_text(rows, cols, nrow) or []
+        ck("R14 %d×%d 档：切标签的动画帧里没有任何一列越过屏宽，静止屏 %d 行齐" % (rows, cols, len(ln)),
+           not ov and len(ln) == rows and all(dispw(l) <= cols for l in ln),
+           "越界列=%r 行数=%d" % (ov[:4], len(ln)))
+
+    # 连点 30 下切标签（上一段动画没走完就再来一段）：不许吞键、不许留暗色
+    burst = b"".join(b"\x02s\x02p" for _ in range(15))
+    b_off = capture_page_keys(ROWS_C, COLS_C, [b"\x02n", burst], ini=rini("off"))
+    b_nrm = capture_page_keys(ROWS_C, COLS_C, [b"\x02n", burst], ini=rini("normal"))
+    bo, bn = vt_text(ROWS_C, COLS_C, b_off) or [], vt_text(ROWS_C, COLS_C, b_nrm) or []
+    ck("R15 一口气 30 次切标签（动画没走完就再切）：静止屏与 off 逐格同文同色、%d 行齐、无超宽行"
+       % ROWS_C,
+       bo == bn and len(bn) == ROWS_C and all(dispw(l) <= COLS_C for l in bn)
+       and vt_sig(ROWS_C, COLS_C, b_off) == vt_sig(ROWS_C, COLS_C, b_nrm),
+       "行数=%d 首个差异=%r" % (len(bn), next((i for i in range(min(len(bo), len(bn)))
+                                               if bo[i] != bn[i]), -1)))
 
     print()
     print()
