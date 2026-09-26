@@ -1650,15 +1650,24 @@ int main(int argc, char **argv) {
     o_nrm = capture_page_keys(24, 100, ONE, ini=rini("normal"))
     o_slow = capture_page_keys(24, 100, ONE, ini=rini("200"))
 
-    def lv_one(data):
-        d, _n = rA_dim(o_off, data, win=64)
-        return max((len(v) for v in d.values()), default=0)
+    def r3_measure(data):
+        """(这一行压色压了几帧, 整场帧数)。前者看颜色、后者只看渲染了几帧。"""
+        d, n = rA_dim(o_off, data, win=64)
+        return max((len(v) for v in d.values()), default=0), n
 
-    L_s, L_n, L_w = lv_one(o_short), lv_one(o_nrm), lv_one(o_slow)
-    ck("R3 时长真按 ini 走：单次翻页 + 整场窗口数「压色帧数」，short(60) < normal(110) < 200ms "
-       "且两端至少差 2 帧",
-       L_s < L_n < L_w and L_w - L_s >= 2,
-       "short=%d normal=%d 200=%d（off 静止屏 %d 帧）" % (L_s, L_n, L_w, len(o_off.split(b"\x1b[?7l"))))
+    L_s, N_s = r3_measure(o_short)
+    L_n, N_n = r3_measure(o_nrm)
+    L_w, N_w = r3_measure(o_slow)
+    _, N_0 = r3_measure(o_off)
+    # 为什么两条量法并用：CI 的 macOS runner 实测压色帧数是 4 / 7 / 6 —— 200ms 那一档反而比
+    # 110ms 少，因为时长越长，越多的收尾帧「已经淡到与真色四舍五入相同」，在颜色口径下就不
+    # 计入了（本机是 4 / 7 / 13，机器采得开才看得出单调）。颜色口径只用来判采得准的那一环
+    # （60 vs 110，两台机器都是 4 < 7），200 这一环改用【整场帧数】：动画在多久之内一直在请求
+    # 重绘，与颜色量化无关 ⇒ 2 < 6 < 9 ≤ 15（macOS 同形）。两头都写进判据名，不藏着。
+    ck("R3 时长真按 ini 走：压色帧数 short(60) < normal(110)，整场帧数 off < short < normal ≤ 200ms",
+       1 < L_s < L_n and N_0 < N_s < N_n <= N_w,
+       "压色帧数 short=%d normal=%d 200=%d ｜ 整场帧数 off=%d short=%d normal=%d 200=%d"
+       % (L_s, L_n, L_w, N_0, N_s, N_n, N_w))
     ck("R3b 认不出的单词不静默关掉动画（typo → 按默认 110ms 走）",
        4 <= lv(d_junk) <= 12 and abs(lv(d_junk) - lv(d_nrm)) <= 3,
        "typo=%d 档，normal=%d 档" % (lv(d_junk), lv(d_nrm)))
