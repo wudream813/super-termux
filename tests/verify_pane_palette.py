@@ -1971,6 +1971,19 @@ int main(int argc, char **argv) {
        "行数=%d 首个差异=%r" % (len(bn), next((i for i in range(min(len(bo), len(bn)))
                                                if bo[i] != bn[i]), -1)))
 
+    # 位移重写是「先搬进另一个缓冲、再把两段长度回写」：长度与内容一旦不吻合，缓冲尾巴上
+    # 从没写过的字节就会被当成光标段直接发给终端（表现为 NUL / 控制字节，画面看着还“正常”，
+    # 因为终端把 NUL 吞了）。静止帧与动画帧一起数，四段捕获都不许有。
+    def rA_nul(data):
+        return [i for i, f in enumerate(rA_frames25(data)) if b"\x00" in f]
+    nul = {}
+    for nm, dat in (("切标签→", t_next), ("切标签←", t_prev), ("气泡", tip_nrm), ("toast", to_nrm)):
+        bad = rA_nul(dat)
+        if bad:
+            nul[nm] = bad[:3]
+    ck("R16 动画帧的字节流里没有 NUL（动画改写过长度 ⇒ 尾巴必须是自己写过的字节）",
+       not nul, "%r" % (nul,))
+
     print()
     print()
     if FAILS:

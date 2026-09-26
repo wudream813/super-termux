@@ -1508,24 +1508,18 @@ static char *g_slide_buf;
 static int g_slide_cap;
 
 /* 重写整段正文要往另一个缓冲里搬字节：每一处写入都先验长度，装不下就整段放弃（这一帧
- * 只剩淡入、没有位移），绝不在缓冲区里越界。 */
+ * 只剩淡入、没有位移），绝不在缓冲区里越界。用 return 而不是 goto：goto 跨过带初始化的
+ * 声明在 C 里合法，在 CI 的「源码也要被 C++ 编译器接受」那一关（g++ -x c++）会判死。 */
 #define SLIDE_PUTF(...) do { int _w = snprintf(tmp + n, need - n, __VA_ARGS__);          \
-                             if (_w < 0 || _w >= need - n) { goto slide_fail; } else { n += _w; } } while (0)
-#define SLIDE_PUTN(src, k) do { if ((k) > 0) { if (n + (k) > need) { goto slide_fail; }   \
+                             if (_w < 0 || _w >= need - n) { return -1; } else { n += _w; } } while (0)
+#define SLIDE_PUTN(src, k) do { if ((k) > 0) { if (n + (k) > need) { return -1; }         \
                                 else { memcpy(tmp + n, (src), (size_t)(k)); n += (k); } } } while (0)
 
-/* 按位移 d 重写 out[0..*endp)（正文）并搬走光标段；成功后把两个长度写回去。
- * 失败（缓冲不够 / 没内存在）时原样返回 0，这一帧就是「只有淡入、没有位移」，
- * 下一帧还会再试 ⇒ 最坏是某一次切标签少了滑动，绝不会画错。 */
-static int anim_slide_rewrite(char *out, int bs, int *posp, int *endp, int host_rows, int host_cols, int d) {
-    int end = *endp, total = *posp;
-    int need = total + (total >> 2) + 4096;
-    if (need > g_slide_cap) {
-        char *nb = (char *)realloc(g_slide_buf, (size_t)need);
-        if (!nb) return 0;
-        g_slide_buf = nb; g_slide_cap = need;
-    }
-    char *tmp = g_slide_buf;
+/* 把 out[0..total) 按位移 d 重放到 tmp：正文 [0..end) 逐行改列号 + 丢掉落屏外的格子，
+ * 光标段 [end..total) 只把首条行定位的列一起平移、其余原样接在后面。*bodyp 回填「正文
+ * 占到第几个字节」—— 调用方要靠它把两段分开，不能拿总长当正文长度。 */
+static int anim_slide_fill(char *out, int end, int total, int host_rows, int host_cols,
+                           int d, char *tmp, int need, int *bodyp) {
     int i = 0, n = 0, dcur = 0, vcol = 1, pend = 1, crow = 1;
     while (i < end) {
         if (out[i] == '\x1b') {
@@ -1548,48 +1542,68 @@ static int anim_slide_rewrite(char *out, int bs, int *posp, int *endp, int host_
             SLIDE_PUTN(out + i, L); i += L; continue;
         }
         if (!dcur) { SLIDE_PUTN(out + i, 1); i++; continue; }
-        int adv = 0;
-        unsigned int cp = utf8_decode_cp(out + i, end - i, &adv);
-        if (adv <= 0) { SLIDE_PUTN(out + i, 1); i++; continue; }
-        int w = is_zero_width_cp(cp) ? 0 : (is_wide_cp(cp) ? 2 : 1);
-        int t = vcol + dcur;
-        if (t >= 1 && t + w - 1 <= host_cols) {
-            if (t != pend) { SLIDE_PUTF("\x1b[%d;%dH", crow, t); pend = t; }
-            SLIDE_PUTN(out + i, adv);
-            pend += (w > 0 ? w : 0);
-        }
-        vcol += w;
-        i += adv;
-    }
-    /* 光标段 [end,total)：只把首条 CUP 的列一起平移（否则动画期间光标会停在还没推过来
-     * 的那一截上），?25h / ?7h 之类一律原样追加在末尾 —— 与不做差分的那条约定一致。 */
-    int done = 0;
-    for (int j = end; j < total; ) {
-        int r = -1, c = 1;
-        int L = (out[j] == '\x1b') ? anim_esc(out, j, total, &r, &c) : 0;
-        if (!done && L > 0 && r >= 2 && r <= host_rows + 1) {
-            int nc = c + d;
-            if (nc < 1) nc = 1;
-            if (nc > host_cols) nc = host_cols;
-            if (nc != c) {
-                SLIDE_PUTF("\x1b[%d;%dH", r, nc);
-                j += L; done = 1; continue;
+        {
+            int adv = 0, w, t;
+            unsigned int cp = utf8_decode_cp(out + i, end - i, &adv);
+            if (adv <= 0) { SLIDE_PUTN(out + i, 1); i++; continue; }
+            w = is_zero_width_cp(cp) ? 0 : (is_wide_cp(cp) ? 2 : 1);
+            t = vcol + dcur;
+            if (t >= 1 && t + w - 1 <= host_cols) {
+                if (t != pend) { SLIDE_PUTF("\x1b[%d;%dH", crow, t); pend = t; }
+                SLIDE_PUTN(out + i, adv);
+                pend += w;
             }
+            vcol += w;
+            i += adv;
         }
-        SLIDE_PUTN(out + j, (L > 0) ? L : 1);
-        j += (L > 0) ? L : 1;
     }
-    /* 重写只会让正文变短（丢掉屏外的格子），多的只是极少数「重新对齐」用的 CUP；
-     * 光标段原封不动接在后面，两个长度一起回写，framediff 看到的就是这一帧的真身。 */
-    if (n + (total - end) > bs) goto slide_fail;
-    memcpy(out, tmp, (size_t)(n + (total - end)));
-    *endp = n;
-    *posp = n + (total - end);
-    return 1;
-slide_fail:
-    return 0;
+    *bodyp = n;
+    /* 光标段：光标得跟着推到已经亮出来的那一格上；?25h / ?7h 之类原样照抄 —— 与「这一帧
+     * 不做差分」那条约定一致。 */
+    {
+        int done = 0;
+        for (int j = end; j < total; j += 1) {
+            int r = -1, c = 1;
+            int L = (out[j] == '\x1b') ? anim_esc(out, j, total, &r, &c) : 0;
+            int step = (L > 0) ? L : 1;
+            if (!done && L > 0 && r >= 2 && r <= host_rows + 1) {
+                int nc = c + d;
+                if (nc < 1) nc = 1;
+                if (nc > host_cols) nc = host_cols;
+                if (nc != c) {
+                    SLIDE_PUTF("\x1b[%d;%dH", r, nc);
+                    done = 1;
+                    continue;
+                }
+            }
+            SLIDE_PUTN(out + j, step);
+            j += step - 1;          /* for 还会 +1 */
+        }
+    }
+    return n;
+}
 #undef SLIDE_PUTF
 #undef SLIDE_PUTN
+
+/* 成功后把两个长度写回去。失败（缓冲装不下 / 没内存）时原样返回 0，这一帧就是「只有淡
+ * 入、没有位移」，下一帧还会再试 ⇒ 最坏是某一次切标签少了滑动，绝不会画错。 */
+static int anim_slide_rewrite(char *out, int bs, int *posp, int *endp, int host_rows, int host_cols, int d) {
+    int end = *endp, total = *posp;
+    int need = total + (total >> 2) + 4096;
+    int body = 0, n;
+    if (need > g_slide_cap) {
+        char *nb = (char *)realloc(g_slide_buf, (size_t)need);
+        if (!nb) return 0;
+        g_slide_buf = nb; g_slide_cap = need;
+    }
+    n = anim_slide_fill(out, end, total, host_rows, host_cols, d, g_slide_buf, need, &body);
+    /* tmp 里已经是完整一帧（正文 + 光标段），长度就是 n：只搬 n 个字节，两段各自的位置按
+     * body / n 回写。多搬会把没写过的缓冲尾巴当光标段送给终端。 */
+    if (n < 0 || n > bs) return 0;
+    memcpy(out, g_slide_buf, (size_t)n);
+    *endp = body;
+    *posp = n;
+    return 1;
 }
 
 /* 帧尾统一起动画：谁变了、该用哪一种曲线，都在这里说定。挂在 render_screen 的帧尾而不是
