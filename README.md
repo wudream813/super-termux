@@ -5,7 +5,7 @@
 终端复用器（Terminal Multiplexer）—— 模块化 C 架构，单文件可执行。
 在一个终端窗口里管理多个 shell 会话，像 tmux 一样分标签页、分屏、搜历史。
 
-当前版本：**v2.1.6**（正式支持 Windows / Linux / macOS 三个系统）
+当前版本：**v2.1.7**（正式支持 Windows / Linux / macOS 三个系统）
 
 ## 平台支持
 
