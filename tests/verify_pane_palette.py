@@ -1711,6 +1711,14 @@ int main(int argc, char **argv) {
 
 
     # ============ R 组续（v2.1.8）：切标签左右滑入 / 气泡与 toast 淡入 / 向底色混合 ============
+    # 这台机器没有 libvterm（CI 的 macOS runner）时，屏幕级判据一律打 SKIP：拿空帧去比
+    # 位移/淡入既会假红（R8~R13），拿 None == None 去比静止屏又会假绿（R9/R15）—— 两种都
+    # 没意义。字节级的两条（R10 的 CUP 列号、R16 的 NUL）不看屏幕 ⇒ 照常硬判。
+    def rA_ck(name, cond, extra=""):
+        if not _VTEXT_OK:
+            print("  [SKIP] %s —— 本机没有 libvterm-dev" % name)
+            return
+        ck(name, cond, extra)
     # 滑动的量法不重新实现 C 里的位移，而是拿「整屏文本」套一条闭式：
     #   从右进（d>0）：第 r 行 = d 个空格 + 静止那一屏第 r 行的前 cols-d 列
     #   从左进（d<0）：第 r 行 = 静止那一屏第 r 行去掉前 |d| 列，右边补 |d| 个空格
@@ -1786,15 +1794,15 @@ int main(int argc, char **argv) {
     g_next, g_next_last, n_next, rest_next, ds_n = rA_slide_scan("gn", t_next, ROWS_C, COLS_C, +1)
     g_prev, g_prev_last, n_prev, rest_prev, ds_p = rA_slide_scan("gp", t_prev, ROWS_C, COLS_C, -1)
     g_no = rA_slide_scan("gno", t_next_off, ROWS_C, COLS_C, +1)[0]
-    ck("R8 切到下一个标签 = 整页横向滑入（首帧 %s 起整页右移 %+d 列，一路滑到 %+d 列），关动画时一帧都没有"
+    rA_ck("R8 切到下一个标签 = 整页横向滑入（首帧 %s 起整页右移 %+d 列，一路滑到 %+d 列），关动画时一帧都没有"
        % (g_next[0] if g_next else None, g_next[1] if g_next else 0, g_next_last[1] if g_next_last else 0),
        g_next is not None and g_no is None, "off 也匹配到位移=%r normal 各帧=%r" % (g_no, ds_n))
-    ck("R8b 切回上一个标签方向是反的（首帧 %s 整页左移 %d 列）—— 不是所有切换都从右边推"
+    rA_ck("R8b 切回上一个标签方向是反的（首帧 %s 整页左移 %d 列）—— 不是所有切换都从右边推"
        % (g_prev[0] if g_prev else None, g_prev[1] if g_prev else 0),
        g_prev is not None, "各帧位移=%r 静止屏非空行=%d"
        % (ds_p, sum(1 for l in rA_pad(rest_prev, COLS_C) if l.strip())))
 
-    ck("R9 滑动收尾后不留残影：静止屏与 anim=off 同文同色（含标签栏那行）",
+    rA_ck("R9 滑动收尾后不留残影：静止屏与 anim=off 同文同色（含标签栏那行）",
        vt_text(ROWS_C, COLS_C, t_next) == vt_text(ROWS_C, COLS_C, t_next_off)
        and vt_sig(ROWS_C, COLS_C, t_next) == vt_sig(ROWS_C, COLS_C, t_next_off),
        "首个差异=%r" % (next((i for i, a in enumerate(vt_text(ROWS_C, COLS_C, t_next) or [])
@@ -1827,7 +1835,7 @@ int main(int argc, char **argv) {
     k_rest = max((i for i, f in enumerate(fr_next) if b"\x1b[1;1H" in f), default=len(fr_next) - 1)
     v1a, v1r = rA_vis_bytes(fr_next[k_slide], 1), rA_vis_bytes(fr_next[k_rest], 1)
     v2a, v2r = rA_vis_bytes(fr_next[k_slide], 2), rA_vis_bytes(fr_next[k_rest], 2)
-    ck("R10b 标签栏只跟着亮、不跟着滑：位移最大那帧（帧 %s，%+d 列）标签栏可见字节 %d 与静止帧 %d "
+    rA_ck("R10b 标签栏只跟着亮、不跟着滑：位移最大那帧（帧 %s，%+d 列）标签栏可见字节 %d 与静止帧 %d "
        "一样多，而正文第 2 行从 %d 被裁到 %d" % (k_slide, (g_next or (0, 0))[1], v1a, v1r, v2r, v2a),
        v1a == v1r and v1r > 0 and 0 < v2a < v2r,
        "标签栏=%r/%r 第2行=%r/%r" % (v1a, v1r, v2a, v2r))
@@ -1882,19 +1890,19 @@ int main(int argc, char **argv) {
     tip_off = capture_page_keys(ROWS_C, COLS_C, T_ON, ini=tip_ini_off)
     tip_nrm = capture_page_keys(ROWS_C, COLS_C, T_ON, ini=tip_ini_nrm)
     k_tip, d_tip, rows_tip, seen_tip = rA_float_fade(tip_off, tip_nrm, BOX_TOP, box=True)
-    ck("R12 悬停气泡出现那一帧起确有淡入：只淡气泡占的第 %s~%s 行，最多 %d 帧在渐变（首帧 %s）"
+    rA_ck("R12 悬停气泡出现那一帧起确有淡入：只淡气泡占的第 %s~%s 行，最多 %d 帧在渐变（首帧 %s）"
        % (min(rows_tip) if rows_tip else "—", max(rows_tip) if rows_tip else "—",
           max((len(v) for v in d_tip.values()), default=0), k_tip),
        bool(tip_mv) and k_tip is not None and len(rows_tip) >= 2 and bool(d_tip)
        and set(d_tip) <= rows_tip and max(len(v) for v in d_tip.values()) >= 3,
        "气泡行=%r 被淡行=%r 悬停序列=%r" % (sorted(rows_tip), d_tip, tip_mv))
     n_t_off, n_t_nrm = rA_tail_chunks(tip_off, BOX_TOP), rA_tail_chunks(tip_nrm, BOX_TOP)
-    ck("R12b anim=off 时气泡一帧都不多画（气泡出现后 off=%s 帧、normal=%s 帧）" % (n_t_off, n_t_nrm),
+    rA_ck("R12b anim=off 时气泡一帧都不多画（气泡出现后 off=%s 帧、normal=%s 帧）" % (n_t_off, n_t_nrm),
        n_t_off is not None and n_t_nrm is not None and n_t_off <= 2 and n_t_nrm - n_t_off >= 2,
        "off=%s normal=%s" % (n_t_off, n_t_nrm))
     # 淡入是「向页面底色混合」而不是「向黑压暗」：淡到最狠那一帧应该贴到 (13,17,23) 上。
     near = [t for t in seen_tip if all(abs(t[i] - BG0[i]) <= 2 for i in range(3))]
-    ck("R11 混合基准是页面底色：淡入期间写出过 %r 这类「贴着底色」的颜色（向黑压暗会掉到 "
+    rA_ck("R11 混合基准是页面底色：淡入期间写出过 %r 这类「贴着底色」的颜色（向黑压暗会掉到 "
        "0~8，永远到不了 13/17/23）" % (sorted(near)[:2],),
        bool(near), "淡入期间的非原色=%r" % sorted(seen_tip)[:8])
 
@@ -1921,7 +1929,7 @@ int main(int argc, char **argv) {
         d_sw = {r: [k for k in v if k >= k_b] for r, v in d_sw_all.items()}
         d_sw = {r: v for r, v in d_sw.items() if v}
     sn_sw = "\n".join(vt_text(ROWS_C, COLS_C, sw_nrm) or [])
-    ck("R12c 气泡从乙行挪到丙行：全文跟着换（屏上只剩丙那串），但不重播淡入",
+    rA_ck("R12c 气泡从乙行挪到丙行：全文跟着换（屏上只剩丙那串），但不重播淡入",
        bool(mv_a) and bool(mv_b) and mv_a != mv_b and bool(box_fr) and k_b is not None
        and k_b > box_fr[0] and ("丙" * 12) in sn_sw and ("乙" * 12) not in sn_sw
        # 前半：第一次出现必须真淡（不淡的判据在 v2.1.7 上也会绿，等于没测）；后半：搬行不许再淡
@@ -1937,12 +1945,12 @@ int main(int argc, char **argv) {
     k_to, d_to, rows_to, seen_to = rA_float_fade(to_off, to_nrm, TO_MARK)
     to_scr = vt_text(ROWS_C, COLS_C, to_nrm) or []
     to_row = next((i + 1 for i, l in enumerate(to_scr) if "不能分屏" in l), -1)
-    ck("R13 底部 toast 出现也有淡入：只淡 toast 自己那一行（屏幕第 %d 行），其余 %d 行一格不动"
+    rA_ck("R13 底部 toast 出现也有淡入：只淡 toast 自己那一行（屏幕第 %d 行），其余 %d 行一格不动"
        % (to_row, ROWS_C - (1 if to_row in d_to else 0)),
        k_to is not None and to_row > 0 and set(d_to) == {to_row}
        and max((len(v) for v in d_to.values()), default=0) >= 3,
        "toast 行=%d 被淡行=%r 档=%r" % (to_row, d_to, max((len(v) for v in d_to.values()), default=0)))
-    ck("R13b toast 的静止屏与 anim=off 同文同色（淡完不留一丝痕迹，行宽也没被碰）",
+    rA_ck("R13b toast 的静止屏与 anim=off 同文同色（淡完不留一丝痕迹，行宽也没被碰）",
        vt_text(ROWS_C, COLS_C, to_off) == vt_text(ROWS_C, COLS_C, to_nrm)
        and vt_sig(ROWS_C, COLS_C, to_off) == vt_sig(ROWS_C, COLS_C, to_nrm)
        and all(dispw(l) <= COLS_C for l in (vt_text(ROWS_C, COLS_C, to_nrm) or [])),
@@ -1955,7 +1963,7 @@ int main(int argc, char **argv) {
         f2 = rA_frames25(nrow)
         ov = [c for fr in f2 for _, c in re.findall(rb"\x1b\[(\d+);(\d+)H", fr) if int(c) > cols]
         ln = vt_text(rows, cols, nrow) or []
-        ck("R14 %d×%d 档：切标签的动画帧里没有任何一列越过屏宽，静止屏 %d 行齐" % (rows, cols, len(ln)),
+        rA_ck("R14 %d×%d 档：切标签的动画帧里没有任何一列越过屏宽，静止屏 %d 行齐" % (rows, cols, len(ln)),
            not ov and len(ln) == rows and all(dispw(l) <= cols for l in ln),
            "越界列=%r 行数=%d" % (ov[:4], len(ln)))
 
@@ -1964,7 +1972,7 @@ int main(int argc, char **argv) {
     b_off = capture_page_keys(ROWS_C, COLS_C, [b"\x02n", burst], ini=rini("off"))
     b_nrm = capture_page_keys(ROWS_C, COLS_C, [b"\x02n", burst], ini=rini("normal"))
     bo, bn = vt_text(ROWS_C, COLS_C, b_off) or [], vt_text(ROWS_C, COLS_C, b_nrm) or []
-    ck("R15 一口气 30 次切标签（动画没走完就再切）：静止屏与 off 逐格同文同色、%d 行齐、无超宽行"
+    rA_ck("R15 一口气 30 次切标签（动画没走完就再切）：静止屏与 off 逐格同文同色、%d 行齐、无超宽行"
        % ROWS_C,
        bo == bn and len(bn) == ROWS_C and all(dispw(l) <= COLS_C for l in bn)
        and vt_sig(ROWS_C, COLS_C, b_off) == vt_sig(ROWS_C, COLS_C, b_nrm),
