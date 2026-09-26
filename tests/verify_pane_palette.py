@@ -1639,23 +1639,26 @@ int main(int argc, char **argv) {
     ck("R2b 切页是「整页一起淡」：各行同一帧回到原色（收尾批次 ≤2），且各行进度相近",
        bool(d_nrm) and len(uni_nrm) <= 2 and lv_nrm and min(lv_nrm) * 10 >= 7 * max(lv_nrm),
        "收尾帧集合=%r 档数=%r" % (sorted(uni_nrm), lv_nrm))
-    # 「三档严格递增」里 110 与 200 这一环，取决于这台机器采得出多少帧：CI 的 macOS
-    # runner 实测 short=7 / normal=10 / 200=10 —— 两档都撞上同一次访问里能采到的帧数上限
-    # （浮层只在那 0.4s 的 drain 里出帧），于是中间那一环根本没法比，而程序本身没毛病
-    # （本机同一条判据是 4 < 8 < 13 这样严格递增的）。所以按分辨率分两种问法：
-    # 采得开 ⇒ 必须严格递增（一个字都不放宽）；采不开 ⇒ 只硬判两端之差（差 140ms，
-    # 任何采样都看得见），并且把「这一环没测出来」写在判据名里，不藏着。
-    r3_res = lv(d_nrm) < lv(d_slow)
-    if r3_res:
-        ck("R3 时长真按 ini 走（本机采得开）：三档严格递增 short(60) < normal(110) < 200ms，"
-           "且 200ms 比 short 多 3 档以上",
-           lv(d_short) < lv(d_nrm) < lv(d_slow) and lv(d_slow) - lv(d_short) >= 3,
-           "short=%d normal=%d 200=%d" % (lv(d_short), lv(d_nrm), lv(d_slow)))
-    else:
-        ck("R3 时长真按 ini 走（本机采样采不出 110 与 200 的档数差 ⇒ 只判两端）："
-           "short(60) < normal(110) ≤ 200ms，且 200ms 比 short 多 3 档以上",
-           lv(d_short) < lv(d_nrm) <= lv(d_slow) and lv(d_slow) - lv(d_short) >= 3,
-           "short=%d normal=%d 200=%d" % (lv(d_short), lv(d_nrm), lv(d_slow)))
+    # 时长这条不能用上面那组捕获：一是它里面有两次动画（进设置页 + 切标签），二是
+    # rA_dim 只看【最后 win 帧】⇒ 慢机器上三档全被同一个窗口削平（CI 的 macOS runner 实测
+    # short=7 / normal=10 / 200=10，两档撞在窗口上限上，比出的是采样窗口、不是时长）。
+    # 改成：只按一次翻页（进设置页）、窗口放到整场，数「这一行压色压了几个帧」。
+    # 帧与帧的间隔由这台机器决定，但帧数随时长单调增长这件事与间隔无关 ⇒ 快慢机器都比得出。
+    ONE = [b"\x02s"]
+    o_off = capture_page_keys(24, 100, ONE, ini=rini("off"))
+    o_short = capture_page_keys(24, 100, ONE, ini=rini("short"))
+    o_nrm = capture_page_keys(24, 100, ONE, ini=rini("normal"))
+    o_slow = capture_page_keys(24, 100, ONE, ini=rini("200"))
+
+    def lv_one(data):
+        d, _n = rA_dim(o_off, data, win=64)
+        return max((len(v) for v in d.values()), default=0)
+
+    L_s, L_n, L_w = lv_one(o_short), lv_one(o_nrm), lv_one(o_slow)
+    ck("R3 时长真按 ini 走：单次翻页 + 整场窗口数「压色帧数」，short(60) < normal(110) < 200ms "
+       "且两端至少差 2 帧",
+       L_s < L_n < L_w and L_w - L_s >= 2,
+       "short=%d normal=%d 200=%d（off 静止屏 %d 帧）" % (L_s, L_n, L_w, len(o_off.split(b"\x1b[?7l"))))
     ck("R3b 认不出的单词不静默关掉动画（typo → 按默认 110ms 走）",
        4 <= lv(d_junk) <= 12 and abs(lv(d_junk) - lv(d_nrm)) <= 3,
        "typo=%d 档，normal=%d 档" % (lv(d_junk), lv(d_nrm)))
