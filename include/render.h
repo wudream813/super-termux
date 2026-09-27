@@ -232,6 +232,8 @@ int  settings_behavior_natural_at(int host_rows, int row);
 int  settings_detail_row_view(int host_rows, int natural);
 int  settings_startup_row_view(int host_rows, int natural);
 int  settings_manage_row_view(int host_rows, int natural);   /* v2.1.4：条目管理页 */
+int  settings_manage_bar_row(int host_rows);                /* v2.2.0：动作条行（钉底）*/
+int  settings_manage_hint_row(int host_rows);               /* v2.2.0：提示行（钉底）*/
 int  settings_manage_last(void);                       /* v2.1.5：条目管理页末行（随条目数长） */
 int  settings_manage_natural_at(int host_rows, int row);
 int  settings_startup_natural_at(int host_rows, int row);
@@ -279,6 +281,7 @@ int settings_keys_reset_col(int host_cols, int main_left);
 int settings_keys_show_reset(int host_cols, int main_left);
 /* v2.1.0：窗格配色页顶部的「预设方案」行按 Enter / 点击打开的方案列表浮层。 */
 void pane_scheme_picker_geom(int host_rows, int host_cols, int *top, int *left, int *w, int *h);
+int  settings_pane_scheme_arrow_col(int main_left, int which);   /* v2.2.0：0=‹ 1=› 所在终端列 */
 /* v2.1.1：十六进制颜色编辑浮层。以前编辑框是「嵌在表行里」的，终端一窄
  * （值段起点在屏幕外）就整段被裁掉——看不见色、也看不见自己敲了哪几位。
  * 改成居中的小浮层：色块 + 完整 6 位十六进制 + 提示，任何宽度都不截断。 */

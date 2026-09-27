@@ -599,10 +599,17 @@ void pane_resize_to(int idx, int cols, int rows) {
      *
      * 两侧一起冻结后拖动中不存在宽度差，也就没有错位；窗格边界仍然跟鼠标动
      * （布局矩形由 split_layout 算，不经过这里），只是内容在松手时才重排。 */
-    if (split_drag_active()) {
-        g_mux.needs_redraw = 1;
-        return;
-    }
+    /* v2.2.0（用户 #4：「拖动分隔条时改成即时修改渲染，拖动过程中也会自动对齐」）：
+     * 这里以前整段跳过（本地 screen_resize 与 ResizePseudoConsole 一起冻结到松手），
+     * 因为实测「只改一侧」两头都出问题：只冻 ConPTY ⇒ conhost 按旧宽度排版、模型按新
+     * 宽度 reflow，拿 16 列碎片去拼 92 列的行，一次拖动里模型宽度在 15/16/20/30/45/
+     * 60/76/92 之间跳、非空历史行 8331→2771→1360→4167 剧变；只冻本地 ⇒ conhost 每帧
+     * 整屏重绘、screen_repaint_align 对不齐（返回 2 不动作），滚出视口的行被就地覆盖，
+     * 真机一次拖动把 hist 从 93 吃成 0。
+     * 现在节流挪到了【布局】那一侧（src/input.c 的 SPLIT_DRAG_LIVE_MS：最多每 90ms 提交
+     * 一次分屏比例）：提交的帧里布局、模型、ConPTY 同帧一起改，不提交的帧里三者一起保持
+     * 原样 —— 宽度差不存在，所以这一层不再需要特殊分支，拖动途中就能看到内容重排。
+     * 别把「拖动中就 return」加回来：那等于把用户这条 #4 又变回「松手才跳一下」。 */
     EnterCriticalSection(&g_mux.cs);
     if (p->screen.cols != cols || p->screen.rows != rows) {
         screen_resize(&p->screen, cols, rows);

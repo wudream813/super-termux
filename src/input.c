@@ -66,6 +66,10 @@ static char g_split_drag_dir = 0;    /* 'V' / 'H' / 0 */
  * 变，而「用户抓的是哪条线」必须在按下时就锁定。见 split_drag_pick_node() 的注释
  * （src/split.c，bug #27）。 */
 static int g_split_drag_node = -1;
+/* v2.2.0（用户 #4：「拖动分隔条时改成即时修改渲染，拖动过程中也会自动对齐」）：
+ * 上次「把新分屏比例提交给 split_set_frac_node」的时刻。见下面拖动分支里的注释。 */
+#define SPLIT_DRAG_LIVE_MS 90
+static ULONGLONG g_split_drag_commit_ms;
 
 /* 分屏边框是否正在被拖动。pane_resize_to 用它把【本地 screen_resize 和
  * ResizePseudoConsole 一起】推迟到松手。
@@ -131,12 +135,24 @@ static int handle_split_mouse(MOUSE_EVENT_RECORD *me) {
 
     /* 1) 正在拖边框：根据鼠标移动调 frac。 */
     if (g_split_drag_dir && g_split_drag_pane >= 0) {
+        /* 先把这一帧鼠标位置对应的百分比算出来（松手那一下也要用）。 */
+        int root_ = split_active_root();
+        int pct_ = 0;
+        int ok_ = 0;
+        {
+            PaneRect *aa = &rects[g_split_drag_pane];
+            ok_ = root_ >= 0 && aa->valid && g_split_drag_node >= 0 &&
+                  split_drag_pct(rects, g_split_drag_node, g_split_drag_dir,
+                                 g_split_drag_dir == 'V' ? content_x : content_y, &pct_);
+        }
         if (!pressed) {
+            /* 松手：节流是「最多每 90ms 提交一次」，最后一次提交可能落在几列之外
+             * ⇒ 这里按鼠标此刻的位置无条件补一次，落点不会因为节流而偏。 */
+            if (ok_) split_set_frac_node(g_split_drag_node, g_split_drag_pane, pct_);
             g_split_drag_dir = 0; g_split_drag_pane = -1; g_split_drag_node = -1;
-            /* 拖动期间 pane_resize_to 一直跳过 ResizePseudoConsole（见 split_drag_active
-             * 的注释）。松手后必须再渲染一帧，那一帧里的 pane_resize_to 才会检测到
-             * conpty_cols 与布局宽度不一致并把 resize 补发给 ConPTY。主循环在
-             * needs_redraw==0 时要等 25ms 且不渲染，所以这里必须显式点亮。 */
+            g_split_drag_commit_ms = 0;
+            /* 仍需点亮一帧：布局变了要重画，pane_resize_to 也要在那一帧里把最后一次
+             * 尺寸下发出去（节流窗口可能正好把它挡下）。 */
             g_mux.needs_redraw = 1;
             return 1;
         }
@@ -145,14 +161,23 @@ static int handle_split_mouse(MOUSE_EVENT_RECORD *me) {
          * 的直接兄弟时才等于那个节点的跨度；嵌套分屏下拖中间格的右侧分隔线，右邻
          * 落在节点子树之外，分母就不对了 —— 而且被改的还是【里层】那条分隔线，
          * 表现为「动的是另一条分隔条」。（2026-09-20 用户报，bug #27。） */
-        int root = split_active_root();
-        PaneRect *a = &rects[g_split_drag_pane];
-        int pct = 0;
-        if (root >= 0 && a->valid && g_split_drag_node >= 0 &&
-            split_drag_pct(rects, g_split_drag_node, g_split_drag_dir,
-                           g_split_drag_dir == 'V' ? content_x : content_y, &pct)) {
-            split_set_frac_node(g_split_drag_node, g_split_drag_pane, pct);
-            g_mux.needs_redraw = 1;
+        if (ok_) {
+            /* v2.2.0：改完【立刻】重排，而不是憋到松手。做法上的关键是「节流点在布局、
+             * 不在 resize」：split_set_frac_node 一提交，split_layout 给出的矩形、本地
+             * screen_resize 与 ResizePseudoConsole 就在同一帧一起动，中间任何一帧都不存在
+             * 宽度差。旧做法是反过来 —— 把本地 reflow 和 ConPTY resize 一起冻结到松手，
+             * 画面稳，但整个拖动过程内容一行都不重排，松手才「跳」一下（用户报的正是这个）。
+             * 只改一侧的两个老坑不能重犯：只冻 ConPTY ⇒ 拿旧宽度的碎片去拼新宽度的行、
+             * 错位；只冻本地 ⇒ conhost 每帧整屏重绘与模型对不齐，真机实测一次拖动把
+             * hist 从 93 吃成 0。这里两侧同帧一起动，走的正是「松手那一帧」那条路。
+             * 90ms ≈ 一秒的拖动能看到十来次重排，手感是即时的，又不至于每来一个鼠标
+             * 事件就重排一遍（拖动事件可以到 60Hz，ConPTY 整屏重排扛不住那个频率）。*/
+            ULONGLONG now = GetTickCount64();
+            if (!g_split_drag_commit_ms || now - g_split_drag_commit_ms >= SPLIT_DRAG_LIVE_MS) {
+                g_split_drag_commit_ms = now;
+                split_set_frac_node(g_split_drag_node, g_split_drag_pane, pct_);
+                g_mux.needs_redraw = 1;
+            }
         }
         return 1;
     }
@@ -176,6 +201,7 @@ static int handle_split_mouse(MOUSE_EVENT_RECORD *me) {
                  * 一个；真正会搞错的是【嵌套方向】—— 中间格右沿那条线属于外层
                  * 祖先，不是中间格自己那个 V 节点。 */
                 g_split_drag_node = split_drag_pick_node(rects, split_active_root(), i, 'V', vx);
+                g_split_drag_commit_ms = 0;   /* 第一次挪动就立刻提交 */
                 return 1;
             }
             int hy = r->or0 + r->orows;
@@ -187,6 +213,7 @@ static int handle_split_mouse(MOUSE_EVENT_RECORD *me) {
                 g_split_drag_dir = 'H'; g_split_drag_pane = i;
                 /* 同上：横线也有同样的嵌套问题（左右分三格后再把中间那格上下分）。 */
                 g_split_drag_node = split_drag_pick_node(rects, split_active_root(), i, 'H', hy);
+                g_split_drag_commit_ms = 0;
                 return 1;
             }
         }
@@ -2212,10 +2239,8 @@ static void handle_settings_items_key(WORD vk, WCHAR uc, BOOL is_ctrl) {
         if (settings_manage_set_default_startup()) g_mux.needs_redraw = 1;
         return;
     }
-    if (vk == VK_F2) { g_settings_nav = SETTINGS_NAV_APPEARANCE; g_mux.needs_redraw = 1; return; }
-    if (vk == VK_F3 || uc == 'k' || uc == 'K') { g_settings_nav = SETTINGS_NAV_KEYS; g_mux.needs_redraw = 1; return; }
-    if (vk == VK_F4 || uc == 'b' || uc == 'B') { g_settings_nav = SETTINGS_NAV_BEHAVIOR; g_mux.needs_redraw = 1; return; }
-    if (vk == VK_F5 || uc == 'w' || uc == 'W') { g_settings_nav = SETTINGS_NAV_PANE; g_mux.needs_redraw = 1; return; }
+    /* F2..F5 / K / B / W 这排换页键 v2.2.0 起在分派器里统一认（这一页的 S、A 仍是本页动作，
+     * 让路名单见 g_settings_nav_letters 上面那段注释）。 */
     if (vk == VK_PRIOR || vk == VK_NEXT) {
         int page = (g_mux.host_rows > 8) ? g_mux.host_rows - 7 : 1;
         int step = (vk == VK_NEXT) ? page : -page;
@@ -2336,6 +2361,28 @@ static void handle_settings_behavior_key(WORD vk, WCHAR uc) {
 /* 是否停在「某个菜单项的详情页」上。v2.1.4 起 g_settings_nav 除了 1..N 还可能是
  * 100+ 的页号（含新的 104=条目管理），所以老的「>= 1」判据必须收窄，否则 104 会被
  * 当成第 104 项：预设会写进 g_chooser_items[103]。 */
+/* v2.2.0（用户 #1：「设置中 启动 (Startup) 没有快捷键可以打开」）：六个入口的快捷键
+ * 全部提到分派器前面统一认，规则只有一条 —— 「这一页自己已经把这个字母用做本页动作」时不抢。
+ * 三条改动：
+ *   ① 「启动」这一栏以前一个键都没有（F2..F5 那四页有字母，它连字母位都是空的）⇒ 现在 F1 / S；
+ *   ② 侧栏写着「[A] 外观 / 主题」，可 A 从来没被绑过（只有 F2 能用）—— 假标签 ⇒ 补上；
+ *   ③ 这些字母以前只在启动页认 ⇒ 进了别的页就按不回来，只能一路 ←/→ 或 Esc 退出去重来。
+ * 让路名单是从各页 handler 里数出来的：条目管理页把 S 用做「设为启动默认」、A 用做「添加条目」；
+ * 行为页把 A/B/D/E/H/K/M/N/P/T/U/W/Y 用做各个开关的单键切换。那两页上换页请用 F1..F5。 */
+static const struct { WCHAR uc; int nav; } g_settings_nav_letters[] = {
+    { 's', SETTINGS_NAV_STARTUP },    { 'a', SETTINGS_NAV_APPEARANCE },
+    { 'm', SETTINGS_NAV_ITEMS },      { 'k', SETTINGS_NAV_KEYS },
+    { 'b', SETTINGS_NAV_BEHAVIOR },    { 'w', SETTINGS_NAV_PANE },
+};
+static int settings_letter_used_by_page(WCHAR uc) {
+    WCHAR l = (uc >= 'A' && uc <= 'Z') ? (WCHAR)(uc + 32) : uc;
+    switch (g_settings_nav) {
+    case SETTINGS_NAV_ITEMS:    return l == 's' || l == 'a';
+    case SETTINGS_NAV_BEHAVIOR: return l == 'a' || l == 'b' || l == 'k' || l == 'w' || l == 'm';
+    default: return 0;
+    }
+}
+
 static int settings_nav_is_item_detail(void) {
     return g_settings_nav >= 1 && g_settings_nav <= g_chooser_item_count;
 }
@@ -2481,6 +2528,32 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
         return;
     }
 
+    /* 换页快捷键（F1..F5 任何设置页都能按；字母只在本页没占用时才当导航用）。
+     * 放在分派【之前】、十六进制编辑与捕键的提前返回【之后】⇒ 正在改配色/在录按键时
+     * 一个键都不会被抢走。 */
+    /* 不看 is_shift：这些入口字母本来就大小写都认（老代码 `uc == 'm' || uc == 'M'`），
+     * 而终端给出大写时常常带 SHIFT_PRESSED ⇒ 一并排除会把 Shift+M 这种按法挡掉。 */
+    if (!is_ctrl && !is_alt) {
+        int tgt = -1;
+        if (vk == VK_F1) tgt = SETTINGS_NAV_STARTUP;
+        else if (vk == VK_F2) tgt = SETTINGS_NAV_APPEARANCE;
+        else if (vk == VK_F3) tgt = SETTINGS_NAV_KEYS;
+        else if (vk == VK_F4) tgt = SETTINGS_NAV_BEHAVIOR;
+        else if (vk == VK_F5) tgt = SETTINGS_NAV_PANE;
+        else {
+            WCHAR l = (uc >= 'A' && uc <= 'Z') ? (WCHAR)(uc + 32) : uc;
+            if (!settings_letter_used_by_page(l)) {
+                for (int q = 0; q < (int)(sizeof(g_settings_nav_letters) / sizeof(g_settings_nav_letters[0])); q++)
+                    if (g_settings_nav_letters[q].uc == l) { tgt = g_settings_nav_letters[q].nav; break; }
+            }
+        }
+        if (tgt >= 0) {
+            g_settings_nav = tgt;
+            g_mux.needs_redraw = 1;
+            return;
+        }
+    }
+
     if (g_settings_nav == SETTINGS_NAV_APPEARANCE) { handle_settings_appearance_key(vk, uc, is_ctrl); return; }
     if (g_settings_nav == SETTINGS_NAV_KEYS) { handle_settings_keys_key(vk, uc, is_ctrl); return; }
     if (g_settings_nav == SETTINGS_NAV_BEHAVIOR) { handle_settings_behavior_key(vk, uc); return; }
@@ -2544,12 +2617,7 @@ void handle_settings_key(KEY_EVENT_RECORD *ke) {
             return;
         }
 
-        /* 分类页快捷入口：F2 外观 / F3 键位 / F4 行为 / F5 窗格，字母同义 */
-        if (vk == VK_F2) { g_settings_nav = SETTINGS_NAV_APPEARANCE; g_mux.needs_redraw = 1; return; }
-        if (vk == VK_F3 || uc == 'k' || uc == 'K') { g_settings_nav = SETTINGS_NAV_KEYS; g_mux.needs_redraw = 1; return; }
-        if (vk == VK_F4 || uc == 'b' || uc == 'B') { g_settings_nav = SETTINGS_NAV_BEHAVIOR; g_mux.needs_redraw = 1; return; }
-        if (vk == VK_F5 || uc == 'w' || uc == 'W') { g_settings_nav = SETTINGS_NAV_PANE; g_mux.needs_redraw = 1; return; }
-        if (uc == 'm' || uc == 'M') { g_settings_nav = SETTINGS_NAV_ITEMS; g_mux.needs_redraw = 1; return; }
+        /* F1..F5 与 S/A/M/K/B/W 六个入口的快捷键都在分派器里认（v2.2.0），这一页不再各自绑一遍。 */
 
         if ((uc >= '1' && uc <= '9') || (vk >= '1' && vk <= '9') || (vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9)) {
             int num = (uc >= '1' && uc <= '9') ? (uc - '0') : ((vk >= '1' && vk <= '9') ? (vk - '0') : (vk - VK_NUMPAD1 + 1));
@@ -2889,12 +2957,17 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
         }
         if (g_settings_nav == SETTINGS_NAV_PANE) {
             if (r == SETTINGS_PANE_SCHEME_ROW && c >= main_left) {
-                /* v2.1.0：点方案行 = 选中并弹出方案列表；点「‹」「›」箭头仍是上一个/下一个 */
-                int half = main_left + 12;
-                if (g_settings_pane_sel == -1 && c != main_left) {
-                    if (c < half) g_settings_pane_scheme = (g_settings_pane_scheme + theme_pane_scheme_count() - 1) % theme_pane_scheme_count();
-                    else if (c < main_left + 34) g_settings_pane_scheme = (g_settings_pane_scheme + 1) % theme_pane_scheme_count();
-                    else { g_settings_show_pane_schemes = 1; g_mux.needs_redraw = 1; return; }
+                /* v2.2.0（用户 #3）：上一个/下一个只留「‹」「›」那两个箭头格子；行上其余位置
+                 * —— 行首标签、方案名（例如 GitHub Light）、[选择…] —— 一律弹出方案列表。
+                 * 以前从 main_left+12 一直到 +34 都算「→」，点名字会把当前方案静悄悄换成
+                 * 下一个，正是用户说的「点 GitHub Light 却换了方案、预览没开」。
+                 * 列表打开时光标就停在当前方案那行（渲染侧 is_sel = g_settings_pane_scheme）
+                 * ⇒ 「点名字 = 打开列表并预选它」。 */
+                int al = settings_pane_scheme_arrow_col(main_left, 0);
+                int ar = settings_pane_scheme_arrow_col(main_left, 1);
+                if (g_settings_pane_sel == -1 && (c == al || c == ar)) {
+                    int step = (c == ar) ? 1 : theme_pane_scheme_count() - 1;
+                    g_settings_pane_scheme = (g_settings_pane_scheme + step) % theme_pane_scheme_count();
                 } else {
                     g_settings_pane_sel = -1;
                     g_settings_show_pane_schemes = 1;
@@ -2994,7 +3067,7 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
             ecol = vbc + (mud ? 6 : 0);
             int vc = c - main_left + (h_on ? 0 : h_sc);
             for (int i = 0; i < g_chooser_item_count; i++) {
-                if (snat != 10 + i) continue;
+                if (snat != SETTINGS_MANAGE_ITEM0 + i) continue;   /* v2.2.0：与渲染同一份行号 */
                 int h_up = (mud && mbtn_on && vc >= vbc && vc <= vbc + 2);
                 int h_dn = (mud && mbtn_on && vc >= vbc + 3 && vc <= vbc + 5);
                 int h_ed = (mbtn_on && vc >= ecol && vc <= ecol + 3);
@@ -3041,7 +3114,7 @@ void handle_settings_mouse(MOUSE_EVENT_RECORD *me) {
                 g_mux.needs_redraw = 1;
                 return;
             }
-            if (snat == 10 + g_chooser_item_count + 1) {      /* 动作条：[+] / [P] / [设为默认] */
+            if (r == settings_manage_bar_row(host_rows)) {   /* 动作条：[+] / [P] / [设为默认]（钉底，行号与渲染同源）*/
                 /* 段宽由 settings_manage_action_span() 给（与渲染同一份），不再写死 14/29。 */
                 int aw0 = settings_manage_action_span(0), aw1 = settings_manage_action_span(1);
                 int aw2 = settings_manage_action_span(2);

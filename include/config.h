@@ -17,6 +17,15 @@ extern int g_chooser_item_count;
 #define SETTINGS_NAV_PANE       103   /* v2.0.7：窗格配色（pane_*） */
 #define SETTINGS_NAV_ITEMS      104   /* v2.1.4：条目管理（新建 / 预设库 / 每行 ↑↓改删） */
 #define SETTINGS_MANAGE_FIRST   3     /* v2.1.4：条目管理页可见带 */
+/* v2.2.0（用户 #2：「条目管理中间有一段很大的空缺」）：这一页以前照抄启动页的行号
+ * （说明在第 4 行、表头却在第 9 行），中间 5~8 行是启动页那几行选项的位置、这一页根本
+ * 不画 ⇒ 屏幕上一片空。现在这一页的行号只有一个来源：表头 HEAD、第一条 ITEM0、动作条、
+ * 提示行，全部由条目数推出来；渲染（render.c）与命中判定（input.c）都用这四个式子。 */
+#define SETTINGS_MANAGE_HEAD      5                              /* 表头所在自然行 */
+#define SETTINGS_MANAGE_ITEM0     (SETTINGS_MANAGE_HEAD + 1)     /* 第一条条目 */
+#define SETTINGS_MANAGE_BAR(n)    (SETTINGS_MANAGE_ITEM0 + (n) + 1)   /* 动作条（与末条隔 1 行）*/
+#define SETTINGS_MANAGE_HINT(n)   (SETTINGS_MANAGE_BAR(n) + 1)        /* 提示行 = 本页末行 */
+#define SETTINGS_MANAGE_TAIL        2      /* 动作条 + 提示行：条目多时钉在可见带底下这两行 */
 #define SETTINGS_MANAGE_LAST      26      /* v2.1.5：只作历史参照；页尾改由 settings_manage_last() 算 */
 
 

@@ -16,7 +16,7 @@ void ui_modes_claim(void);
 void ui_modes_cancel(void);
 void ui_modes_sync_pane(void);
 void handle_mouse(MOUSE_EVENT_RECORD *me);
-int  split_drag_active(void);   /* 分屏边框拖动中：pane_resize_to 据此推迟 ConPTY resize */
+int  split_drag_active(void);   /* v2.2.0：仅剩 cell_diag 帧头的 drag= 用（resize 冻结已改成布局侧节流）*/
 void action_execute(int action, int arg, DWORD ctrl);
 void handle_prefix(WORD vk, DWORD ctrl, WCHAR uc);
 void handle_settings_key(KEY_EVENT_RECORD *ke);

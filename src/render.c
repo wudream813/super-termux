@@ -2,7 +2,7 @@
 #include "framediff.h"
 #include "split.h"
 #include "pane.h"
-#include "input.h"   /* split_drag_active()：拖动分屏边框期间不夹取 scroll_offset */
+#include "input.h"   /* split_drag_active()：cell_diag 帧头里的 drag= 标记 */
 #include <stdarg.h>   /* cell_diag 诊断（TERMUX_CELLDIAG） */
 
 
@@ -926,11 +926,22 @@ static void fit_cols(char *dst, int dstbs, const char *src, int maxw) {
 
 /* 取 src 的第 [from,to) 个显示列（转义序列整段保留；落在宽字符中间就整字丢掉）。
  * 注意：按【内容列】计数，SGR 之类的转义序列不占列、也不许被切成半截
- * （半截转义会把 "[0m" 当正文画出来）。 */
+ * （半截转义会把 "[0m" 当正文画出来）。
+ *
+ * v2.2.0（用户 #5：条目管理的「[+] 新建条目」既没前景色也没背景色、hover 也不亮）：
+ * 这里原来是 `used > from` 才保留转义序列，于是【落在窗口左边界那一格上的样式】被丢掉 ——
+ * 一行里第一个带色段（例如 settings_line_begin 之后紧接着写的 "\x1b[48;..m\x1b[38;..m"，
+ * 它前面的可见列数是 0）就这么没了：底色、字色、hover 那一支的 SGR 全部消失，只剩正文。
+ * 现在两条一起修：① used == from 处的样式保留；② 窗口左边【之前】的样式先攒着，吐出第一格
+ * 可见内容时一并补上 —— 横滚过后，视口第一格也该带着它自己的颜色。 */
 static void hcut(const char *src, char *dst, int dstbs, int from, int to) {
     if (dstbs <= 0) return;
     dst[0] = 0;
     int len = (int)strlen(src), i = 0, used = 0, k = 0;
+    /* started：窗口里第一个可见格还没吐出来。在那之前的转义序列一律先攒进 pend，
+     * 吐第一格时补发 —— 「一行开头的样式」和「横滚后视口第一格的样式」都靠它。 */
+    char pend[192]; int pk = 0, started = 0;
+    pend[0] = 0;
     while (i < len) {
         if (src[i] == '\x1b') {
             int e = i + 1;
@@ -939,9 +950,15 @@ static void hcut(const char *src, char *dst, int dstbs, int from, int to) {
                 while (e < len && !(src[e] >= 'm' && src[e] <= '~')) e++;
                 if (e < len) e++;
             } else { e = i + 1; }
-            if (used > from && used < to) {          /* 只在可见段内保留样式 */
-                int n = e - i;
-                if (k + n < dstbs - 1) { for (int q = 0; q < n; q++) dst[k++] = src[i + q]; }
+            int n = e - i;
+            if (used < to) {
+                if (started) {
+                    if (k + n < dstbs - 1) { for (int q = 0; q < n; q++) dst[k++] = src[i + q]; }
+                } else {
+                    if (pk + n >= (int)sizeof(pend)) pk = 0;   /* 挤爆就重来：留最近这几个 */
+                    for (int q = 0; q < n && pk < (int)sizeof(pend) - 1; q++) pend[pk++] = src[i + q];
+                    pend[pk] = 0;
+                }
             }
             i = e;
             continue;
@@ -953,6 +970,11 @@ static void hcut(const char *src, char *dst, int dstbs, int from, int to) {
         int nc = used + w;
         if (used >= to) break;
         if (used >= from && nc <= to) {
+            if (!started) {
+                started = 1;
+                for (int q = 0; q < pk && k + 1 < dstbs - 1; q++) dst[k++] = pend[q];
+                dst[k] = 0; pk = 0;
+            }
             if (k + adv < dstbs - 1) { for (int q = 0; q < adv; q++) dst[k++] = src[i + q]; }
         }
         used = nc; i += adv;
@@ -1149,13 +1171,24 @@ static int hex_edit_popup_shown(int host_rows, int host_cols) {
  * 会被裁到行尾 ⇒ 标记正好压在最后一个【宽字符的右半格】上（56 列实测：「择」被挤成半角，
  * 整行显示宽度反而多出 1 列 ⇒ O/P 组判据红）。所以先按 settings_page_mark 的同一判据问一句
  * 「这一行会不会画标记」，会画就把它占的列从预算里扣掉。 */
+/* v2.2.0（用户 #2「条目管理中间有一段很大的空缺」的收尾）：一页可见带的高度只留一份式子。
+ * 通用式是「面板底行到页首」；条目管理页末尾钉了动作条 + 提示行两行（SETTINGS_MANAGE_TAIL），
+ * 所以这一页要少两行。原先只有 settings_page_band_raw 减了，页脚那个 "(3-11/12)" 标记没减
+ * ⇒ 标记报的行窗比画面宽两行，用户照着它去点第 10、11 行，那儿是按钮和提示，不是条目。
+ * 行窗、条子行程、命中反查、页脚标记四处现在都调这一支。 */
+static int settings_page_vis(int host_rows, int first, int last) {
+    int tot = last - first + 1;
+    int v = host_rows - first + 1;
+    if (g_settings_nav == SETTINGS_NAV_ITEMS) v -= SETTINGS_MANAGE_TAIL;
+    if (v < 3) v = 3;
+    if (v > tot) v = tot;
+    return v;
+}
+
 int settings_mark_room(int host_rows, int host_cols, int main_left, int row,
                        int first, int last) {
-    int tot = last - first + 1;
-    int vis = host_rows - first + 1;
-    if (vis < 3) vis = 3;
-    if (vis > tot) vis = tot;
-    if (tot <= vis) return 0;                       /* 页短到不用滚 ⇒ 不画标记 */
+    int vis = settings_page_vis(host_rows, first, last);
+    if (last - first + 1 <= vis) return 0;          /* 页短到不用滚 ⇒ 不画标记 */
     (void)main_left;
     int mleft = settings_mark_left(host_rows, host_cols, row, 9);   /* "(3-23/24)" = 9 列 */
     if (!mleft) return 0;                           /* 连标记都放不下 ⇒ 它不会画 */
@@ -1164,9 +1197,7 @@ int settings_mark_room(int host_rows, int host_cols, int main_left, int row,
 void settings_page_mark(char *out, int bs, int *posp, int row, int right_col, int host_rows,
                         int first, int last, int *scroll) {
     int tot = last - first + 1;
-    int vis = host_rows - first + 1;
-    if (vis < 3) vis = 3;
-    if (vis > tot) vis = tot;
+    int vis = settings_page_vis(host_rows, first, last);
     if (tot <= vis) return;
     int top = first + *scroll;
     if (top + vis - 1 > last) top = last - vis + 1;
@@ -1243,21 +1274,41 @@ static int settings_startup_last(int host_rows) {
 /* 条目管理页真正的末行：标题/说明/表头 + 每条两行余量里的 1 行 + 动作条 + 提示行。
  * v2.1.5：原先这里被 SETTINGS_MANAGE_LAST(26) 硬夹住，条目 ≥ 15 条时【动作条与最后几条】
  * 落在可见带之外，滚多少下都到不了（滚动条一加出来就暴露了）⇒ 改成按条目数算。 */
+/* 可滚范围的自然末行 = 最后一条条目（v2.2.0：动作条与提示行不再算在可滚内容里，
+ * 它们改由 settings_manage_bar_row() / settings_manage_hint_row() 定行 —— 见那两个函数的注释）。 */
 int settings_manage_last(void) {
-    int last = 12 + g_chooser_item_count;
+    int last = SETTINGS_MANAGE_ITEM0 + g_chooser_item_count - 1;
     if (last < SETTINGS_MANAGE_FIRST + 1) last = SETTINGS_MANAGE_FIRST + 1;
     return last;
 }
+/* v2.2.0（用户 #2：「条目管理中间有一段很大的空缺」）：
+ * 可见带底下两行固定留给动作条与提示行（窄终端 12 行时正好是第 10、11 行，面板底行另作
+ * 横条/状态用），条目一多它们就「钉」在那两行上，不跟着滚走；条目少的时候仍贴着列表末尾
+ * 画，所以既不会像以前那样空着 4 行，也不会把新建按钮顶到带外看不见 ——
+ * 「滚到底也找不到 [+] 新建条目」这件事从根上没有了（旧版在 12 行终端 + 「选中行必须可见」
+ * 的夹取之下，动作条是滚不出来的）。渲染与命中判定都调这两个函数，保证只有一份行号。 */
+int settings_manage_bar_row(int host_rows) {
+    int cap = host_rows - SETTINGS_MANAGE_TAIL + 1;
+    int r = SETTINGS_MANAGE_BAR(g_chooser_item_count) - g_settings_manage_scroll;
+    if (r < SETTINGS_MANAGE_FIRST) r = SETTINGS_MANAGE_FIRST;
+    return r > cap ? cap : r;
+}
+int settings_manage_hint_row(int host_rows) {
+    int cap = host_rows;
+    int r = SETTINGS_MANAGE_HINT(g_chooser_item_count) - g_settings_manage_scroll;
+    if (r < SETTINGS_MANAGE_FIRST) r = SETTINGS_MANAGE_FIRST;
+    return r > cap ? cap : r;
+}
 
 int settings_manage_row_view(int host_rows, int natural) {
-    int sel = (g_settings_table_sel >= 0) ? 10 + g_settings_table_sel : -1;
+    int sel = (g_settings_table_sel >= 0) ? SETTINGS_MANAGE_ITEM0 + g_settings_table_sel : -1;
     /* 横向：滚过界就夹回来（这一页没有「▶ 跟随」的必要——表很短）。 */
     int sbw = settings_host_sidebar_w(g_mux.host_cols);
     settings_hscroll_clamp(host_rows, g_mux.host_cols, sbw + 3,
                            settings_canvas_w(g_mux.host_cols, sbw + 3));   /* 与渲染同一个画布口径 */
-    int last = settings_manage_last();             /* 到提示行为止 —— 条目多了也要滚得到尾巴 */
-    int vis = host_rows - SETTINGS_MANAGE_FIRST + 1;
-    if (vis > last - SETTINGS_MANAGE_FIRST + 1) vis = last - SETTINGS_MANAGE_FIRST + 1;
+    int last = settings_manage_last();             /* 到最后一条条目为止（动作条/提示行不滚） */
+    /* v2.2.0：底下两行留给钉住的动作条与提示行 ⇒ 行窗与条子、命中、页脚标记同一支式子。 */
+    int vis = settings_page_vis(host_rows, SETTINGS_MANAGE_FIRST, last);
     int maxs = (last - SETTINGS_MANAGE_FIRST + 1) - vis;
     if (maxs < 0) maxs = 0;
     if (sel >= SETTINGS_MANAGE_FIRST && sel <= last) {
@@ -1276,9 +1327,8 @@ int settings_manage_row_view(int host_rows, int natural) {
 
 int settings_manage_natural_at(int host_rows, int row) {
     /* 与 settings_manage_row_view 互逆：屏幕行 → 自然行（命中判定用）。 */
-    int vis = host_rows - SETTINGS_MANAGE_FIRST + 1;
     int last = settings_manage_last();
-    if (vis > last - SETTINGS_MANAGE_FIRST + 1) vis = last - SETTINGS_MANAGE_FIRST + 1;
+    int vis = settings_page_vis(host_rows, SETTINGS_MANAGE_FIRST, last);
     if (row < SETTINGS_MANAGE_FIRST || row > SETTINGS_MANAGE_FIRST + vis - 1) return -1;
     int nat = row + g_settings_manage_scroll;
     if (nat < SETTINGS_MANAGE_FIRST || nat > last) return -1;
@@ -2218,7 +2268,11 @@ static int *settings_page_scroll_ptr(int nav) {
  * 不然用户把滑块拖到底，画面却停在中间，条子永远差那么几格。 */
 static int settings_page_sel_natural(int host_rows) {
     int nav = g_settings_nav;
-    if (nav == SETTINGS_NAV_ITEMS || nav == SETTINGS_NAV_STARTUP)
+    /* v2.2.0：这一页第一条条目从第 SETTINGS_MANAGE_ITEM0 自然行起（空缺填掉后行号变了），
+     * 启动项页仍是原来的第 10 行 —— 两页不再共用同一个数字。 */
+    if (nav == SETTINGS_NAV_ITEMS)
+        return (g_settings_table_sel >= 0) ? SETTINGS_MANAGE_ITEM0 + g_settings_table_sel : -1;
+    if (nav == SETTINGS_NAV_STARTUP)
         return (g_settings_table_sel >= 0) ? 10 + g_settings_table_sel : -1;
     if (nav == SETTINGS_NAV_APPEARANCE) return settings_appearance_sel_natural(host_rows);
     if (nav == SETTINGS_NAV_BEHAVIOR) return settings_behavior_sel_natural(host_rows);
@@ -2274,9 +2328,7 @@ static int settings_page_band_raw(int host_rows, int *first_o, int *tot_o, int *
     }
     tot = last - first + 1;
     if (tot < 1) return 0;
-    v = host_rows - first + 1;             /* 与 settings_page_row 同式（含 vis<3 兜底） */
-    if (v < 3) v = 3;
-    if (v > tot) v = tot;
+    v = settings_page_vis(host_rows, first, last);   /* 四处共用同一份式子 */
     *first_o = first; *tot_o = tot; *vis_o = v; *sc_o = sc;
     return 1;
 }
@@ -2350,9 +2402,14 @@ void settings_page_vset(int host_rows, int v) {
          * 窗口顶端：拖到哪儿就滚到哪儿，而且 ▶ 也跟着走，与滚轮同一套语义。 */
         int nat_off = lo + nv0;                       /* 这一页自己的滚动量（自然行口径） */
         int want_top = first + nat_off;
-        int selnat = want_top < 10 ? 10 : want_top;
-        if (selnat > 9 + g_chooser_item_count) selnat = 9 + g_chooser_item_count;
-        g_settings_table_sel = selnat - 10;
+        /* v2.2.0：这里的 10 / 9 是「第一条条目的自然行 - 1」，空缺填掉之后那个数是
+         * SETTINGS_MANAGE_ITEM0(=6) ⇒ 改成跟着常量走。写死 10 的时候，拖条子会把聚焦行
+         * 强行按回第 1 条（want_top < 10 全被夹成 10），于是「选中行必须可见」那一夹取
+         * 又把滚动量拽回来 —— 条子拖到底、画面只走两三行（Q2 就是抓的这个）。 */
+        int selnat = want_top < SETTINGS_MANAGE_ITEM0 ? SETTINGS_MANAGE_ITEM0 : want_top;
+        if (selnat > SETTINGS_MANAGE_ITEM0 - 1 + g_chooser_item_count)
+            selnat = SETTINGS_MANAGE_ITEM0 - 1 + g_chooser_item_count;
+        g_settings_table_sel = selnat - SETTINGS_MANAGE_ITEM0;
         *sc = nat_off;
         g_mux.needs_redraw = 1;
         return;
@@ -2563,7 +2620,7 @@ static void render_settings_items(char *out, int bs, int *posp, int host_rows, i
                              &g_bc, &g_ud, &g_btn);
     int h_on = (g_cw > host_cols - main_left - 1);
     int h_sc = h_on ? settings_hscroll() : 0;
-    int hr = settings_manage_row_view(host_rows, 9);
+    int hr = settings_manage_row_view(host_rows, SETTINGS_MANAGE_HEAD);
     if (hr > 0) {
         if (!h_on) {
             settings_line_begin(out, bs, &pos, hr, main_left, host_cols, "\x1b[038;2;121;192;255;1m");
@@ -2597,7 +2654,7 @@ static void render_settings_items(char *out, int bs, int *posp, int host_rows, i
     }
 
     /* 顶部动作条：[+] 新建条目 / [P] 快速预设库 */
-    int btn_r = settings_manage_row_view(host_rows, 10 + g_chooser_item_count + 1);
+    int btn_r = settings_manage_bar_row(host_rows);
     if (btn_r > 0) {
         /* 三段按钮：[+] 新建条目 / [P] 预设库 / [设为默认]。段间留 2 列，热区按
          * settings_manage_action_span() 逐段推出来（与渲染同一份宽度）。 */
@@ -2625,7 +2682,7 @@ static void render_settings_items(char *out, int bs, int *posp, int host_rows, i
         settings_line_end(out, bs, &pos);
     }
 
-    int hint_r = settings_manage_row_view(host_rows, 12 + g_chooser_item_count);
+    int hint_r = settings_manage_hint_row(host_rows);
     settings_line_begin(out, bs, &pos, hint_r, main_left, host_cols, "\x1b[038;2;139;148;158m");
     {
         /* 提示行自己也得留神：这一页的提示比别页长，窄终端（如 50 列）放不下时
@@ -2776,6 +2833,16 @@ static void append_clipped_utf8(char *out, int bs, int *posp, const char *s, int
  * 一个名字、←/→ 逐个换，既看不见有哪些、也看不见长什么样。改成 Enter/点击弹出
  * 完整列表：每行带 背景/前景/红/绿 四个色块预览，↑/↓ 或数字选中、Enter 应用。
  * 视觉语言与「常用命令行预设」浮层一致（同一套边框 + [Esc] 取消行）。 */
+/* v2.2.0（用户 #3：「预设方案 点击 GitHub Light 也可以打开预览」）：「预设方案」那一行上
+ * ‹ / › 两个箭头所在的【终端列】（1 基）。渲染那支 snprintf 的前缀是 " 预设方案  "（1+8+2 =
+ * 11 列）⇒ ‹ 在第 12 列（偏移 11）、名字占偏移 13~26、› 在偏移 28。命中判定必须用这两个数，
+ * 否则「看得见箭头的位置」和「点得着的位置」又分家（这毛病这仓库犯过好几次）。
+ * 改那一行的排版时，同步改这两个偏移 —— tests/verify_pane_palette.py 的 R20b 会把
+ * 「屏幕上 ‹› 实际落在第几列」量出来对着看。 */
+int settings_pane_scheme_arrow_col(int main_left, int which) {
+    return main_left + (which == 0 ? 11 : 28);
+}
+
 void pane_scheme_picker_geom(int host_rows, int host_cols, int *top, int *left, int *w, int *h) {
     int n = theme_pane_scheme_count();
     int pw = 44;
@@ -3161,7 +3228,7 @@ static void render_settings_pane(char *out, int bs, int *posp, int host_rows, in
         int hovered = (g_mouse_y == SETTINGS_PANE_SCHEME_ROW - 1 && g_mouse_x >= main_left - 1 && g_mouse_x < main_left - 1 + avail);
         int matched = theme_pane_scheme_matches(g_settings_pane_scheme);
         char line[128];
-        snprintf(line, sizeof(line), " 预设方案  ‹ %-14s ›  [选择…]  ←/→ 换  Enter 打开方案列表  %s",
+        snprintf(line, sizeof(line), " 预设方案  ‹ %-14s ›  [选择…]  点名字或 Enter 打开列表  ‹› 换  %s",
                  theme_pane_scheme_name(g_settings_pane_scheme), matched ? "● 已应用" : " ");
         pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH%s", SETTINGS_PANE_SCHEME_ROW, main_left, settings_row_style(sel_scheme, hovered));
         settings_tip_arm(SETTINGS_PANE_SCHEME_ROW, main_left);
@@ -3471,7 +3538,7 @@ void render_menu_rows(MenuRowCtx *rc) {
     int vmbtn = mbtn, vecol = ecol;
     int pos = *posp;
     for (int i = 0; i < g_chooser_item_count; i++) {
-        int r = rc->row_view(host_rows, 10 + i);
+        int r = rc->row_view(host_rows, SETTINGS_MANAGE_ITEM0 + i);   /* v2.2.0：见 config.h */
         if (r < 0) continue;
         int row_hover = (g_mouse_y == r - 1 && g_mouse_x >= main_left - 1 && g_mouse_x < host_cols);
         int row_focus = rc->show_ops ? (i == rc->sel) : 0;
@@ -3859,7 +3926,7 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
      * 第 2 条：删掉「默认：终端」那一行（条目管理页的标题里已经写着「当前默认：xxx」）。 */
     {
         static const char *const sb_label[SETTINGS_SB_NAT_ROWS + 1] = {
-            "", "  导航选项", "", "  %s   启动 (Startup)", "  [M] 条目管理",
+            "", "  导航选项", "", "  [S] 启动 (Startup)", "  [M] 条目管理",
             "  [A] 外观 / 主题", "  [K] 键位设置", "  [B] 行为开关", "  [W] 窗格配色",
             " [Ctrl+S] 保存配置",
         };
@@ -3883,12 +3950,13 @@ void render_settings_panel(char *out, int bs, int *posp, int host_rows, int host
             /* v2.1.6 第 3 条：六个入口一律同字色（不是一条一个颜色）。v2.1.9 用户第 4 条：
              * 名字要同列 —— 原先「▶ 启动」那行拿 1 格的 %s 去顶别人的 3 格 [X]，名字比其余
              * 条目靠左两格；而选中其它页时写成 " ▶[A] …"，▶ 直接和快捷键挤在一块儿。
-             * 现在一律「两格缩进 + 四格记号位 + 名字」，名字都从第 7 列起。 */
+             * 现在一律「两格缩进 + 四格记号位 + 名字」，名字都从第 7 列起。
+             * v2.2.0 用户 #1：这一行也给了快捷键 [S]（以前它连一个键都没有，而 [A] 那行写着
+             * 快捷键却根本没绑）⇒ 记号位与其它五格同形，选中时统一换成 ▶，不用再特判。 */
             char lab[64], fit[96];
-            int cur = (n == 3) ? (g_settings_nav == 0)
+            int cur = (n == 3) ? (g_settings_nav == SETTINGS_NAV_STARTUP)
                                : (navs[n] >= 0 && g_settings_nav == navs[n]);
-            if (n == 3) snprintf(lab, sizeof(lab), sb_label[3], cur ? "▶" : " ");
-            else if (cur) snprintf(lab, sizeof(lab), "  ▶   %s", sb_label[n] + 6);
+            if (cur) snprintf(lab, sizeof(lab), "  ▶   %s", sb_label[n] + 6);
             else snprintf(lab, sizeof(lab), "%s", sb_label[n]);
             /* 侧栏每行都必须停在分隔线之前（v2.1.3：写死的定宽串在 30 列终端上会折行，
              * 把侧栏自己的条目顶掉）。 */
@@ -5643,10 +5711,13 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
          * 视图直接跳到底部，松手后 limit 恢复了但 vo 已经丢了、翻不回去。
          * 症状就是用户报的「左右拖动分屏导致历史直接消失」。
          * 拖动期间干脆不夹不写回：视图位置保持稳定，松手后再按新宽度夹一次。 */
+        /* v2.2.0：这里以前在 split_drag_active() 时「不夹不写回」，因为那时拖动期间模型宽度
+         * 被冻结、与 rc->cols 不一致，按 rc->cols 算出的 limit 会把用户翻上去的
+         * scroll_offset 永久夹小（症状：「左右拖动分屏导致历史直接消失」）。现在拖动中
+         * 布局/模型/ConPTY 同帧一起改（节流挪到 split_set_frac_node 那一侧），两边宽度恒等
+         * ⇒ 按常规算 limit 就是对的，窄窗格里拖窄后多余的历史偏移该收就收。 */
         int lim_sc;
-        if (split_drag_active()) {
-            lim_sc = pane->scroll_offset;   /* 拖动中：不夹 */
-        } else {
+        {
             int rw = rc->cols < s->cols ? rc->cols : s->cols;
             int h = screen_reflow_height(s, rw);
             lim_sc = h - s->rows;
@@ -6037,11 +6108,12 @@ void render_screen(void) {
             WORD la_attr = 0xFFFF, la_fr = 0, la_br = 0; int la_fv = -1, la_bv = -1;
             if (pane->scroll_offset < 0) pane->scroll_offset = 0;
             if (pane->scroll_offset > 0) {
-                /* 同 render_split_pane：拖动分屏边框期间不夹取、不写回，否则
-                 * scroll_offset 会被一个与当前显示宽度无关的 limit 永久夹小，
-                 * 表现为「拖动分屏后历史翻不上去」。 */
+                /* 同 render_split_pane：v2.2.0 起这里不再有「拖动分屏期间不夹取」的特例 ——
+                 * 那条特例是为了躲「模型宽度被冻结、limit 却按新宽度算」把用户翻上去的
+                 * scroll_offset 永久夹小（症状「拖动分屏后历史翻不上去」）。现在节流挪到
+                 * 布局那一侧，拖动中两侧同帧变化，limit 与显示宽度本来就是一致的。 */
                 int lim_sc = pane->scroll_offset;
-                if (!split_drag_active()) {
+                {
                     int rw = g_mux.host_cols < s->cols ? g_mux.host_cols : s->cols;
                     int h = screen_reflow_height(s, rw);
                     lim_sc = h - s->rows;

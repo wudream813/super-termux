@@ -917,7 +917,7 @@ int main(int argc, char **argv) {
                 "Solarized Dark", "GitHub Light", "Dracula", "Nord"]),
            "")
         ck("J1 浮层带方框（顶边/底边都在）", "┌" in joined and "└" in joined, "")
-        ck("J1 方案行文案提示 Enter 打开列表", "Enter 打开方案列表" in joined, "")
+        ck("J1 方案行文案提示 Enter 打开列表", "Enter 打开列表" in joined, "")
         # 浮层每行要有真实色块预览（append_swatch 的形状：底色 SGR + 两空格 + 复位）。
         # 配置全空时窗格页本身不画色块，所以「标题之后」出现的色块只可能来自浮层。
         pi = j1.find("┌─ 窗格配色方案".encode())
@@ -1054,11 +1054,24 @@ int main(int argc, char **argv) {
            "five" not in m3a and "▶[5]  five" in m3b and "three" in m3b,
            "基线=%r 滚后=%r" % (m3a[-160:], m3b[-160:]))
         # v2.1.4：启动项页的 Enter 只设「启动默认」，进详情页要先 m 去条目管理页再 Enter。
-        m3c = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", wheel(60, 8, 3),
-                                                                      b"m", b"\r", wheel(60, 8, 2)],
-                                                              ini=ini3)) or [])
-        ck("M3 12 行 × 菜单项详情页：滚轮能滚到第 3 个字段（启动目录）",
-           "3. 启动目录" in m3c and "4. 启动默认颜色" not in m3a, "实际 %r" % m3c[:80])
+        # v2.2.0：这一条原先传的是 `ini=ini3` —— 那是 E3 用例剩下的「ini 文件内容」串，里面
+        # 根本没有 [menu] 段（0 条目），断言只是碰巧成立。现在给真正的三条 fixture，量的是
+        # 「详情页 17 行内容 vs 可见带 9 行 ⇒ 滚得动、滚到底能把按钮行露出来」：
+        # 12 行终端下基线能看见标题与前三个字段（第三个只剩标签，输入框被面板底切掉），
+        # 滚五下之后标题滚出屏、[保存并应用此项] 那一行进来。两个方向都比，防「滚了个空」。
+        ini_m3d = ("[menu]\n1 = sh, /bin/sh\n2 = two, /bin/bash\n3 = three, /bin/sh\n"
+                   "[general]\nanim = off\n")
+        m3c0 = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"m", b"\r"],
+                                                             ini=ini_m3d)) or [])
+        m3c = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"m", b"\r",
+                                                                      wheel(60, 8, 5)],
+                                                             ini=ini_m3d)) or [])
+        ck("M3 12 行 × 菜单项详情页：基线可见标题 + 前三个字段而按钮在带外；滚五下 ⇒ "
+           "标题滚出屏、[保存并应用此项] 进来（这一页 17 行内容 / 可见带 9 行）",
+           "■ 菜单项详细配置" in m3c0 and "[保存并应用此项]" not in m3c0
+           and "1. 显示名称" in m3c0 and "3. 启动目录" in m3c0
+           and "■ 菜单项详细配置" not in m3c and "[保存并应用此项]" in m3c,
+           "基线=%r 滚后=%r" % (m3c0[:200], m3c[:200]))
         # M4 窗格配色页滚轮
         m4a = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"W"])) or [])
         m4 = "\n".join(vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"W", wheel(60, 8, 7)])) or [])
@@ -1473,10 +1486,13 @@ int main(int argc, char **argv) {
            q0 != qdt and "\u8bbe\u4e3a\u9ed8\u8ba4" in "\n".join(qdt)
            and max(dn) > max(up + [-1]) and max(up) >= 0,
            "上段=%r 下段=%r" % (up, dn))
+        # v2.2.0：条目管理页可见带底下两行钉给动作条与提示行 ⇒ 轨道的最后一格从第 11 行
+        # 挪到第 9 行（行窗 3..9 共 7 行；第 10、11 行现在是按钮与提示，点它们是点按钮，
+        # 不是点轨道）。点轨道下端 = 往下翻一页 = 行窗跳到 natural 8..14 ⇒ [5] 进来。
         qt = vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"m",
-                      b"\x1b[<0;100;11M\x1b[<35;100;11M"], ini=qini9)) or []
-        ck("Q3 点轨道下端 = 往下翻一页（不用按住拖也能滚）",
-           q0 != qt and "[5]" in "\n".join(qt), "点完=%r" % "\n".join(qt)[-90:])
+                      b"\x1b[<0;100;9M\x1b[<35;100;9M"], ini=qini9)) or []
+        ck("Q3 点轨道下端（第 9 行 = 这一页可见带的末行）= 往下翻一页（不用按住拖也能滚）",
+           q0 != qt and "[5]" in "\n".join(qt), "点完=%r" % "\n".join(qt)[120:400])
         qw = vt_text(24, 80, capture_page_keys(24, 80, [b"\x02s", b"m"], ini=qini9)) or []
         ck("Q4 24 行 × 80 列（基准档）：这一页装得下 ⇒ 最右一列不许常驻一条，80 列排版不变",
            not any(c in ("\u2588", "\u2502") for c in qbars(qw, 3, 24, 80))
@@ -1542,9 +1558,16 @@ int main(int argc, char **argv) {
            and "[W] 窗格配色" not in "\n".join(qs) and "[W] 窗格配色" in "\n".join(qsw),
            "分隔线列=%d 底色=%r 基线=%r 滚后=%r" % (dcol, sb6, "\n".join(qs)[-120:], "\n".join(qsw)[-120:]))
         qf = vt_text(12, 100, capture_page_keys(12, 100, [b"\x02s", b"m", b"\x1b[B" * 8], ini=qini9)) or []
-        ck("Q7 12 行 × 条目管理页：连按 ↓ 时行窗跟着聚焦行走（滚到聚焦位置，不是把 ▶ 顶出屏幕）",
-           "[9]" not in "\n".join(q0) and "\u25b6[9]" in "\n".join(qf)
-           and "[1]  项目01" in "\n".join(qf), "按8次↓=%r" % "\n".join(qf)[-90:])
+        qfj = "\n".join(qf)
+        qi9 = next((i for i, l in enumerate(qf) if "\u25b6[9]" in l), -1)
+        # v2.2.0：可见带底下两行给了动作条/提示行 ⇒ 12 行终端里一屏少装两条，滚到第 9 条时
+        # 第 1 条出屏是应该的；这一条守的是「行窗跟着聚焦行走」：▶ 落在可见带末行（第 9 行），
+        # 并且它下面紧接的一行就是钉住的动作条（不是又一屏条目，也不是空缺）。
+        ck("Q7 12 行 × 条目管理页：连按 ↓ 时行窗跟着聚焦行走（▶[9] 停在可见带末行第 9 行，"
+           "下一行就是动作条，不把 ▶ 顶出屏幕）",
+           "\u25b6[9]" in qfj and qi9 == 8 and qi9 + 1 < len(qf) and "新建条目" in qf[qi9 + 1]
+           and "[1]  项目01" not in qfj and "[3]  项目03" in qfj,
+           "▶ 行号=%d 按8次↓=%r" % (qi9 + 1, qfj[120:420]))
 
     # ================== R 组：切页 / 浮层的过渡动画（v2.1.7）==================
     # 「没那么生硬」和「别太长」都是主观话，落到判据上只有四件事：
@@ -2232,6 +2255,230 @@ int main(int argc, char **argv) {
        and all(dispw(l) <= COLS_C for l in bar_scr),
        "铺到 %d 列（分隔线 0 基列 %d）行宽越界=%r"
        % (w_bar, bar_col, [i + 1 for i, l in enumerate(bar_scr) if dispw(l) > COLS_C]))
+
+    # ================= v2.2.0：用户这轮报的五件事 =================
+    # 规矩沿用：行号/列号一律从屏上量；屏幕量不到就 [SKIP]，绝不让判据自己把作业带崩
+    # （v2.1.9 的 macOS 作业就是这么红的，教训记在 README 的回归判据那一行）。
+    r20_ini = ("[menu]" + chr(10) + "1 = sh, /bin/sh" + chr(10)
+               + "2 = two, /bin/bash" + chr(10) + "3 = three, /bin/sh" + chr(10)
+               + "[general]" + chr(10) + "anim = off" + chr(10))
+    R20_TITLES = {"启动": "■ 默认启动项设置", "条目": "■ 条目管理", "外观": "■ 配色主题",
+                  "键位": "■ 键位", "行为": "■ 行为", "窗格": "■ 窗格配色"}
+
+    def r20_page(lines):
+        for l in lines or []:
+            for k, v in R20_TITLES.items():
+                if v in l:
+                    return k
+        return ""
+
+    for r20_lbl, r20_keys, r20_want in [
+            ("启动页按 A 去外观页", [b"\x02s", b"a"], "外观"),
+            ("从键位页按 F1 回启动页", [b"\x02s", b"k", b"\x1bOP"], "启动"),
+            ("从行为页按 S 回启动页", [b"\x02s", b"b", b"s"], "启动"),
+            ("从外观页（F2 进的）按 F1 回启动页", [b"\x02s", b"\x1bOQ", b"\x1bOP"], "启动")]:
+        r20_scr = vt_text(ROWS_C, COLS_C, capture_page_keys(ROWS_C, COLS_C, r20_keys,
+                                                            ini=r20_ini)) or []
+        rA_ck("R20a 设置页快捷键：%s ⇒ 停在「%s」页" % (r20_lbl, r20_want),
+              r20_page(r20_scr) == r20_want,
+              "实测页=%r 屏首行=%r" % (r20_page(r20_scr), (r20_scr[:3] or ["<空>"])[0][:36]))
+    r20_it = vt_text(ROWS_C, COLS_C, capture_page_keys(ROWS_C, COLS_C,
+                                                       [b"\x02s", b"m", b"s"], ini=r20_ini)) or []
+    rA_ck("R20b 条目管理页的 S 仍是本页动作「设为启动默认」，没被导航抢走（按完还在这一页）",
+          r20_page(r20_it) == "条目", "实测页=%r" % r20_page(r20_it))
+    r20_m = vt_text(ROWS_C, COLS_C, capture_page_keys(ROWS_C, COLS_C, [b"\x02s", b"m"],
+                                                      ini=r20_ini)) or []
+    r20_rows = rA_side_rows(r20_m)
+    r20_cols = {v[1] for v in r20_rows.values()}
+    r20_lab = next((l.split("│")[0].rstrip() for l in r20_m if "启动 (Startup)" in l), "")
+    rA_ck("R20c 侧栏那一栏给启动页写上了快捷键（实测 %r）：六个入口名字仍同列（第 %s 列）"
+       % (r20_lab.strip(), sorted(r20_cols)),
+          len(r20_rows) == len(NAMES) and "[S] 启动 (Startup)" in r20_lab
+          and len(r20_cols) == 1 and bool(r20_cols) and min(r20_cols) == 7,
+          "各入口名字列=%r" % ({k: v[1] for k, v in sorted(r20_rows.items())},))
+
+    # R21（用户 #2「条目管理中间有一段很大的空缺」）：说明行与表头必须相邻，动作条与提示行
+    # 钉在可见带底下（旧版把 5~8 行空着，而且条目一多动作条就滚不出来）。
+    r21_ini9 = "[menu]" + chr(10) + "".join("%d = 项目%02d, /bin/sh" % (i, i) + chr(10)
+                                           for i in range(1, 10)) + "[general]" + chr(10) + "anim = off" + chr(10)
+    for r21_rows in (12, ROWS_C):
+        r21_scr = vt_text(r21_rows, COLS_C, capture_page_keys(r21_rows, COLS_C, [b"\x02s", b"m"],
+                                                              ini=r21_ini9)) or []
+        r21_txt = "\n".join(r21_scr)
+        r21_title = next((i + 1 for i, l in enumerate(r21_scr) if "■ 条目管理" in l), 0)
+        r21_desc = next((i + 1 for i, l in enumerate(r21_scr) if "启动菜单的项目" in l), 0)
+        r21_head = next((i + 1 for i, l in enumerate(r21_scr)
+                         if "序号" in l and "显示名称" in l), 0)
+        r21_bar = next((i + 1 for i, l in enumerate(r21_scr) if "新建条目" in l), 0)
+        r21_hint = next((i + 1 for i, l in enumerate(r21_scr) if "提示: ↑/↓" in l), 0)
+        # 页脚那截 "(3-9/12)" 报的是可见带的自然行号。带钉了两行 ⇒ 它必须与「页首到动作条
+        # 之上」这一段的行数一致（旧版这里报 9 行、画面只有 7 行，用户照着它去点第 10、11 行，
+        # 那儿是按钮和提示；行窗短到不用滚时整截标记不画，此时末条与动作条都要在屏内）。
+        r21_m = re.search(r"\((\d+)-(\d+)/(\d+)\)", r21_scr[r21_hint - 1] if r21_hint else "")
+        if r21_m:
+            r21_ok = (int(r21_m.group(2)) - int(r21_m.group(1)) + 1
+                      == (r21_bar - r21_title if r21_title and r21_bar else -1))
+            r21_d = "标记=%s 屏上带=%d..%d（%d 行）" % (r21_m.group(0), r21_title,
+                                                    max(r21_title, r21_bar - 1),
+                                                    r21_bar - r21_title)
+        else:
+            r21_ok = r21_bar > 0 and "项目09" in r21_txt and r21_title > 0
+            r21_d = "没画标记（页放得下）：末条在屏=%r 动作条=%d" % ("项目09" in r21_txt, r21_bar)
+        rA_ck("R21 %d×%d 条目管理页：说明行第 %d 行与表头第 %d 行之间没有空缺，动作条（第 %d 行）"
+              "与提示行（第 %d 行）钉在可见带底下，页脚行窗读数与画面一致"
+              % (r21_rows, COLS_C, r21_desc, r21_head, r21_bar, r21_hint),
+              r21_desc == r21_title + 1 and r21_head == r21_desc + 1 and r21_bar > 0
+              and r21_hint == r21_bar + 1 and all(dispw(l) <= COLS_C for l in r21_scr)
+              and r21_ok,
+              "标题=%d %s 越界行=%r" % (r21_title, r21_d,
+                                  [i + 1 for i, l in enumerate(r21_scr) if dispw(l) > COLS_C]))
+
+    # R22（用户 #5「[+] 新建条目 没有前景色、背景色、没有 hover 色」）：根因在 hcut ——
+    # 落在窗口左边界那一格上的 SGR 被整段丢掉，于是「一行的第一个带色段」只剩正文。
+    # 量法：直接看字节流里「新建条目」前面那截，未 hover 必须有 48;2 + 38;2，划过去还得换色。
+    def r22_seg(data, needle):
+        """最后一个落在屏上的 needle 之前那 220 字节（行首样式就在那儿）。"""
+        if not data or not needle:
+            return b""
+        j = (data or b"").rfind(needle)
+        return data[max(0, j - 220):j] if j >= 0 else b""
+
+    r22_nd = "新建条目".encode()
+    r22_off = capture_page_keys(12, COLS_C, [b"\x02s", b"m"], ini=r21_ini9)
+    r22_scr = vt_text(12, COLS_C, r22_off) or []
+    r22_row = next((i + 1 for i, l in enumerate(r22_scr) if "新建条目" in l), 0)
+    r22_col = 0
+    for l in r22_scr:
+        if "新建条目" in l and "[+]" in l:
+            r22_col = dispw(l[:l.find("[+]")])
+            break
+    r22_s0 = r22_seg(r22_off, r22_nd)
+    r22_s0 = r22_seg(r22_off, r22_nd)
+    r22_hv = capture_page_keys(12, COLS_C, [b"\x02s", b"m",
+              ("\x1b[<35;%d;%dM" % (r22_col + 3, r22_row)).encode()], ini=r21_ini9) if r22_row else b""
+    r22_s1 = r22_seg(r22_hv, r22_nd) if r22_hv else b""
+
+    def r22_bg(seg):
+        """needle 前最后一段 48;2 —— 那就是这个标签自己的底色（更早的那些是别段的）。"""
+        f = re.findall(rb"48;2;(\d{1,3});(\d{1,3});(\d{1,3})", seg or b"")
+        return tuple(int(x) for x in f[-1]) if f else None
+
+    r22_bg0, r22_bg1 = r22_bg(r22_s0), r22_bg(r22_s1)
+    rA_ck("R22 条目管理页的「[+] 新建条目」有前景色也有背景色（实测 %r），划过去换成 %r（hover 有效）"
+       % (r22_bg0, r22_bg1),
+          r22_row > 0 and b"48;2;" in r22_s0 and b"38;2;" in r22_s0
+          and r22_bg0 is not None and r22_bg1 is not None and r22_bg1 != r22_bg0,
+          "未 hover 前缀=%r hover 前缀=%r" % (r22_s0[-56:], r22_s1[-56:]))
+
+    # R23（用户 #3「预设方案 点 GitHub Light 也可以打开预览」）：点名字 = 打开列表并把光标
+    # 停在当前方案上；上一个/下一个只留 ‹ › 两个箭头那一格。箭头列位还要与渲染对得上
+    # （settings_pane_scheme_arrow_col 那两个偏移是从排版式子里数出来的，漂了就红）。
+    r23_ini = "[general]" + chr(10) + "anim = off" + chr(10)
+    r23_off = capture_page_keys(ROWS_C, COLS_C, [b"\x02s", b"w"], ini=r23_ini)
+    r23_scr = vt_text(ROWS_C, COLS_C, r23_off) or []
+    r23_row = r23_ml = 0
+    r23_al = r23_ar = -1
+    r23_name0 = ""
+    for i, l in enumerate(r23_scr):
+        if "预设方案" in l and "\u2039" in l and "\u203a" in l:
+            r23_row = i + 1
+            r23_ml = dispw(l[:l.index("预设方案")])
+            r23_al = dispw(l[:l.index("\u2039")]) + 1
+            r23_ar = dispw(l[:l.index("\u203a")]) + 1
+            mm = re.search("\u2039\\s*(.+?)\\s*\u203a", l)
+            r23_name0 = mm.group(1).strip() if mm else ""
+            break
+
+    def r23_click(col, extra=()):
+        seq = [b"\x02s", b"w"] + list(extra)
+        if col > 0 and r23_row > 0:
+            seq.append(("\x1b[<0;%d;%dM\x1b[<0;%d;%dm" % (col, r23_row, col, r23_row)).encode())
+        return vt_text(ROWS_C, COLS_C, capture_page_keys(ROWS_C, COLS_C, seq, ini=r23_ini)) or []
+
+    r23_name_scr = r23_click(r23_ml + 16)
+    r23_arr_scr = r23_click(r23_al)
+    r23_joined = "\n".join(r23_name_scr)
+    mm2 = re.search("\u2039\\s*(.+?)\\s*\u203a", "\n".join(r23_arr_scr))
+    r23_name1 = mm2.group(1).strip() if mm2 else ""
+    rA_ck("R23a 「预设方案」行上 ‹ › 的实际列位与命中口径一致（第 %d / %d 列，main_left=%d + 11 / + 28）"
+       % (r23_al, r23_ar, r23_ml),
+          r23_row > 0 and r23_al == r23_ml + 11 and r23_ar == r23_ml + 28,
+          "行号=%d ‹=%d ›=%d" % (r23_row, r23_al, r23_ar))
+    rA_ck("R23b 点方案名（第 %d 列，「%s」那一段）= 打开方案列表浮层，光标停在当前那条上"
+       % (r23_ml + 16, r23_name0),
+          "窗格配色方案" in r23_joined and r23_name0 in r23_joined,
+          "屏=%r" % [l.strip()[:44] for l in r23_name_scr[3:8]])
+    rA_ck("R23c 点 ‹ 那一格仍是「上一个方案」：浮层不开、名字从「%s」变成「%s」"
+       % (r23_name0, r23_name1),
+          r23_name0 and r23_name1 and r23_name1 != r23_name0
+          and "窗格配色方案" not in "\n".join(r23_arr_scr),
+          "浮层=%r" % ("窗格配色方案" in "\n".join(r23_arr_scr)))
+
+    # R24（用户 #4「拖动分隔条时改成即时修改渲染」）：量的不是画面，是子 pty 的宽度 ——
+    # pane_resize_to 里 TIOCSWINSZ / ResizePseudoConsole 与本地 screen_resize 同帧，
+    # 所以「拖动途中 stty size 的列数就变了」= 模型跟上了布局 = 画面在拖动中就重排。
+    # 旧版把两侧一起冻结到松手（那是当年修「一次拖动把 hist 从 93 吃成 0」的做法），
+    # 拖动途中列数一动不动 ⇒ 这一条必须红。
+    if os.name == "posix":
+        r24_ini = "[general]" + chr(10) + "anim = off" + chr(10)
+        r24_rows = 12
+
+        def r24_ch(line, col):
+            """0 基显示列上的字符（宽字符占两格，右半格算同一字符）。"""
+            acc = 0
+            for ch in line:
+                if acc >= col:
+                    return ch
+                acc += 2 if ord(ch) > 0x2E80 else 1
+            return " "
+
+        def r24_cols(lines):
+            """分屏后焦点在右窗格（实测：新建窗格才拿到键盘），所以 stty 的回显在最后一根
+            分隔线右边；用 rsplit 而不是「上次那根分隔线列」，拖动之后分隔线挪了也读得到。"""
+            out = []
+            for l in lines or []:
+                tail = l.rsplit("\u2502", 1)[-1] if "\u2502" in l else l
+                mm = re.fullmatch(r"\s*(\d{1,2}) (\d{1,3})\s*", tail)
+                if mm:
+                    out.append(int(mm.group(2)))
+            return out
+
+        def r24_divider(lines):
+            best, bc = 0, 0
+            for c in range(6, COLS_C - 6):
+                n = sum(1 for l in lines[2:r24_rows - 1] if r24_ch(l, c) == "\u2502")
+                if n > best:
+                    best, bc = n, c
+            return bc if best >= r24_rows - 4 else 0
+
+        r24_base = [b"\x02-", b"stty size\r"]
+        r24_a = vt_text(r24_rows, COLS_C, capture_page_keys(r24_rows, COLS_C, r24_base,
+                                                            ini=r24_ini)) or []
+        r24_d = r24_divider(r24_a)
+        r24_c0 = r24_cols(r24_a)
+        if r24_d <= 0 or len(r24_c0) < 1:
+            print("  [SKIP] R24 拖动即时重排 —— 这一屏没找到分隔线或 stty 输出（分屏不可用？）")
+        else:
+            # 按住分隔线往左拖 6 格：右窗格该一格格变宽（每格一次 capture_page_keys 边界，
+            # 间隔远大于 90ms 节流 ⇒ 每一格都该被采纳）。松手前就量一次，松手后再量一次。
+            r24_press = ("\x1b[<0;%d;5M" % (r24_d + 1)).encode()
+            r24_mv = [("\x1b[<32;%d;5M" % (r24_d + 1 - k)).encode() for k in range(1, 7)]
+            r24_rel = ("\x1b[<0;%d;5m" % (r24_d + 1 - 6)).encode()
+            # 一次跑完：拖到位 → 先量（还按着）→ 松手 → 再量。同一场拖动里两个读数才可比。
+            r24_b = vt_text(r24_rows, COLS_C, capture_page_keys(
+                r24_rows, COLS_C, r24_base + [r24_press] + r24_mv
+                + [b"stty size\r", r24_rel, b"stty size\r"], ini=r24_ini)) or []
+            r24_c = r24_cols(r24_b)
+            r24_d2 = r24_divider(r24_b)
+            rA_ck("R24 按住分隔条往左拖 6 格：没松手右窗格就已经从 %d 列变到 %d 列（子 pty 的 "
+                  "stty size 跟着变 ⇒ 布局、模型、ConPTY 同帧一起改，不用等松手）；松手后停在 "
+                  "%d 列、分隔线也从第 %d 列挪到第 %d 列（拖动中的画面与模型一起走）"
+                  % (r24_c0[-1], r24_c[1] if len(r24_c) >= 2 else -1,
+                     r24_c[2] if len(r24_c) >= 3 else -1, r24_d + 1, r24_d2 + 1),
+                  len(r24_c) >= 3 and r24_c[1] > r24_c0[-1] and r24_c[2] == r24_c[1]
+                  and 0 < r24_d2 < r24_d,
+                  "拖前=%r 拖中/松手=%r 分隔线 0 基列 %d → %d"
+                  % (r24_c0, r24_c, r24_d, r24_d2))
 
     # 窄屏：横滑期间的裁剪必须仍守得住屏宽（右侧被裁掉是设计，越界折行不是）
     for rows, cols in ((24, 40), (12, 100)):
