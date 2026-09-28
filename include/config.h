@@ -41,6 +41,10 @@ extern int g_copy_move_deselect;  /* 复制模式无 Shift/Alt 移动时丢弃�
 extern int g_confirm_on_exit;        /* 退出 termux 前是否二次确认 */
 extern int g_confirm_on_close;       /* 关闭窗格 / 标签前是否二次确认 */
 extern int g_search_case_sensitive;  /* 搜索是否锁定大小写（区分大小写） */
+/* v2.3.0：`[general] session = on` ⇒ 退出时把每个窗格的文本历史 + 标签/分屏树写进快照文件，
+ * 下次启动读回来（默认 off ⇒ 既不写也不读，与 v2.2.0 行为一致）。这不是常驻后台进程：
+ * 关掉的那段时间里没有任何东西在跑，见 include/session.h。 */
+extern int g_session_persist;
 extern int g_anim_ms;                /* 设置页过渡动画时长 ms；0 = 关（ini `anim`） */
 extern int g_settings_show_presets;
 extern int g_preset_sel;
@@ -79,6 +83,12 @@ extern const int g_preset_count;
 
 void init_default_config(void);
 void load_config(void);
+/* v2.3.0：会话快照文件的路径。与 ini 走【同一套】定位规则（exe 旁边优先，读不到再退
+ * 用户主目录下的点文件），单独写一遍就会出现「ini 在 A、session 在 B」这种两边找不到对方。
+ * for_write=1 时不做「存在性」探测（要写的文件本来就不存在）。 */
+void config_sibling_path(WCHAR *out, int out_len, int for_write,
+                         const WCHAR *next_to_exe, const WCHAR *in_home);
+
 void save_config(void);
 int config_parse_bool(const char *val, int fallback);
 

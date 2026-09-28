@@ -3805,6 +3805,7 @@ static void render_settings_behavior(char *out, int bs, int *posp, int host_rows
         {"confirm_on_exit", "退出 termux 前二次确认",             g_confirm_on_exit},
         {"confirm_on_close", "关闭窗格 / 标签前二次确认",          g_confirm_on_close},
         {"search_case_sensitive", "搜索锁定大小写（区分大小写）",  g_search_case_sensitive},
+        {"session",           "退出时保存会话（下次启动恢复历史与布局）", g_session_persist},
     };
     for (int i = 0; i < SETTINGS_BEHAVIOR_TOGGLES; i++) {
         int row = settings_behavior_row_view(host_rows, SETTINGS_BEHAVIOR_ROW0 + i);

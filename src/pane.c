@@ -5,6 +5,7 @@
 #endif
 #include "render.h"
 #include "input.h"
+#include "session.h"
 #include "split.h"
 
 /* input.c 定义：分屏全屏缩放（zoom）标志。窗格死亡时若处于 zoom 需要清掉。 */
@@ -22,6 +23,9 @@ void write_to_pane(const char *data, int len) {
 
 void pane_mark_dead(int idx) {
     if (idx < 0 || idx >= MAX_PANES) return;
+    /* v2.3.0（session = on）：紧接着就要 split_remove_pane() 改树、并会在 close_pane() 里把这个
+     * 窗格的屏 free 掉 ⇒ 这是最后一个「分屏树和所有窗格的历史都还完整」的瞬间。 */
+    session_note_now();
     EnterCriticalSection(&g_mux.cs);
     Pane *pane = &g_mux.panes[idx];
     if (!pane->active) { LeaveCriticalSection(&g_mux.cs); return; }
@@ -517,6 +521,7 @@ int open_settings_pane(void) {
 void close_pane(int idx) {
     if (idx < 0 || idx >= g_mux.pane_count) return;
     Pane *pane = &g_mux.panes[idx];
+    session_note_now();   /* v2.3.0：下面 screen_free(&pane->screen) 之前，把还没采到的窗格留下 */
 
     EnterCriticalSection(&g_mux.cs);
     if (!pane->active && !pane->read_thread) { LeaveCriticalSection(&g_mux.cs); return; }

@@ -20,6 +20,7 @@ int g_copy_move_deselect = 1;
 int g_confirm_on_exit = 0;
 int g_confirm_on_close = 0;
 int g_search_case_sensitive = 0;
+int g_session_persist = 0;        /* v2.3.0：`session = on` ⇒ 退出时存会话、下次启动恢复 */
 /* v2.1.7/8：终端只能整格重绘、没有半透明，所以「淡入」只能靠几帧之间把写给终端的颜色
  * 整体向页面底色混合来模拟 —— 时长也就只能是帧的倍数（动画期间约 8~15ms 一帧，实测
  * 110ms 出 7 档）。默认 110ms：够看出方向，又短到不会让人觉得要点一下等一下。
@@ -121,6 +122,7 @@ void init_default_config(void) {
     g_confirm_on_exit = 0;
     g_confirm_on_close = 0;
     g_search_case_sensitive = 0;
+    g_session_persist = 0;              /* 默认关：不碰任何人的现有行为 */
     theme_init();
     keymap_init();
 #ifdef _WIN32
@@ -203,6 +205,7 @@ static int apply_general_key(const char *key, const char *val) {
     if (_stricmp(key, "confirm_on_exit") == 0) { g_confirm_on_exit = config_parse_bool(val, 0); return 1; }
     if (_stricmp(key, "confirm_on_close") == 0) { g_confirm_on_close = config_parse_bool(val, 0); return 1; }
     if (_stricmp(key, "search_case_sensitive") == 0) { g_search_case_sensitive = config_parse_bool(val, 0); return 1; }
+    if (_stricmp(key, "session") == 0)  { g_session_persist = config_parse_bool(val, 0); return 1; }
     if (_stricmp(key, "anim") == 0) {
         /* off/none 与 0 都是关；写个认不出来的单词时不要把它当成 0 关掉动画，
          * 按默认走 —— 用户手打 ini 打错字是常事，静默关掉功能最难查。 */
@@ -219,25 +222,32 @@ static int apply_general_key(const char *key, const char *val) {
     return 0;
 }
 
-static void resolve_ini_path(WCHAR *out, int out_len, int for_write) {
+/* v2.3.0：ini 与会话快照共用这一支定位（原先是 resolve_ini_path 内部写死的一串）。
+ * 「exe 旁边那份优先，否则用用户主目录下的点文件」—— 两处各写一遍迟早会漂。 */
+void config_sibling_path(WCHAR *out, int out_len, int for_write,
+                         const WCHAR *next_to_exe, const WCHAR *in_home) {
     WCHAR exe_path[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, exe_path, MAX_PATH);
     WCHAR *last_bs = wcsrchr(exe_path, TERMUX_PATH_SEP);
     if (last_bs) {
         *last_bs = 0;
-        _snwprintf(out, out_len - 1, L"%s" TERMUX_PATH_SEP_S L"termux.ini", exe_path);
+        _snwprintf(out, out_len - 1, L"%s" TERMUX_PATH_SEP_S L"%s", exe_path, next_to_exe);
     } else {
-        wcsncpy(out, L"termux.ini", out_len - 1);
+        wcsncpy(out, next_to_exe, out_len - 1);
     }
     if (for_write) return;
     if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return;
     const WCHAR *prof = plat_user_home();
     if (prof) {
-        WCHAR user_ini[MAX_PATH] = {0};
-        _snwprintf(user_ini, MAX_PATH - 1, L"%s" TERMUX_PATH_SEP_S L".termux.ini", prof);
-        if (GetFileAttributesW(user_ini) != INVALID_FILE_ATTRIBUTES)
-            wcsncpy(out, user_ini, out_len - 1);
+        WCHAR alt[MAX_PATH] = {0};
+        _snwprintf(alt, MAX_PATH - 1, L"%s" TERMUX_PATH_SEP_S L"%s", prof, in_home);
+        if (GetFileAttributesW(alt) != INVALID_FILE_ATTRIBUTES)
+            wcsncpy(out, alt, out_len - 1);
     }
+}
+
+static void resolve_ini_path(WCHAR *out, int out_len, int for_write) {
+    config_sibling_path(out, out_len, for_write, L"termux.ini", L".termux.ini");
 }
 
 static void trim_tail(char *s) {
@@ -387,7 +397,9 @@ void save_config(void) {
         "[general]\r\n"
         "# theme: github-dark | one-dark | nord | gruvbox-dark | dracula\r\n"
         "# prefix: 前缀键，C- = Ctrl，M- = Alt，S- = Shift，例如 C-a\r\n"
-        "# anim: 设置页过渡动画 off | short | normal（也可写毫秒数，上限 600）\r\n";
+        "# anim: 设置页过渡动画 off | short | normal（也可写毫秒数，上限 600）\r\n"
+        "# session: on ⇒ 退出时把会话（各窗格已滚出去的历史 + 标签与分屏布局）写进\r\n"
+        "#          termux.session，下次启动灌回来（进程本身不保留，见 README）\r\n";
     fwrite(header, 1, strlen(header), f);
 
     len = snprintf(buf, sizeof(buf),
@@ -399,6 +411,7 @@ void save_config(void) {
         "confirm_on_exit = %s\r\n"
         "confirm_on_close = %s\r\n"
         "search_case_sensitive = %s\r\n"
+        "session = %s\r\n"
         "anim = %s\r\n"
         "default_startup = %d\r\n\r\n",
         theme_name(), keymap_prefix_text(), g_scrollback_lines,
@@ -407,6 +420,7 @@ void save_config(void) {
         g_confirm_on_exit ? "true" : "false",
         g_confirm_on_close ? "true" : "false",
         g_search_case_sensitive ? "true" : "false",
+        g_session_persist ? "true" : "false",
         anim_ini_text(),
         g_default_startup);
     if (len > 0) fwrite(buf, 1, len, f);

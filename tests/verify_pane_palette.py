@@ -418,6 +418,110 @@ def capture_page_keys(rows, cols, keys, ini=None, keep_ini=False):
     return (bytes(got), ini_txt) if keep_ini else bytes(got)
 
 
+# ==== v2.3.0：会话存盘/恢复的真往返 ====
+# capture_page_keys 的收尾是 SIGKILL + rmtree：SIGKILL 不跑退出钩子（⇒ 会话文件根本不会写），
+# rmtree 又把目录清掉（⇒ 没地方跑第二轮）。所以这一组自己开目录、跑两次、中间读文件。
+def sess_mkdir(ini_text):
+    """临时目录：里面放一份 exe + 一份 termux.ini，返回目录路径（调用方负责删）。"""
+    td = tempfile.mkdtemp(prefix="termux_session_")
+    exe = os.path.join(td, "termux")
+    shutil.copy2(EXE, exe)
+    os.chmod(exe, 0o755)
+    with open(os.path.join(td, "termux.ini"), "w", encoding="utf-8") as f:
+        f.write(ini_text)
+    return td
+
+
+def sess_run(td, rows, cols, keys, quit_keys=(b"\x02d",), exit_wait=12.0):
+    """在【已存在的】目录里起一次 termux：发完 keys 后【先存一份屏幕字节】，再发 quit_keys
+    等它自己退出。返回 (退出前最后一帧的字节, 是否正常退出)。
+
+    两个非做不可的理由：
+      - 会话文件是在退出钩子里写的 ⇒ 必须让进程自己走完（capture_page_keys 那种 SIGKILL
+        收尾根本不会跑退出钩子）；
+      - 干净退出时 termux 会退出备用屏，于是整段字节流的【末尾】是「退出后的宿主屏幕」，
+        拿它当「程序界面」判会量到空屏（v2.3.0 第一版就这样误判过：右窗格明明恢复了，
+        needle 却找不到）。所以量屏幕一律用发出退出键【之前】的那一帧。
+    窗格关闭时读线程最多各等 2s ⇒ exit_wait 默认 12s。"""
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(td)
+        os.environ["TERM"] = "xterm-256color"
+        os.environ["SHELL"] = "/bin/sh"
+        os.environ["PS1"] = "$ "
+        try:
+            os.execv(os.path.join(td, "termux"), ["termux"])
+        finally:
+            os._exit(127)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    os.kill(pid, signal.SIGWINCH)
+    got = bytearray()
+
+    def drain(t):
+        # 与 capture_page_keys 同一条规矩：读到超时为止，读空了就退出。
+        # （v2.3.0 第一版这里在「读到一个块」之后就 break ⇒ 一帧只收走一段字节，
+        #   后面的画面全丢了，屏幕级判据量到的是一片空屏 —— 假红，和产品无关。）
+        end = time.time() + t
+        while time.time() < end:
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    got.extend(os.read(fd, 65536))
+                except OSError:
+                    return
+
+    drain(1.2)
+    for k in keys:
+        try:
+            os.write(fd, k)
+        except OSError:
+            break                        # 进程已经退了：后面的键没有落点，正常
+        drain(0.5)
+    last_frame = bytes(got)              # ★ 发退出键之前的那一帧，才是「程序界面」
+    for k in quit_keys:
+        try:
+            os.write(fd, k)
+        except OSError:
+            break
+        drain(0.4)
+    exited = False
+    end = time.time() + exit_wait
+    while time.time() < end:
+        try:
+            w, st = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            exited = True
+            break
+        if w == pid:
+            exited = (not os.WIFSIGNALED(st)) and os.WEXITSTATUS(st) == 0
+            break
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try:
+                got.extend(os.read(fd, 65536))
+            except OSError:
+                pass
+    if not exited:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    return last_frame, exited
+
+
+def sess_read(td, name="termux.session"):
+    try:
+        with open(os.path.join(td, name), "rb") as f:
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
 # argv[4] = 要找的文字。若它以 '#' 开头：找到含它的行，要求光标在同一行且列 = 该串末尾之后 → "ok"；
 # 否则：只报告它出现在哪一行（"row N"），没找到 → "notfound"。
 VTERM_CURSOR_C = r"""
@@ -2514,6 +2618,180 @@ int main(int argc, char **argv) {
             nul[nm] = bad[:3]
     ck("R16 动画帧的字节流里没有 NUL（动画改写过长度 ⇒ 尾巴必须是自己写过的字节）",
        not nul, "%r" % (nul,))
+
+    # ================= T 组（v2.3.0）：退出存盘 / 启动恢复 =================
+    # 用户口径：只做「退出时把终端存盘、下次启动恢复」（常驻后台进程另开版本）；入口 = 行为页
+    # 第 6 个开关 + ini `session`；范围 = 每窗格文本历史 + 完整布局（标签 + 分屏树/比例 + 焦点）；
+    # 只在退出时写一次。量法 = 同一个目录跑两次 + 读回中间的文件，不去读代码里的常量
+    # （读常量等于把实现再抄一遍当判据）。
+    SESS_INI_ON = "[general]\nsession = true\nmouse = true\nanim = off\n"
+    SESS_INI_OFF = "[general]\nsession = false\nmouse = true\nanim = off\n"
+
+    td_off = sess_mkdir(SESS_INI_OFF)
+    try:
+        _, ex_off = sess_run(td_off, ROWS_C, COLS_C, [b"echo OFFSEED99\r"])
+        ck("T1 session = off（默认）时退出【不产生任何会话文件】，不碰没开这个功能的人的目录",
+           ex_off and sess_read(td_off) is None
+           and sorted(n for n in os.listdir(td_off) if n.endswith(".session")) == [],
+           "退出正常=%r 目录=%r" % (ex_off, sorted(os.listdir(td_off))))
+    finally:
+        shutil.rmtree(td_off, ignore_errors=True)
+
+    td = sess_mkdir(SESS_INI_ON)
+    try:
+        sess_keys = [b"echo LEFTSEED41\r", "echo 中文测试甲\r".encode(),
+                     b"\x02-", b"echo RIGHTSEED42\r"]
+        d1, ex1 = sess_run(td, ROWS_C, COLS_C, sess_keys)
+        txt = sess_read(td) or ""
+        r1 = txt.splitlines()
+        dlines = [l[2:] for l in r1 if l.startswith("D ")]
+        seg1 = txt.split("\nP 1", 1)
+        left1 = [x[2:] for x in seg1[0].splitlines() if x.startswith("D ")]
+        right1 = [x[2:] for x in seg1[1].splitlines() if x.startswith("D ")] if len(seg1) > 1 else []
+        # 「提示符那一行」有没有进档取决于退出键落在 shell 画提示符之前还是之后（实测两种都出现过），
+        # 所以这里量【内容与条数上限】而不是咬死条数：命令行 + 输出行必须在、顺序对，
+        # 屏底那二十来行空格一行都不许进档（上限 3 = 命令/输出/提示符）。
+        ck("T2 干净退出后写出 termux.session：1 个 tab、树 `0 v50pp`（左右各半）、2 个窗格；"
+           "每格只存「命令 / 输出 /（可能有的）提示符」，屏底那些空行一条都不进档",
+           ex1 and r1[:1] == ["s 1"] and txt.count("\nT ") == 1
+           and [l[2:] for l in r1 if l.startswith("T ")] == ["0 v50pp"]
+           and right1[:2] == ["$ echo RIGHTSEED42", "RIGHTSEED42"] and 2 <= len(right1) <= 3
+           and left1[0].endswith("echo LEFTSEED41") and 4 <= len(left1) <= 6
+           and sum(1 for x in left1 if x.endswith("LEFTSEED41")) == 2
+           and sum(1 for x in left1 if x.endswith("中文测试甲")) == 2
+           and sum(1 for x in right1 if x.endswith("RIGHTSEED42")) == 2
+           and all(x.strip() for x in dlines),
+           "退出正常=%r 记录=%r" % (ex1, r1[:12]))
+        ck("T2b 中文按【字符】存、不按【格子】存：宽字符的次格不许变成空格（存成「中 文 测 试」"
+           "等于每存一轮就把历史撑长一倍）",
+           any(x.endswith("echo 中文测试甲") for x in left1)
+           and sum(1 for x in left1 if x.endswith("中文测试甲")) == 2
+           and not any("中 文" in x or "文 测" in x or "试 甲" in x for x in dlines),
+           "左格=%r" % (left1,))
+        ck("T2c 焦点跟着走：保存时聚焦的是分屏后【新建的那个】（右）窗格；两个 needle 各在各的"
+           "窗格里、没有互相漏进去",
+           [x[2:] for x in r1 if x.startswith("P ")] == ["0", "1"]
+           and "LEFTSEED41" not in " ".join(right1) and "RIGHTSEED42" not in " ".join(left1),
+           "P 行=%r 左=%r 右=%r" % ([x for x in r1 if x.startswith("P ")], left1, right1))
+        ck("T2d 单条逻辑行不越 8000 字节、文件不越 6MB（越界就是静默截断，截断必须看得穿）",
+           all(len(x.encode("utf-8")) <= 8000 for x in dlines)
+           and len(txt.encode("utf-8")) < 6 * 1024 * 1024,
+           "最长行=%d 文件=%d" % (max([len(x.encode("utf-8")) for x in dlines] or [0]),
+                                  len(txt.encode("utf-8"))))
+
+        d2, ex2 = sess_run(td, ROWS_C, COLS_C, [b"echo AFTERFOCUS\r"])
+        scr2 = vt_text(ROWS_C, COLS_C, d2) or []
+
+        def scol(line, needle):      # 这段文字在屏上的显示列（0 基）；-1 = 没找到
+            i = line.find(needle)
+            return dispw(line[:i]) if i >= 0 else -1
+
+        def scol_all(line, needle):  # 同一行里【左右两格各有一条】时，按行数是数不出两次的
+            out, i = [], 0
+            while True:
+                j = line.find(needle, i)
+                if j < 0:
+                    return out
+                out.append(dispw(line[:j]))
+                i = j + 1
+
+        markc = [c for l in scr2 for c in scol_all(l, "上次会话的历史")]
+        lrow = next((i for i, l in enumerate(scr2) if "LEFTSEED41" in l), -1)
+        rrow = next((i for i, l in enumerate(scr2) if "RIGHTSEED42" in l), -1)
+        crow = next((i for i, l in enumerate(scr2) if "中文测试甲" in l), -1)
+        arow = next((i for i, l in enumerate(scr2) if "AFTERFOCUS" in l), -1)
+        divc = [scol(l, "\u2502") for l in scr2 if "\u2502" in l]
+        dcol = min([c for c in divc if c > 0] or [-1])
+        rA_ck("T3 第二次启动把两个窗格的历史都读回来了，而且【各归各的窗格】：两格各有一行说明"
+              "（分居分隔线两侧），左边是 LEFTSEED41 + 中文行、右边是 RIGHTSEED42",
+              ex2 and dcol > 0 and len(markc) == 2
+              and any(0 <= c < dcol for c in markc) and any(c > dcol for c in markc)
+              and lrow >= 0 and crow >= 0 and rrow >= 0 and arow >= 0
+              and scol(scr2[lrow], "LEFTSEED41") < dcol
+              and scol(scr2[crow], "中文测试甲") < dcol
+              and scol(scr2[rrow], "RIGHTSEED42") > dcol
+              and all(dispw(l) <= COLS_C for l in scr2 if "上次会话的历史" in l),
+              "说明行列=%r 左=%r 中文=%r 右=%r 新键=%r 分隔线列=%d"
+              % (markc, lrow, crow, rrow, arow, dcol))
+        div_rows = [i for i, l in enumerate(scr2) if "\u2502" in l]
+        rA_ck("T3b 布局也回来了：恢复完那一帧起就有分屏分隔线（%d/%d 行带 │），不用重新 Ctrl+B -"
+              % (len(div_rows), ROWS_C),
+              len(div_rows) >= ROWS_C - 2,
+              "带分隔线的行数=%d 屏前 3 行=%r" % (len(div_rows), scr2[:3]))
+
+        txt2 = sess_read(td) or ""
+        seg2 = txt2.split("\nP 1", 1)
+        right2 = [x[2:] for x in seg2[1].splitlines() if x.startswith("D ")] if len(seg2) > 1 else []
+        all2 = [x[2:] for x in txt2.splitlines() if x.startswith("D ")]
+        ck("T3c 恢复出来的历史 + 这一轮新打的字，退出时又存了一次（跨会话连续，不是只读一次）；"
+           "而上一轮那句说明行【不会被当成历史再存一遍】（否则每开一次多一行，越滚越长）",
+           ex2 and "LEFTSEED41" in txt2 and any(x.endswith("AFTERFOCUS") for x in right2)
+           and not any(x.startswith("── 上次会话的历史") for x in all2)
+           and [l[2:] for l in txt2.splitlines() if l.startswith("T ")] == ["0 v50pp"],
+           "退出正常=%r 右格=%r 说明行被二次存档=%r"
+           % (ex2, right2, any(x.startswith("── 上次会话的历史") for x in all2)))
+
+        # 存时 100 列、读时 40 列 ⇒ 逻辑行由引擎重折：不许超宽、不许半个汉字
+        d3, _ = sess_run(td, ROWS_C, 40, [])
+        scr3 = vt_text(ROWS_C, 40, d3) or []
+        over = [i + 1 for i, l in enumerate(scr3) if dispw(l) > 40]
+        rA_ck("T4 40 列窄终端读回 100 列存的历史：%d 行齐、没有一行超宽、三个 needle 都还在、"
+              "中文没被腰斩" % ROWS_C,
+              len(scr3) == ROWS_C and not over
+              and any("LEFTSEED41" in l for l in scr3) and any("RIGHTSEED42" in l for l in scr3)
+              and any("中文测试甲" in l for l in scr3) and "\ufffd" not in "\n".join(scr3),
+              "超宽行=%r 行数=%d" % (over[:4], len(scr3)))
+
+        # 坏档只许「当没有快照」，不许把启动带崩
+        td_bad = sess_mkdir(SESS_INI_ON)
+        try:
+            for jtag, junk in (("空文件", ""), ("版本不对", "s 9\nT 0 v50pp\nD 半条记录\n"),
+                               ("树语法坏", "s 1\nT 0 v120px\nP 1\nD junk\n"),
+                               ("树超长", "s 1\nT 9 v99" + "p" * 400 + "\n"),
+                               ("尾部截断", "s 1\nT 0 v50pp\nP 0\nD 只有半")):
+                with open(os.path.join(td_bad, "termux.session"), "w", encoding="utf-8") as f:
+                    f.write(junk)
+                db, exb = sess_run(td_bad, ROWS_C, COLS_C, [b"echo SURVIVE\r"])
+                visb = vt_text(ROWS_C, COLS_C, db) or []
+                rA_ck("T5 坏档（%s）不崩不卡：照常起得来、能打字、退出正常" % jtag,
+                      exb and any("SURVIVE" in l for l in visb),
+                      "正常退出=%r 屏上命中=%r" % (exb, [l for l in visb if "SURVIVE" in l][:1]))
+        finally:
+            shutil.rmtree(td_bad, ignore_errors=True)
+
+        # ---- 设置页：第 6 个开关 + 行为页字母换页（v2.2.0 我写错的挡位） ----
+        b_off = capture_page_keys(ROWS_C, COLS_C, [b"\x02s", b"b"], ini=SESS_INI_OFF, keep_ini=True)
+        s_off = vt_text(ROWS_C, COLS_C, b_off[0]) or []
+        row_off = [i for i, l in enumerate(s_off) if "] session" in l]
+        b_on = capture_page_keys(ROWS_C, COLS_C,
+                                 [b"\x02s", b"b"] + [b"\x1b[B"] * 5 + [b" "],
+                                 ini=SESS_INI_OFF, keep_ini=True)
+        s_on = vt_text(ROWS_C, COLS_C, b_on[0]) or []
+        row_on = [i for i, l in enumerate(s_on) if "session" in l and "退出时保存会话" in l]
+        rA_ck("T6 行为页第 6 行 = 「session 退出时保存会话（下次启动恢复历史与布局）」：光标移过去"
+              "按 Space 就打上勾，ini 里同步多出一行 session = true（关着时那行是 false）",
+              bool(row_off) and bool(row_on) and row_off[0] == row_on[0]
+              and "[x]" in s_on[row_on[0]] and "[ ]" in s_off[row_off[0]]
+              and re.search(r"^session\s*=\s*true", b_on[1] or "", re.M) is not None
+              and re.search(r"^session\s*=\s*false", b_off[1] or "", re.M) is not None,
+              "行=%r→%r ini_on=%r ini_off=%r"
+              % (row_off, row_on, (b_on[1] or "")[-70:], (b_off[1] or "")[-70:]))
+        s_a = vt_text(ROWS_C, COLS_C,
+                      capture_page_keys(ROWS_C, COLS_C, [b"\x02s", b"b", b"a"])) or []
+        rA_ck("T7 行为页上按 a 能换到外观页（v2.2.0 我把 A/B/K/W/M 当成行为页的开关键挡了换页，"
+              "而行为页其实只认 ESC/↑↓←→/Space/Enter）",
+              any("外观" in l for l in s_a) and not any("■ 行为" in l for l in s_a),
+              "屏前 3 行=%r" % (s_a[:3],))
+        for rows, cols in ((24, 40), (12, 40)):
+            nrow = capture_page_keys(rows, cols, [b"\x02s", b"b"], ini=SESS_INI_ON)
+            ln40 = vt_text(rows, cols, nrow) or []
+            rA_ck("T8 %d×%d 档：行为页多出第 6 行之后仍没有一行越过屏宽（%d 行齐）"
+                  % (rows, cols, rows),
+                  len(ln40) == rows and all(dispw(l) <= cols for l in ln40),
+                  "超宽行=%r 行数=%d" % ([i + 1 for i, l in enumerate(ln40)
+                                          if dispw(l) > cols][:3], len(ln40)))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
     print()
     print()

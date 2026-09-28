@@ -10,7 +10,7 @@ jobs:
       #   term_input_posix.c）也在 src/ 里，拿 mingw 去编它们必然炸（找不到
       #   poll.h / signal.h）。文件清单必须和 Makefile 的 $(SRC) 逐字一致。
       - run: make -B all
-      - run: x86_64-w64-mingw32-g++ -O2 -s -Wall -Wextra -x c++ -Iinclude src/config.c src/cliphtml.c src/conpty_loader.c src/framediff.c src/input.c src/keymap.c src/loghist.c src/main.c src/globals.c src/pane.c src/platform_win.c src/render.c src/screen.c src/split.c src/theme.c src/utf8.c src/vt.c -o termux_cpp.exe -luser32
+      - run: x86_64-w64-mingw32-g++ -O2 -s -Wall -Wextra -x c++ -Iinclude src/config.c src/cliphtml.c src/conpty_loader.c src/framediff.c src/input.c src/keymap.c src/loghist.c src/main.c src/globals.c src/pane.c src/platform_win.c src/render.c src/screen.c src/session.c src/split.c src/theme.c src/utf8.c src/vt.c -o termux_cpp.exe -luser32
       - run: gcc -O1 -Wall -Wextra -Werror -Itests/stub -Iinclude src/theme.c src/keymap.c tests/test_config.c -o /tmp/test_config -lm && /tmp/test_config
       - run: python3 verify_all.py
   msvc:
@@ -19,5 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
       # 同上：src\*.c 会把 POSIX 后端一起喂给 cl。这里显式列出与
-      # Makefile $(SRC) 同一份的 17 个文件。
-      - run: cl /O2 /Iinclude src\config.c src\cliphtml.c src\conpty_loader.c src\framediff.c src\input.c src\keymap.c src\loghist.c src\main.c src\globals.c src\pane.c src\platform_win.c src\render.c src\screen.c src\split.c src\theme.c src\utf8.c src\vt.c /Fe:termux.exe /link user32.lib
+      # Makefile $(SRC) 同一份的 18 个文件（v2.3.0 起多了 src/session.c）——
+      # 新增 .c 时必须同时改这里两处和 Makefile 的 $(SRC) / $(POSIX_SRC)，
+      # 漏一个就是「Linux 绿、Windows 少一个 obj / 链接失败」。
+      - run: cl /O2 /Iinclude src\config.c src\cliphtml.c src\conpty_loader.c src\framediff.c src\input.c src\keymap.c src\loghist.c src\main.c src\globals.c src\pane.c src\platform_win.c src\render.c src\screen.c src\session.c src\split.c src\theme.c src\utf8.c src\vt.c /Fe:termux.exe /link user32.lib

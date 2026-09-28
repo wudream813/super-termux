@@ -4,7 +4,7 @@ CFLAGS = -O2 -s -Wall -Wextra -Iinclude
 CXXFLAGS = -O2 -s -Wall -Wextra -Iinclude
 LDFLAGS = -luser32 -lshell32
 
-SRC = src/config.c src/cliphtml.c src/conpty_loader.c src/framediff.c src/input.c src/keymap.c src/loghist.c src/main.c src/globals.c src/pane.c src/platform_win.c src/render.c src/screen.c src/split.c src/theme.c src/utf8.c src/vt.c
+SRC = src/config.c src/cliphtml.c src/conpty_loader.c src/framediff.c src/input.c src/keymap.c src/loghist.c src/main.c src/globals.c src/pane.c src/platform_win.c src/render.c src/screen.c src/session.c src/split.c src/theme.c src/utf8.c src/vt.c
 TARGET = termux.exe
 TARGET_CPP = termux_cpp.exe
 
@@ -169,8 +169,8 @@ unittest:
 # ===========================================================================
 POSIX_SRC = src/config.c src/cliphtml.c src/framediff.c src/globals.c src/input.c \
             src/keymap.c src/loghist.c src/main_posix.c src/pane.c src/platform_posix.c \
-            src/render.c src/screen.c src/split.c src/term_input_posix.c src/theme.c \
-            src/utf8.c src/vt.c
+            src/render.c src/screen.c src/session.c src/split.c src/term_input_posix.c \
+            src/theme.c src/utf8.c src/vt.c
 # 注意：$(CC) 是 MinGW 交叉编译器（给 Windows 版用的）。POSIX 构建必须用本机
 # 编译器，否则会拿着 mingw 的头去找 poll.h / termios.h。用 ?= 以便 CI 里覆盖。
 POSIX_CC     ?= cc

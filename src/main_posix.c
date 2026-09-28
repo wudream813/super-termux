@@ -20,6 +20,7 @@
 #include "config.h"
 #include "pane.h"
 #include "render.h"
+#include "session.h"
 #include "input.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -241,9 +242,15 @@ int main(void) {
     split_init_tab(first);
     g_mux.active_pane = first;
     if (g_default_startup == 1) g_mux.help_mode = 1;
+    /* v2.3.0：`session = on` 时把上次退出前存的历史 + 布局读回来（默认 off ⇒ 直接返回）。
+     * 放在首帧之前：恢复是「先建结构再灌文本」，一屏就绪比先闪一下空终端再补内容好。 */
+    session_restore();
     g_mux.needs_redraw = 1;
     render_screen();
     handle_input();
+    /* 退出钩子只在「最后一个窗格关掉」时到得了这里；SIGKILL / 断线（SIGHUP 已被吞）
+     * 到不了 —— 所以这不是常驻进程，只是存盘恢复（与用户定好的口径一致）。 */
+    session_save();
     for (int i = 0; i < g_mux.pane_count; i++) close_pane(i);
 
     restore_console();

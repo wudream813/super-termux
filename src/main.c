@@ -10,6 +10,7 @@
 #include "config.h"
 #include "pane.h"
 #include "render.h"
+#include "session.h"
 #include "input.h"
 #include "split.h"
 
@@ -300,11 +301,14 @@ int main(void) {
     if (g_default_startup == 1) {
         g_mux.help_mode = 1;
     }
+    session_restore();   /* v2.3.0：session = on 时读回上次会话（默认 off 直接返回 0） */
     g_mux.needs_redraw = 1;
     render_screen();
     dump_mark("[boot] first-render-done help_mode=%d", (int)g_mux.help_mode);
     handle_input();
     dump_mark("[boot] input-loop-exited");
+    session_save();      /* v2.3.0：退出前存一份历史 + 布局（Ctrl+D / exit 这类干净退出） */
+    dump_mark("[boot] session-saved");
     for (int i = 0; i < g_mux.pane_count; i++) close_pane(i);
 
 cleanup:

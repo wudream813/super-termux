@@ -2192,6 +2192,8 @@ static void settings_behavior_toggle(int idx) {
         g_search_case_sensitive = !g_search_case_sensitive;
         if (g_search_active) execute_search();   /* 立刻按新规则重新匹配 */
     }
+    /* v2.3.0：第 6 个开关 = 退出时保存会话。落盘由紧接着的 save_config() 顺手做掉。 */
+    else if (idx == 5) g_session_persist = !g_session_persist;
     save_config();
     g_mux.needs_redraw = 1;
 }
@@ -2367,8 +2369,11 @@ static void handle_settings_behavior_key(WORD vk, WCHAR uc) {
  *   ① 「启动」这一栏以前一个键都没有（F2..F5 那四页有字母，它连字母位都是空的）⇒ 现在 F1 / S；
  *   ② 侧栏写着「[A] 外观 / 主题」，可 A 从来没被绑过（只有 F2 能用）—— 假标签 ⇒ 补上；
  *   ③ 这些字母以前只在启动页认 ⇒ 进了别的页就按不回来，只能一路 ←/→ 或 Esc 退出去重来。
- * 让路名单是从各页 handler 里数出来的：条目管理页把 S 用做「设为启动默认」、A 用做「添加条目」；
- * 行为页把 A/B/D/E/H/K/M/N/P/T/U/W/Y 用做各个开关的单键切换。那两页上换页请用 F1..F5。 */
+ * 让路名单是从各页 handler 里数出来的：条目管理页确实把 S 用做「设为启动默认」、A 用做「添加条目」，
+ * 那两页上换页请用 F1..F6。（v2.2.0 曾把行为页的 A/B/K/W/M 也列进来挡换页 —— 数错了：
+ * handle_settings_behavior_key 只认 ESC/↑↓/←→/Space/Enter，那几个字母在行为页什么都不做，
+ * 白挡掉一半换页键；v2.3.0 拿掉，并由判据钉住「行为页上字母必须能换页」。
+ * 以后加挡位前先在对应页的 handler 里数到那个字母，别照抄本页注释。） */
 static const struct { WCHAR uc; int nav; } g_settings_nav_letters[] = {
     { 's', SETTINGS_NAV_STARTUP },    { 'a', SETTINGS_NAV_APPEARANCE },
     { 'm', SETTINGS_NAV_ITEMS },      { 'k', SETTINGS_NAV_KEYS },
@@ -2378,7 +2383,6 @@ static int settings_letter_used_by_page(WCHAR uc) {
     WCHAR l = (uc >= 'A' && uc <= 'Z') ? (WCHAR)(uc + 32) : uc;
     switch (g_settings_nav) {
     case SETTINGS_NAV_ITEMS:    return l == 's' || l == 'a';
-    case SETTINGS_NAV_BEHAVIOR: return l == 'a' || l == 'b' || l == 'k' || l == 'w' || l == 'm';
     default: return 0;
     }
 }
