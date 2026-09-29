@@ -32,6 +32,7 @@
 #define SESS_MAX_BYTES      (6 * 1024 * 1024)   /* 快照文件上限：更大的直接不认 */
 #define SESS_MAX_LINES      4000                /* 每个窗格最多存这么多逻辑行 */
 #define SESS_MAX_LINE_BYTES 8000                /* 单条逻辑行的字节上限 */
+#define SESS_VER_TEXT     "2"                 /* 快照格式版本；1 = 纯文本（无 ANSI、无转义） */
 #define SESS_PATH_NAME      L"termux.session"
 #define SESS_HOME_NAME      L".termux.session"
 
@@ -73,6 +74,32 @@ static void sbuf_fmt(SBuf *b, const char *fmt, ...) {
     sbuf_add(b, tmp, n);
 }
 
+/* 文本 → 快照里的一段记录：反斜杠写成 `\\`、ESC 写成 `\e`。为什么不放裸 ESC：
+ * 文件格式是「一行一条记录」，把 ESC 原样塞进去以后，`grep` / 编辑器 / 逐行读代码
+ * 的人都会看见控制字节，D 记录也不再是「能用肉眼看的历史」；转义只花一个字节。
+ * 有了这套转义，正文里出现字面量 `\e`（比如 `cat` 了一个带转义的脚本）也不会被
+ * 读回时当成真 ESC —— 那必须写成 `\\e`。 */
+static void sbuf_esc(SBuf *b, const char *s, int n) {
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '\\') sbuf_str(b, "\\\\");
+        else if (s[i] == 0x1B) sbuf_str(b, "\\e");
+        else sbuf_add(b, s + i, 1);
+    }
+}
+
+/* 快照里的一段正文 → 真正喂给屏幕的字节：`\e` 还原成 ESC、`\\` 还原成反斜杠。
+ * ver_esc=0（v1 的老档）时原样拷贝 —— 老档里的反斜杠是正文而不是转义引导符，
+ * 把 `C:\e` 当成 ESC 会把用户的 Windows 路径读花。 */
+static void sess_unesc(SBuf *b, const char *s, int ver_esc) {
+    if (!ver_esc) { sbuf_str(b, s); return; }
+    const char *p = s;
+    while (*p) {
+        if (p[0] == '\\' && p[1] == 'e') { sbuf_add(b, "\x1b", 1); p += 2; }
+        else if (p[0] == '\\' && p[1] == '\\') { sbuf_add(b, "\\", 1); p += 2; }
+        else { sbuf_add(b, p, 1); p++; }
+    }
+}
+
 /* 路径与 ini 用同一套定位（exe 旁边优先，其次主目录下的点文件），见 config_sibling_path。 */
 static void sess_path(WCHAR *out, int out_len, int for_write) {
     config_sibling_path(out, out_len, for_write, SESS_PATH_NAME, SESS_HOME_NAME);
@@ -82,20 +109,82 @@ static void sess_path(WCHAR *out, int out_len, int for_write) {
  * 存
  * ========================================================================= */
 
-/* 一个物理行的单元格 → 一行 UTF-8 文本（行尾空白去掉）。
+/* ---- v2.3.1：把「终端程序原本发的 ANSI」也存下来 ----------------------------------
+ * 用户的原话是「恢复要保存 ANSI 代码」：只存纯文本的话，恢复出来是一片素色，`ls`
+ * 的目录色、报错的红、进度条的底全没了 —— 看着就不算「恢复」。
+ *
+ * 一格的属性 = `cells[].Attributes`（16 色 + 下划线）+ 并行的 `fg_rgb/bg_rgb/rgb_valid`
+ * （真彩，见 screen.c 的 cell_truecolor）。存进档里的是【索引色 + 真彩】这两类
+ * 「程序自己发的」，刻意【不】复用 render.c 的 emit_attr16：那条会把 16 色按
+ * `[theme] pane_*` 换成真彩，焊死在快照里就换不了主题了。存索引色 ⇒ 读回来由
+ * 当前主题重新上色。默认属性（fg=7 / bg=0 / 无下划线 / 无真彩）一个字节都不发，
+ * 否则满屏都是 `\e[0;37;40m`，文件胀十倍、历史也不能用肉眼看。
+ * -------------------------------------------------------------------------- */
+
+static void sess_snprintf_at(char *out, int bs, int *pos, const char *fmt, ...) {
+    if (*pos < 0 || *pos >= bs - 1) { *pos = bs - 1 > 0 ? bs - 1 : 0; return; }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(out + *pos, (size_t)(bs - *pos), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    /* vsnprintf 返回的是「本该写多长」，越界时不能直接加，否则 pos 会跑到 bs 外面，
+     * 下一句就拿负数当剩余空间。 */
+    *pos += (n < bs - *pos - 1) ? n : bs - *pos - 1;
+}
+
+/* 返回写进 out 的字节数；0 = 这一格是默认属性，什么都不用发。out 里是【裸 ESC 串】，
+ * 由 sess_row_text 统一转义后再进档。 */
+static int sess_attr_sgr(WORD attr, WORD frgb, WORD brgb, int fgv, int bgv,
+                         char *out, int bs) {
+    static const int m8[8] = {0,4,2,6,1,5,3,7};   /* Win32 位标志 → ANSI 颜色号（同 render.c） */
+    int fg = attr & 0x0F, bg = (attr >> 4) & 0x0F;
+    int ul = (attr & COMMON_LVB_UNDERSCORE) ? 1 : 0;
+    if (!fgv && !bgv && !ul && fg == 7 && bg == 0) return 0;
+    int pos = 0;
+    sess_snprintf_at(out, bs, &pos, "\x1b[0");
+    if (ul) sess_snprintf_at(out, bs, &pos, ";4");
+    if (fgv) {
+        int r, g, b;
+        rgb565_split(frgb, &r, &g, &b);
+        sess_snprintf_at(out, bs, &pos, ";38;2;%d;%d;%d", r, g, b);
+    } else if (fg == 7) {
+        sess_snprintf_at(out, bs, &pos, ";39");           /* 前景=默认：换主题也跟着走 */
+    } else {
+        sess_snprintf_at(out, bs, &pos, ";%d", (fg & 8) ? 90 + m8[fg & 7] : 30 + m8[fg & 7]);
+    }
+    if (bgv) {
+        int r, g, b;
+        rgb565_split(brgb, &r, &g, &b);
+        sess_snprintf_at(out, bs, &pos, ";48;2;%d;%d;%d", r, g, b);
+    } else if (bg == 0) {
+        sess_snprintf_at(out, bs, &pos, ";49");
+    } else {
+        sess_snprintf_at(out, bs, &pos, ";%d", (bg & 8) ? 100 + m8[bg & 7] : 40 + m8[bg & 7]);
+    }
+    sess_snprintf_at(out, bs, &pos, "m");
+    if (pos > 0 && pos < bs) out[pos] = 0;
+    return pos;
+}
+
+/* 一个物理行的单元格 → 一行「带 ANSI、已转义」的文本（行尾空白去掉），追加到 out。
+ * `*had_code` 置 1 = 这一行发过颜色码（收尾要补一个 `\e[m`，别把颜色漏给下一行）。
  * NUL 与 C0 控制符当空格；落单的代理项丢掉 —— 直接扔给 WideCharToMultiByte 会让
  * 整行转换失败或者变成一串 '?'（Windows 的 WCHAR 是 UTF-16，一个 emoji 占两格；
  * POSIX 侧 WCHAR 是 32 位，那两个判断自然不成立，不必 #ifdef）。
- * 返回写入 out 的字节数（不含结尾 NUL）。 */
-static int sess_row_text(ScreenBuffer *s, int ph, char *out, int out_max) {
+ * 返回追加的字节数（-1 = 装不下了，调用方按截断处理）。 */
+static int sess_row_text(ScreenBuffer *s, int ph, SBuf *out, int cap, int *had_code,
+                         int *cut) {
     ScreenLine *ln = &s->lines[ph];
-    out[0] = 0;
     int used = ln->used;
     if (used > s->cols) used = s->cols;
     if (used > ln->len) used = ln->len;          /* len = cells[] 的容量（见 screen_init） */
     if (used <= 0) return 0;
     WCHAR *w = (WCHAR *)malloc((size_t)(used + 1) * sizeof(WCHAR));
-    if (!w) return 0;
+    /* 每个【留下来的码点】对应回它的格子号：颜色是按格存的，正文是按码点取的，
+     * 宽字符次格被跳掉后两者下标就错开了 ⇒ 必须带一张映射表。 */
+    int *cell_at = (int *)malloc((size_t)(used + 1) * sizeof(int));
+    if (!w || !cell_at) { free(w); free(cell_at); return 0; }
     int n = 0;
     for (int i = 0; i < used; i++) {
         WCHAR c = ln->cells[i].Char.UnicodeChar;
@@ -107,40 +196,72 @@ static int sess_row_text(ScreenBuffer *s, int ph, char *out, int out_max) {
          * （实测：说明行被存成「上 次 会 话」）⇒ 必须跳过。 */
         if (c >= 0xDC00 && c <= 0xDFFF && prev_high) continue;
         if (c == 0 && !prev_high && is_wide_cp((unsigned int)pv)) continue;
-        if (c == 0 || c < 0x20 || c == 0x7F) { w[n++] = L' '; continue; }
+        if (c == 0 || c < 0x20 || c == 0x7F) { cell_at[n] = i; w[n++] = L' '; continue; }
         if (c >= 0xD800 && c <= 0xDBFF) {        /* 高代理：后面紧跟低代理才成对留下 */
             WCHAR d = (i + 1 < used) ? ln->cells[i + 1].Char.UnicodeChar : 0;
-            if (d >= 0xDC00 && d <= 0xDFFF) { w[n++] = c; w[n++] = d; i++; }
-            else w[n++] = L' ';
+            if (d >= 0xDC00 && d <= 0xDFFF) {
+                cell_at[n] = i; w[n++] = c;
+                cell_at[n] = i + 1; w[n++] = d;
+                i++;
+            } else { cell_at[n] = i; w[n++] = L' '; }
             continue;
         }
-        if (c >= 0xDC00 && c <= 0xDFFF) { w[n++] = L' '; continue; }   /* 落单的低代理 */
-        w[n++] = c;
+        if (c >= 0xDC00 && c <= 0xDFFF) { cell_at[n] = i; w[n++] = L' '; continue; }   /* 落单的低代理 */
+        cell_at[n] = i; w[n++] = c;
     }
     while (n > 0 && w[n - 1] == L' ') n--;       /* 行尾空白不算内容 */
-    int got = 0;
-    if (n > 0) {
-        int need = WideCharToMultiByte(CP_UTF8, 0, w, n, NULL, 0, NULL, NULL);
+    int start = out->len;
+    int i = 0;
+    while (i < n) {
+        WORD attr = ln->cells[cell_at[i]].Attributes;
+        WORD frgb = ln->fg_rgb ? ln->fg_rgb[cell_at[i]] : RGB565_WHITE;
+        WORD brgb = ln->bg_rgb ? ln->bg_rgb[cell_at[i]] : RGB565_BLACK;
+        unsigned char vv = ln->rgb_valid ? ln->rgb_valid[cell_at[i]] : 0;
+        int fgv = (vv & 1) ? 1 : 0, bgv = (vv & 2) ? 1 : 0;
+        int j = i + 1;
+        while (j < n) {                          /* 同一串样式 = 同一格的五元组，见 render.c 的换色判据 */
+            WORD a2 = ln->cells[cell_at[j]].Attributes;
+            WORD f2 = ln->fg_rgb ? ln->fg_rgb[cell_at[j]] : RGB565_WHITE;
+            WORD b2 = ln->bg_rgb ? ln->bg_rgb[cell_at[j]] : RGB565_BLACK;
+            unsigned char v2 = ln->rgb_valid ? ln->rgb_valid[cell_at[j]] : 0;
+            if (a2 != attr || f2 != frgb || b2 != brgb || ((v2 & 1) ? 1 : 0) != fgv
+                || ((v2 >> 1) & 1) != bgv) break;
+            j++;
+        }
+        char sgr[96];
+        int slen = sess_attr_sgr(attr, frgb, brgb, fgv, bgv, sgr, (int)sizeof(sgr));
+        if (slen > 0 && (slen >= (int)sizeof(sgr) - 1)) { slen = 0; }   /* 装不下的码宁可不发 */
+        if (slen > 0 && out->len + slen + 2 > cap) { *cut = 1; break; }
+        if (slen > 0) { sbuf_esc(out, sgr, slen); *had_code = 1; }
+        int rl = j - i;
+        int need = rl > 0 ? WideCharToMultiByte(CP_UTF8, 0, w + i, rl, NULL, 0, NULL, NULL) : 0;
         if (need > 0) {
-            /* 缓冲区按【转换要的长度】开，再按 out_max 截：直接把 need 夹到装不下的
+            /* 缓冲区按【转换要的长度】开，再按剩余空间截：直接把 need 夹到装不下的
              * 长度再叫它转，WideCharToMultiByte 会返回 0（insufficient buffer），
              * 整行文本反而一个字都存不下来 —— 超长行应当截断，不该消失。 */
             char *dst = (char *)malloc((size_t)need + 1);
-            if (dst) {
-                int g = WideCharToMultiByte(CP_UTF8, 0, w, n, dst, need, NULL, NULL);
-                if (g > 0) {
-                    if (g > 0 && dst[g - 1] == 0) g--;    /* 两侧的实现都可能把结尾 NUL 计进长度 */
-                    if (g > out_max - 1) g = out_max - 1;
-                    memcpy(out, dst, (size_t)g);
-                    got = g;
+            if (!dst) { *cut = 1; break; }
+            int g = WideCharToMultiByte(CP_UTF8, 0, w + i, rl, dst, need, NULL, NULL);
+            if (g > 0) {
+                if (dst[g - 1] == 0) g--;        /* 两侧的实现都可能把结尾 NUL 计进长度 */
+                int room = cap - out->len;       /* 转义最坏一个字节胀成两个 ⇒ 只能塞一半 */
+                if (g * 2 > room) {
+                    if (room >= 2) sbuf_esc(out, dst, room / 2);
+                    *cut = 1;
+                } else {
+                    sbuf_esc(out, dst, g);
                 }
-                free(dst);
             }
+            free(dst);
         }
+        i = j;
     }
-    out[got] = 0;
     free(w);
-    return got;
+    free(cell_at);
+    return out->len - start;                 /* ★ 返回【实际追加的字节数】：调用方拿这个长度
+                                              * 去 sbuf_add，估大了就会把缓冲尾巴上的陈旧
+                                              * 字节当正文抄进档里（v2.3.1 第一版就这样
+                                              * 存出「REDMARK77\0DMARK77」）。 */
 }
 
 /* 从最后一行往前数逻辑行起点，最多 max 条，把起点（rel 行号）按正序写进 out[]。
@@ -157,36 +278,49 @@ static int sess_collect_starts(ScreenBuffer *s, int *out, int max) {
     return cnt;
 }
 
-/* 一个窗格的历史 → 若干条 `D ...`。两条剪枝：
+/* 一个窗格的历史 → 若干条 `D ...`。三条剪枝：
  *  - 屏底部那几行空行不是「历史」（新窗格一屏空着，恢复出来只是让人以为上次会话真有
  *    那么多空行）⇒ 记下「最后一条非空行结束的位置」，收尾剪掉尾巴 ⇒ 空历史 = 零条 D
  *    记录 = 恢复时连说明行都不写；
  *  - 上一次恢复时那句说明行是【我们自己写的】，不是用户的历史 ⇒ 别再存回去，
- *    否则每开一次会话就多一行说明，档位会一直长。 */
-static void sess_write_pane(ScreenBuffer *s, SBuf *b, char *tmp, int tmp_max) {
+ *    否则每开一次会话就多一行说明，档位会一直长；
+ *  - v2.3.1：只有这一行真的发过颜色码，结尾才补 `\e[m` —— 默认色的行一个转义都不加，
+ *    否则每行白涨四个字节、还会把「D 记录 = 能直接读的历史」弄脏。 */
+static void sess_write_pane(ScreenBuffer *s, SBuf *b) {
     int *starts = (int *)malloc((size_t)(SESS_MAX_LINES + 1) * sizeof(int));
     if (!starts) return;
     int n = sess_collect_starts(s, starts, SESS_MAX_LINES);
+    SBuf scr;
+    memset(&scr, 0, sizeof(scr));
     int keep = b->len;
     int mlen = (int)strlen(SESS_MARK_HEAD);
     for (int i = 0; i < n; i++) {
         int to = (i + 1 < n) ? starts[i + 1] - 1 : s->rows - 1;
-        int used = 0, head = 1, mark = 0;
-        for (int rel = starts[i]; rel <= to; rel++) {
-            int r = sess_row_text(s, screen_phys_row(s, rel), tmp, tmp_max);
-            if (r <= 0) continue;
+        int used = 0, head = 1, mark = 0, cut = 0, code = 0;   /* code 逐行重算：上一行的颜色不许替这一行补复位 */
+        int line_at = b->len;
+        for (int rel = starts[i]; rel <= to && !cut; rel++) {
+            int pr = screen_phys_row(s, rel);
+            scr.len = 0;                                   /* 复用容量，逐行重装 */
+            int r = sess_row_text(s, pr, &scr, SESS_MAX_LINE_BYTES, &code, &cut);
+            if (r <= 0) continue;                          /* 空行（或全空白）不进这一条 */
             if (head) {
                 head = 0;
-                if (r >= mlen && memcmp(tmp, SESS_MARK_HEAD, (size_t)mlen) == 0) { mark = 1; break; }
-                sbuf_str(b, "D ");                 /* 确认这条要留，才动 b */
+                if (r >= mlen && memcmp(scr.p, SESS_MARK_HEAD, (size_t)mlen) == 0) {
+                    mark = 1;
+                    break;
+                }
+                sbuf_str(b, "D ");                        /* 确认这条要留，才动 b */
             }
-            if (used + r > SESS_MAX_LINE_BYTES) break;
-            sbuf_add(b, tmp, r);
+            if (used + r > SESS_MAX_LINE_BYTES) { cut = 1; continue; }
+            sbuf_add(b, scr.p, r);
             used += r;
         }
-        if (mark) continue;                         /* 一条都没写出去，无需回滚 */
+        if (used > 0 && code) sbuf_str(b, "\\e[m");       /* 收尾复位，颜色不许漏给下一行 */
+        if (mark) continue;                                /* 一条都没写出去，无需回滚 */
         if (used > 0) { sbuf_str(b, "\n"); keep = b->len; }
+        else if (b->len > line_at) b->len = line_at;      /* 只写了 "D " 就被剪掉 ⇒ 回滚 */
     }
+    free(scr.p);
     if (keep < b->len) { b->len = keep; if (b->p) b->p[keep] = 0; }
     free(starts);
 }
@@ -212,10 +346,7 @@ static void sess_leaf_list(SplitNode *nd, int node, int *out, int *cnt, int cap,
  * 退出时只做一次落盘。判据用 screen.lines != NULL 而不是 pane.active：reap 里 active 先被清 0，
  * 而那一刻屏还在。 */
 static int sess_render(SBuf *b, int *leaves) {   /* b 必须是调用方新清零的 SBuf */
-    char *tmp = (char *)malloc((size_t)SESS_MAX_LINE_BYTES + 256);
-    if (!tmp) return 0;
-
-    sbuf_str(b, "s 1\n");
+    sbuf_str(b, "s " SESS_VER_TEXT "\n");
     sbuf_fmt(b, "u %lld\n", (long long)time(NULL));
 
     int tabs = 0;
@@ -242,12 +373,11 @@ static int sess_render(SBuf *b, int *leaves) {   /* b 必须是调用方新清�
             sbuf_str(b, "P ");
             sbuf_fmt(b, "%d\n", (k == focus) ? 1 : 0);
             if (lvs[k] >= 0 && lvs[k] < g_mux.pane_count)
-                sess_write_pane(&g_mux.panes[lvs[k]].screen, b, tmp, SESS_MAX_LINE_BYTES);
+                sess_write_pane(&g_mux.panes[lvs[k]].screen, b);
         }
         tabs++;
     }
     LeaveCriticalSection(&g_mux.cs);
-    free(tmp);
     return tabs;
 }
 
@@ -258,6 +388,8 @@ static SBuf g_sess_keep;
 static int g_sess_keep_tabs;
 static int g_sess_keep_leaves;
 static int g_sess_suppress;        /* 恢复期间别顺手把半成品记进 keep */
+static int g_sess_exit_flush;      /* 退出路径上已经存过 ⇒ 钩子那一次不再写盘 */
+static int g_sess_flushing;        /* 落盘正在进行 ⇒ 不许重入（信号打在落盘中间） */
 
 /* 先数一遍「现在有几个 tab、几个窗格」（只看结构，不碰文本），便宜到可以每次调用都做。
  * 作用是给下面的采集把关：主循环退出时是【一个窗格一个窗格关过来】的，每次都全量
@@ -303,11 +435,11 @@ void session_note_now(void) {
     g_sess_keep_leaves = nl;
 }
 
-int session_save(void) {
-    if (!g_session_persist) return 0;
-    session_note_now();      /* 窗格还活着的话此刻再采一次（多半已是同一份） */
-    if (!g_sess_keep.p || g_sess_keep.len <= 0) return 0;
+/* 把内存里那份快照写出去（一次 f*open + 一次 fwrite ⇒ 「退出只写一次盘」这条口径
+ * 就看这一支被调用几次）。落盘后 free 掉，所以第二次调用没有东西可写。 */
+static int sess_write_keep(void) {
     SBuf *b = &g_sess_keep;
+    if (!b->p || b->len <= 0) return 0;
 
     WCHAR path[MAX_PATH] = { 0 };
     sess_path(path, MAX_PATH, 1);
@@ -330,6 +462,43 @@ int session_save(void) {
     g_sess_keep.p = NULL;
     g_sess_keep.len = g_sess_keep.cap = 0;
     g_sess_keep_tabs = g_sess_keep_leaves = 0;
+    return ok;
+}
+
+int session_save(void) {
+    if (!g_session_persist || g_sess_exit_flush) return 0;
+    session_note_now();      /* 窗格还活着的话此刻再采一次（多半已是同一份） */
+    return sess_write_keep();
+}
+
+/* v2.3.1：给「进程马上就没了」的场合用 —— Windows 的控制台关闭事件、POSIX 的
+ * SIGTERM/SIGHUP。这两条路都走不到退出钩子：
+ *   - Windows 的 ctrl_handler 只做 `running = 0` 就 return TRUE，系统在那之后【立刻】
+ *     终止进程（主循环还阻塞在 ReadConsoleInput 里）⇒ 按 X 关窗口时一次盘都没落，
+ *     下次启动自然「没有上次会话」；v2.3.0 就是这样，也是用户报的「没有成功恢复」。
+ *   - POSIX 的 TERM/HUP 靠主循环退回后那句 session_save()，能存，但要绕一圈；
+ *     这里顺手在同一处兜住。
+ * for_exit_path = 1 ⇒ 记一笔「这次退出已经存过了」，退出钩子那一次跳过（口径仍是
+ *                     【一次写盘】，不能因为多挂了个钩子变成两次）。
+ * for_exit_path = 0 ⇒ 只存当下这一份，进程继续跑，退出时照旧再存（POSIX 的 SIGUSR1
+ *                     手动存盘用这个）。
+ * 拿锁只等有限时间（TryEnter 200 次 ≈ 400ms）：信号/事件可能打在别的线程持锁中间，
+ * 死等等于把退出路径挂在锁上。等不到就用上一次采集的那份落盘（宁少不错）。 */
+int session_flush_now(int for_exit_path) {
+    if (!g_session_persist || g_sess_flushing) return 0;
+    g_sess_flushing = 1;
+    int locked = 0;
+    for (int t = 0; t < 200 && !locked; t++) {
+        if (TryEnterCriticalSection(&g_mux.cs)) locked = 1;
+        else Sleep(2);
+    }
+    if (locked) {
+        LeaveCriticalSection(&g_mux.cs);
+        session_note_now();              /* 它自己会拿锁（可重入），这里先明着放掉 */
+    }
+    int ok = sess_write_keep();
+    if (ok && for_exit_path) g_sess_exit_flush = 1;
+    g_sess_flushing = 0;
     return ok;
 }
 
@@ -478,10 +647,14 @@ int session_restore(void) {
     /* 声明必须全部排在第一条 goto 之前：跳进作用域会绕过初始化（gcc 的
      * -Wmaybe-uninitialized 就是抓这个的），done: 里读到的是栈垃圾。 */
     SRec *recs = NULL;
-    int nrec = 0, ri = 0, tabs = 0, focus_pane = -1;
+    int nrec = 0, ri = 0, tabs = 0, focus_pane = -1, ver_esc = 0;
     nrec = sess_index_lines(raw, &recs);
     if (nrec < 1 || !recs) goto done;
-    if (recs[ri].type != 's' || recs[ri].body[0] != '1') goto done;   /* 版本不认 ⇒ 整档不认 */
+    /* 版本：只认 1（纯文本）与 2（带 ANSI 转义）。老档照样恢复，只是没有颜色、
+     * 而且正文里的反斜杠不能当转义引导符看。认不出的版本 ⇒ 整档不认。 */
+    if (recs[ri].type != 's') goto done;
+    if (recs[ri].body[0] != '1' && recs[ri].body[0] != '2') goto done;
+    ver_esc = (recs[ri].body[0] >= '2') ? 1 : 0;
     ri++;
     while (ri < nrec) {
         if (recs[ri].type != 'T') { ri++; continue; }             /* u / 认不出的：跳过 */
@@ -530,7 +703,7 @@ int session_restore(void) {
             memset(&h, 0, sizeof(h));
             int lines = 0;
             while (ri < nrec && recs[ri].type == 'D') {
-                if (recs[ri].body[0]) { sbuf_str(&h, recs[ri].body); sbuf_str(&h, "\r\n"); }
+                if (recs[ri].body[0]) { sess_unesc(&h, recs[ri].body, ver_esc); sbuf_str(&h, "\r\n"); }
                 else sbuf_str(&h, "\r\n");                        /* 空行也要占一行 */
                 lines++;
                 ri++;

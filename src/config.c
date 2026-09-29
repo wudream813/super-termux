@@ -398,8 +398,8 @@ void save_config(void) {
         "# theme: github-dark | one-dark | nord | gruvbox-dark | dracula\r\n"
         "# prefix: 前缀键，C- = Ctrl，M- = Alt，S- = Shift，例如 C-a\r\n"
         "# anim: 设置页过渡动画 off | short | normal（也可写毫秒数，上限 600）\r\n"
-        "# session: on ⇒ 退出时把会话（各窗格已滚出去的历史 + 标签与分屏布局）写进\r\n"
-        "#          termux.session，下次启动灌回来（进程本身不保留，见 README）\r\n";
+        "# session: on ⇒ 退出时把会话（各窗格已滚出去的历史 + 标签与分屏布局，含颜色）写进\r\n"
+        "#          termux.session，下次启动灌回来（关窗口也存；进程本身不保留，见 README）\r\n";
     fwrite(header, 1, strlen(header), f);
 
     len = snprintf(buf, sizeof(buf),

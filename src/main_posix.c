@@ -185,7 +185,22 @@ static void restore_console(void) {
 
 static void on_term_signal(int sig) {
     (void)sig;
+    /* v2.3.1：先在这里存一次。主循环退出去的那几步（关窗格、还原 termios）在 SIGHUP
+     * 这种「宿主已经在拆终端」的场合不一定走得完；存过之后 flush 会记下「这次退出已
+     * 存过」，末尾那句 session_save() 自动跳过 ⇒ 仍然是一次写盘。
+     * ★ 严格说 malloc/fopen 不是 async-signal-safe；这里是有意的取舍 —— 宁可冒这个
+     *   风险，也不要「关窗口后什么都没存下来」。拿锁只试有限次（见 session_flush_now）。 */
+    session_flush_now(1);
     InterlockedExchange(&g_mux.running, 0);
+}
+
+/* SIGUSR1 = 「立刻存一份，但别退出」（POSIX 专有：Windows 没有信号，那边由
+ * ctrl_handler 走同一支 session_flush_now）。它把「有界拿锁 + 落盘 + 进程继续跑」
+ * 这套机制本身暴露给判据量：读档/续写、重入、把锁占住时的降级，都能在 Linux 上验，
+ * 而 Windows 的关闭事件用的就是同一条路。 */
+static void on_usr1_signal(int sig) {
+    (void)sig;
+    session_flush_now(0);
 }
 
 int main(void) {
@@ -215,8 +230,13 @@ int main(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_term_signal;
+    struct sigaction sa2;
+    memset(&sa2, 0, sizeof(sa2));
+    sa2.sa_handler = on_usr1_signal;
+    sa2.sa_flags = SA_RESTART;               /* 别把正阻塞着的读打断成「有输入」 */
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
+    sigaction(SIGUSR1, &sa2, NULL);          /* 手动存盘，不退出 */
     /* SIGINT 不拦：原始模式下 Ctrl+C 是 0x03 字节，要原样转发给前台 shell。 */
     signal(SIGPIPE, SIG_IGN);
 

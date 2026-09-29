@@ -110,6 +110,12 @@ static inline void InitializeCriticalSection(CRITICAL_SECTION *c) {
 static inline void DeleteCriticalSection(CRITICAL_SECTION *c) { pthread_mutex_destroy(&c->m); }
 static inline void EnterCriticalSection(CRITICAL_SECTION *c)   { pthread_mutex_lock(&c->m); }
 static inline void LeaveCriticalSection(CRITICAL_SECTION *c)   { pthread_mutex_unlock(&c->m); }
+/* v2.3.1：会话存盘可能被「拿不到锁就干脆不等」的场合调用（信号 / 控制台关闭事件里，
+ * 对面还阻塞在别处），所以需要 try 版。Windows 的 TryEnterCriticalSection 在「本线程
+ * 已持有」时也返回 TRUE，recursive mutex 的 trylock 正好同义。 */
+static inline int TryEnterCriticalSection(CRITICAL_SECTION *c) {
+    return pthread_mutex_trylock(&c->m) == 0;
+}
 
 /* ---- 控制台几何 / 字符单元 ---- */
 typedef struct _COORD { short X; short Y; } COORD;

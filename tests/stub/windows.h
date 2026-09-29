@@ -60,6 +60,8 @@ typedef struct { int dummy; } CRITICAL_SECTION;
 #define DeleteCriticalSection(p)     (void)(p)
 #define EnterCriticalSection(p)      (void)(p)
 #define LeaveCriticalSection(p)      (void)(p)
+/* 纯逻辑测试里锁是空的 ⇒ try 版永远成功（与 wincompat.h 的语义对齐：可拿就往下走）。 */
+#define TryEnterCriticalSection(p)   (1)
 
 /* 鼠标事件记录替身（只列访问到的字段）。dwMousePosition 用 COORD。 */
 typedef struct _MOUSE_EVENT_RECORD {

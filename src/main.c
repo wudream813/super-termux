@@ -149,7 +149,15 @@ static void handle_input(void) {
 }
 
 static BOOL WINAPI ctrl_handler(DWORD type) {
-    (void)type;
+    /* v2.3.1：CTRL_CLOSE_EVENT（点窗口的 X、关掉 WT 的标签页）/注销/关机这几支，
+     * 系统在【处理器返回之后】就终止进程 —— 主循环还阻塞在 ReadConsoleInput 里，
+     * 退出钩子那句 session_save() 永远到不了。所以存盘必须在这里做完：
+     * 用户按 X 关窗口时「上次会话」其实一个字都没写下去（v2.3.0 的实测行为）。
+     * Ctrl+C / Ctrl+Break 一并存：它们会让主循环正常退出，多存这一次会被
+     * session_flush_now 记下的「已存过」挡掉，不会变成两次写盘。 */
+    if (type == CTRL_CLOSE_EVENT || type == CTRL_LOGOFF_EVENT ||
+        type == CTRL_SHUTDOWN_EVENT || type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT)
+        session_flush_now(1);
     InterlockedExchange(&g_mux.running, 0);
     return TRUE;
 }

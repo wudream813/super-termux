@@ -432,7 +432,7 @@ def sess_mkdir(ini_text):
     return td
 
 
-def sess_run(td, rows, cols, keys, quit_keys=(b"\x02d",), exit_wait=12.0):
+def sess_run(td, rows, cols, keys, quit_keys=(b"\x02d",), exit_wait=12.0, sig=None):
     """在【已存在的】目录里起一次 termux：发完 keys 后【先存一份屏幕字节】，再发 quit_keys
     等它自己退出。返回 (退出前最后一帧的字节, 是否正常退出)。
 
@@ -477,6 +477,14 @@ def sess_run(td, rows, cols, keys, quit_keys=(b"\x02d",), exit_wait=12.0):
         except OSError:
             break                        # 进程已经退了：后面的键没有落点，正常
         drain(0.5)
+    if sig is not None:
+        # v2.3.1：「进程可能马上就没了」那几条路（Windows 的关闭事件、POSIX 的信号）
+        # 靠这个把手量。发完信号再等一会儿：既验「存完还在跑」，也让信号后的画面进帧。
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+        drain(0.8)
     last_frame = bytes(got)              # ★ 发退出键之前的那一帧，才是「程序界面」
     for k in quit_keys:
         try:
@@ -2653,7 +2661,7 @@ int main(int argc, char **argv) {
         # 屏底那二十来行空格一行都不许进档（上限 3 = 命令/输出/提示符）。
         ck("T2 干净退出后写出 termux.session：1 个 tab、树 `0 v50pp`（左右各半）、2 个窗格；"
            "每格只存「命令 / 输出 /（可能有的）提示符」，屏底那些空行一条都不进档",
-           ex1 and r1[:1] == ["s 1"] and txt.count("\nT ") == 1
+           ex1 and r1[:1] == ["s 2"] and txt.count("\nT ") == 1
            and [l[2:] for l in r1 if l.startswith("T ")] == ["0 v50pp"]
            and right1[:2] == ["$ echo RIGHTSEED42", "RIGHTSEED42"] and 2 <= len(right1) <= 3
            and left1[0].endswith("echo LEFTSEED41") and 4 <= len(left1) <= 6
@@ -2792,6 +2800,112 @@ int main(int argc, char **argv) {
                                           if dispw(l) > cols][:3], len(ln40)))
     finally:
         shutil.rmtree(td, ignore_errors=True)
+
+    # ================= T9/T10/T11（v2.3.1）：ANSI 进档 + 「进程要没了」也要存 =================
+    # 用户两句话：「你这也没有成功恢复啊」+「恢复要保存 ANSI 代码」。
+    # 前者：Windows 点 X 关窗口时，ctrl_handler 只置 running=0 就返回，系统在那之后立刻
+    #       终止进程 ⇒ 主循环末尾那句 session_save() 到不了 ⇒ 一次盘都没落。这条只能
+    #       在 Linux 上量【共用的那支 session_flush_now】（SIGUSR1 = 立刻存一份但不退出），
+    #       Windows 侧是同一支函数、编译级验证 —— 这里不假装量到了窗口 X。
+    # 后者：只存纯文本的话，恢复出来是素色一片 ⇒ D 记录里要带上终端程序自己发的 SGR。
+    SESS_COL_KEYS = [b"printf '\\033[31mREDSAVE61\\033[0m\\n'\r",
+                     b"echo PLAINLINE62\r",
+                     b"printf 'A\\\\eB\\n'\r"]
+
+    def sess_dlines(text):
+        return [l[2:] for l in (text or "").splitlines() if l.startswith("D ")]
+
+    td_col = sess_mkdir(SESS_INI_ON)
+    try:
+        d1, ex1 = sess_run(td_col, ROWS_C, COLS_C, SESS_COL_KEYS)
+        t1 = sess_read(td_col) or ""
+        dl = sess_dlines(t1)
+        # 精确等式：红字那行【只】带一个前缀码和一个收尾复位；默认色的行一个转义都不许有
+        # （否则满屏 \e[0;37;40m，文件胀十倍、D 记录也不能用肉眼看）。
+        ck("T10 快照带上了终端程序自己发的 ANSI：红字那行存成 `\\\\e[0;31;49mREDSAVE61\\\\e[m`"
+           "（前景=索引红、背景=默认 49 ⇒ 换主题还会跟着走），而默认色的行一个转义都不发",
+           ex1 and t1.splitlines()[:1] == ["s 2"]
+           and "\\e[0;31;49mREDSAVE61\\e[m" in dl and "PLAINLINE62" in dl,
+           "版本=%r D=%r" % (t1.splitlines()[:1], dl[:6]))
+        ck("T10b 正文里的字面量反斜杠不许被当成转义：屏幕上写着 `A\\eB` 时，档里必须是 "
+           "`A\\\\eB`，读回来还得是 `A\\eB`（把 `\\e` 当真 ESC 会既改内容又凭空上色）",
+           "A\\\\eB" in dl, "D=%r" % ([x for x in dl if "A" in x and "B" in x],))
+        d2, ex2 = sess_run(td_col, ROWS_C, COLS_C, [b"echo AFTER63\r"])
+        sc1, sc2 = vt_text(ROWS_C, COLS_C, d1), vt_text(ROWS_C, COLS_C, d2)
+        sg1, sg2 = vt_sig(ROWS_C, COLS_C, d1), vt_sig(ROWS_C, COLS_C, d2)
+
+        def row_with(lines, needle, exact=False):
+            if not lines:
+                return -1
+            for i, l in enumerate(lines):
+                if (l.strip() == needle) if exact else (needle in l):
+                    return i
+            return -1
+
+        r1_red = row_with(sc1, "REDSAVE61", exact=True)
+        r2_red = row_with(sc2, "REDSAVE61", exact=True)
+        r1_plain = row_with(sc1, "PLAINLINE62", exact=True)
+        r2_plain = row_with(sc2, "PLAINLINE62", exact=True)
+        same_red = (r1_red >= 0 and r2_red >= 0 and sg1 and sg2
+                    and sg1[r1_red] == sg2[r2_red])
+        red_differs_from_plain = (r1_red >= 0 and r1_plain >= 0 and sg1
+                                  and sg1[r1_red] != sg1[r1_plain])
+        rA_ck("T10c 恢复出来的那一行与当场那一行【逐格同色】（前景+背景签名相等），而且签名"
+              "确实与普通行不同 —— 只查文会漏掉「字对了颜色没了」",
+              ex2 and same_red and red_differs_from_plain,
+              "第一程红行=%d 签名=%r；第二程红行=%d 签名=%r；普通行签名=%r/%r"
+              % (r1_red, (sg1[r1_red] if sg1 and 0 <= r1_red < len(sg1) else None),
+                 r2_red, (sg2[r2_red] if sg2 and 0 <= r2_red < len(sg2) else None),
+                 (sg1[r1_plain] if sg1 and 0 <= r1_plain < len(sg1) else None),
+                 (sg2[r2_plain] if sg2 and 0 <= r2_plain < len(sg2) else None)))
+        ck("T10d 带色恢复完还能接着存：第二程退出后档里既是 s 2 又有 AFTER63，"
+           "而上一轮的说明行不会被当历史存回去（颜色往返不是单向的）",
+           ex2 and t1 is not None and (sess_read(td_col) or "").splitlines()[:1] == ["s 2"]
+           and any(x.strip().endswith("AFTER63") for x in sess_dlines(sess_read(td_col)))
+           and not any(x.startswith("── 上次会话的历史") for x in sess_dlines(sess_read(td_col))),
+           "二次快照版本=%r" % ((sess_read(td_col) or "").splitlines()[:1],))
+
+        # v1 老档：没有转义约定 ⇒ 反斜杠是正文。把这条钉住，免得有人拿「不认旧档」当修法。
+        td_v1 = sess_mkdir(SESS_INI_ON)
+        try:
+            with open(os.path.join(td_v1, "termux.session"), "w", encoding="utf-8") as f:
+                f.write("s 1\nu 1\nT 0 p\nP 1\nD $ printf 'A\\eB'\nD LEGACYV1MARK64\n"
+                        "D C:\\Users\\y\n")
+            dv1, exv1 = sess_run(td_v1, ROWS_C, COLS_C, [b"echo NEW65\r"])
+            sv1 = vt_text(ROWS_C, COLS_C, dv1) or []
+            rA_ck("T11 v2.3.0 的老档（s 1，无 ANSI、无转义）照样恢复：三行正文都在、"
+                  "字面量 `A\\eB` 没被当成转义符，且再存一次时升成 s 2",
+                  exv1 and any("LEGACYV1MARK64" in l for l in sv1)
+                  and any("A\\eB" in l for l in sv1) and any("C:\\Users\\y" in l for l in sv1)
+                  and (sess_read(td_v1) or "").splitlines()[:1] == ["s 2"],
+                  "屏=%r 版本=%r" % ([l for l in sv1 if "LEGACY" in l or "Users" in l][:2],
+                                     (sess_read(td_v1) or "").splitlines()[:1]))
+        finally:
+            shutil.rmtree(td_v1, ignore_errors=True)
+
+        # 信号路径：SIGUSR1 = 立刻存一份、进程继续跑（Windows 的关闭事件用的就是同一支
+        # session_flush_now，Linux 上能端到端验的就是它）。
+        td_sig = sess_mkdir(SESS_INI_ON)
+        try:
+            _, alive = sess_run(td_sig, ROWS_C, COLS_C, [b"echo BEFOREUSR166\r"],
+                                quit_keys=(), sig=signal.SIGUSR1, exit_wait=3.0)
+            tmid = sess_read(td_sig) or ""
+            ck("T9 信号里存盘（session_flush_now）：存完进程【还活着】、档里已有那一行 —— "
+               "Windows 的点 X 关窗口走的就是同一支函数（v2.3.0 只在退出钩子存，按 X 时"
+               "一次都没写）",
+               not alive and "BEFOREUSR166" in tmid and tmid.splitlines()[:1] == ["s 2"],
+               "退出正常=%r（这里期望 False：它是被收尾 SIGKILL 掉的）快照=%r" % (alive, tmid[:60]))
+            _, ex2s = sess_run(td_sig, ROWS_C, COLS_C, [b"echo AFTERUSR167\r"])
+            t2s = sess_read(td_sig) or ""
+            ck("T9b 立刻存过之后还能继续用：第二轮退出时把【两轮的字】一起写进去，"
+               "退出钩子也不会因为信号存过就少存（也仍是一次写盘，不重复写两遍）",
+               ex2s and "BEFOREUSR166" in t2s and "AFTERUSR167" in t2s
+               and t2s.count("s 2") >= 1,
+               "退出正常=%r 快照=%r" % (ex2s, t2s[:80]))
+        finally:
+            shutil.rmtree(td_sig, ignore_errors=True)
+    finally:
+        shutil.rmtree(td_col, ignore_errors=True)
 
     print()
     print()
