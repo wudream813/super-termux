@@ -733,13 +733,18 @@ static void sess_feed(Pane *p, SBuf *hist, int lines) {
     SBuf f;
     memset(&f, 0, sizeof(f));
     sbuf_str(&f, "\x1b[m");                      /* 先清掉残留样式，别把整段历史染色 */
-    if (lines > 0) sbuf_fmt(&f, "%s%d%s\r\n", SESS_MARK_HEAD, lines, SESS_MARK_TAIL);
     sbuf_add(&f, hist->p ? hist->p : "", hist->len);
+    if (lines > 0) sbuf_fmt(&f, "%s%d%s\r\n", SESS_MARK_HEAD, lines, SESS_MARK_TAIL);
+    /* v2.3.3：说明行从「历史前面」挪到「历史末尾」。放前面时，长历史（例：32 行）会把
+     * 它顶出视口 —— 用户看到的就是「要能滚动才看得到这行说明」（实测）。挪到末尾之后，
+     * 它是恢复出来的最后一行、紧贴 shell 的提示符，第一屏必定看得见；更早的那些行本来就该
+     * 在滚动缓冲里（滚轮 / PgUp 回看），这也和本仓库「历史归 scrollback」的口径一致。
+     * 注：不用 scroll_offset 去「启动就摊开到历史开头」—— 那条路要跨过 render 的 vo 夹取
+     * （screen_scroll_limit）与 switch_pane 的复位，实测会把画面停在半中间，得不偿失。 */
     EnterCriticalSection(&g_mux.cs);
     screen_process_output(&p->screen, f.p, f.len);
     LeaveCriticalSection(&g_mux.cs);
     p->scroll_offset = 0;
-    free(f.p);
 }
 
 /* 一行说明，只往当前窗格打（lines=0 ⇒ sess_feed 不会补「上次会话的历史」那行）。 */

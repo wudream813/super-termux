@@ -2975,6 +2975,31 @@ int main(int argc, char **argv) {
         finally:
             shutil.rmtree(td_nm, ignore_errors=True)
 
+        td_mk = sess_mkdir(SESS_INI_ON)
+        try:
+            seed = "for i in $(seq 1 40); do echo LONGHIST$i; done\r".encode()
+            sess_run(td_mk, ROWS_C, COLS_C, [seed])                  # 第一程：留一份长历史
+            dl, el = sess_run(td_mk, ROWS_C, COLS_C, [])             # 第二程：只看恢复完那一屏
+            sl = vt_text(ROWS_C, COLS_C, dl) or []
+            rows_mark = [i for i, l in enumerate(sl) if "上次会话的历史" in l]
+            first_line = re.compile(r"LONGHIST1\s*$")
+            older = [i for i, l in enumerate(sl) if first_line.search(l)]
+            rA_ck("T16 长历史（40 条 ⇒ 远超一屏）恢复后，那行「── 上次会话的历史 ──」必须在"
+                  "【第一屏】就看得见（v2.3.2 把它放在历史最前面 ⇒ 被顶出屏幕，用户说"
+                  "「内容过长，能够滚动时才可以显示」）；同时屏上是最新那几行",
+                  el and len(rows_mark) == 1 and rows_mark[0] >= ROWS_C // 2
+                  and sum(1 for l in sl if "LONGHIST" in l) >= 6 and not older,
+                  "说明行行号=%r（屏共 %d 行）LONGHIST 可见=%d 最早那行是否被挤上屏=%r"
+                  % (rows_mark, ROWS_C, sum(1 for l in sl if "LONGHIST" in l), older[:1]))
+            dw, ew = sess_run(td_mk, ROWS_C, COLS_C, [b"\x1b[5~"] * 40)   # PgUp ×40 = 往上翻
+            sw = vt_text(ROWS_C, COLS_C, dw) or []
+            rA_ck("T16b 更早的那些行没丢：PgUp 回看能找到 LONGHIST1（历史归 scrollback，"
+                  "这条口径没变 ⇒ 说明行挪位置不许顺手把老行扔掉）",
+                  ew and any(re.search(r"LONGHIST1\s*$", l) for l in sw),
+                  "屏=%r" % [l for l in sw if "LONGHIST1" in l][:2])
+        finally:
+            shutil.rmtree(td_mk, ignore_errors=True)
+
         td_bd = sess_mkdir(SESS_INI_ON)
         try:
             with open(os.path.join(td_bd, "termux.session"), "w", encoding="utf-8") as f:
