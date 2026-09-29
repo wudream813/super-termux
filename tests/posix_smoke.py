@@ -76,6 +76,7 @@ def main():
     dump = os.path.join(tmp, "render_dump.log")
     env = dict(os.environ)
     env["TERMUX_DUMP"] = "1"
+    env["TERMUX_NO_SESSION"] = "1"   # CI 隔离：见 src/config.c（会话恢复默认开，会把上一轮的档灌回屏上）
     env["TERM"] = "xterm-256color"
     env["PS1"] = "$ "
 

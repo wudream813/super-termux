@@ -32,4 +32,6 @@ third_party/OpenConsole.exe
 
 # 运行时生成的用户配置
 termux.ini
+termux.session
+*.session   # 会话快照（v2.3.0 起；跑判据时落在仓库根，别入库）
 RELEASE_NOTES.md

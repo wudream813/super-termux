@@ -73,6 +73,7 @@ def run(ini_text, marker):
     if pid == 0:
         os.chdir(td)
         os.environ["TERM"] = "xterm-256color"; os.environ["SHELL"] = "/bin/sh"; os.environ["PS1"] = "$ "
+        os.environ["TERMUX_NO_SESSION"] = "1"   # 见 config.c：CI 隔离，别让上一轮快照影响画面
         try:
             os.execv(exe, ["termux"])
         finally:
@@ -116,6 +117,7 @@ def run_settings_ui(keys_after_open, marker):
     if pid == 0:
         os.chdir(td)
         os.environ["TERM"] = "xterm-256color"; os.environ["SHELL"] = "/bin/sh"; os.environ["PS1"] = "$ "
+        os.environ["TERMUX_NO_SESSION"] = "1"   # 见 config.c：CI 隔离，别让上一轮快照影响画面
         try:
             os.execv(exe, ["termux"])
         finally:
@@ -174,6 +176,7 @@ def run_hover_scrollbar(ini_text):
     if pid == 0:
         os.chdir(td)
         os.environ["TERM"] = "xterm-256color"; os.environ["SHELL"] = "/bin/sh"; os.environ["PS1"] = "$ "
+        os.environ["TERMUX_NO_SESSION"] = "1"   # 见 config.c：CI 隔离，别让上一轮快照影响画面
         try:
             os.execv(exe, ["termux"])
         finally:
@@ -216,6 +219,7 @@ def capture_pane_page():
     if pid == 0:
         os.chdir(td)
         os.environ["TERM"] = "xterm-256color"; os.environ["SHELL"] = "/bin/sh"; os.environ["PS1"] = "$ "
+        os.environ["TERMUX_NO_SESSION"] = "1"   # 见 config.c：CI 隔离，别让上一轮快照影响画面
         try:
             os.execv(exe, ["termux"])
         finally:
@@ -381,6 +385,7 @@ def capture_page_keys(rows, cols, keys, ini=None, keep_ini=False):
     if pid == 0:
         os.chdir(td)
         os.environ["TERM"] = "xterm-256color"; os.environ["SHELL"] = "/bin/sh"; os.environ["PS1"] = "$ "
+        os.environ["TERMUX_NO_SESSION"] = "1"   # 见 config.c：CI 隔离，别让上一轮快照影响画面
         try:
             os.execv(exe, ["termux"])
         finally:
@@ -2638,7 +2643,7 @@ int main(int argc, char **argv) {
     td_off = sess_mkdir(SESS_INI_OFF)
     try:
         _, ex_off = sess_run(td_off, ROWS_C, COLS_C, [b"echo OFFSEED99\r"])
-        ck("T1 session = off（默认）时退出【不产生任何会话文件】，不碰没开这个功能的人的目录",
+        ck("T1 显式 session = off 时退出【不产生任何会话文件】（v2.3.2 起默认是开，要静默得自己写 off）",
            ex_off and sess_read(td_off) is None
            and sorted(n for n in os.listdir(td_off) if n.endswith(".session")) == [],
            "退出正常=%r 目录=%r" % (ex_off, sorted(os.listdir(td_off))))
@@ -2904,6 +2909,88 @@ int main(int argc, char **argv) {
                "退出正常=%r 快照=%r" % (ex2s, t2s[:80]))
         finally:
             shutil.rmtree(td_sig, ignore_errors=True)
+
+        # ===== v2.3.2：会话恢复「看不到效果」这一类（默认开 / 找最新那份 / 说了再走）=====
+        # 三条判据都对着用户那句「你这也没有成功恢复啊」：默认 off 时【没手动开过 =
+        # 永远没效果】，Release 的产物名带版本号 ⇒ 换版本 = 换 exe 名 = 快照落在旧名字
+        # 旁边读不到，而「没开 / 读不到 / 读不认」在屏上都长成「什么都没发生」。
+        SESS_INI_BARE = "[general]\nmouse = true\nanim = off\n"   # 故意不写 session 这一行
+        td_def = sess_mkdir(SESS_INI_BARE)
+        try:
+            _, e0 = sess_run(td_def, ROWS_C, COLS_C, [b"echo DEFAULTON70\r"])
+            f_def = sess_read(td_def) or ""
+            ck("T12 ini 里【没有】 session 这一行 ⇒ 默认开：退出照样写盘（v2.3.0/v2.3.1 "
+               "默认 off，这条就该红 —— 用户看到的正是它）",
+               e0 and "DEFAULTON70" in f_def and f_def.splitlines()[:1] == ["s 2"],
+               "退出正常=%r 快照头=%r" % (e0, f_def[:48]))
+            d1, e1 = sess_run(td_def, ROWS_C, COLS_C, [b"echo ROUND2_71\r"])
+            s1 = vt_text(ROWS_C, COLS_C, d1) or []
+            rA_ck("T12b 默认开不是只写了个文件：第二程【屏上】就有上一程那行",
+                  e1 and any("DEFAULTON70" in l for l in s1),
+                  "屏=%r" % [l for l in s1 if "DEFAULTON70" in l][:1])
+        finally:
+            shutil.rmtree(td_def, ignore_errors=True)
+
+        td_nt = sess_mkdir(SESS_INI_BARE)
+        try:
+            d0, e0 = sess_run(td_nt, ROWS_C, COLS_C, [b"echo NOTICERUN72\r"])
+            s0 = vt_text(ROWS_C, COLS_C, d0) or []
+            note0 = [l for l in s0 if "── 会话：" in l]
+            rA_ck("T13 首次启动（没有快照）要说一行「没有可读的快照」，并说清退出时写在哪",
+               e0 and len(note0) == 1 and "没有可读的快照" in note0[0],
+               "屏里的说明行=%r" % note0[:2])
+            f_nt = sess_read(td_nt) or ""
+            ck("T13b 那句说明【不会被当成历史存下去】（档里不含「── 会话：」；存盘时按前缀剔掉）",
+               "── 会话：" not in f_nt and "NOTICERUN72" in f_nt,
+               "档=%r" % f_nt[:60])
+            d1, e1 = sess_run(td_nt, ROWS_C, COLS_C, [b"echo NOTICERUN73\r"])
+            s1 = vt_text(ROWS_C, COLS_C, d1) or []
+            rA_ck("T13c 第二程换成「上次会话的历史」那行，且【不再重复】打说明行（不累积）",
+                  e1 and any("NOTICERUN72" in l for l in s1)
+                  and any("上次会话的历史" in l for l in s1)
+                  and not [l for l in s1 if "── 会话：" in l],
+                  "屏=%r" % [l for l in s1 if "会话" in l][:3])
+        finally:
+            shutil.rmtree(td_nt, ignore_errors=True)
+
+        td_nm = sess_mkdir(SESS_INI_ON)
+        try:
+            _, e0 = sess_run(td_nm, ROWS_C, COLS_C, [b"echo NEWNAME52\r"])
+            good = sess_read(td_nm) or ""
+            src = os.path.join(td_nm, "termux.session")
+            have = bool(good) and os.path.exists(src)
+            if have:                       # 判据不许把整个 harness 带崩：没档就只做「应当有档」这一条
+                os.replace(src, os.path.join(td_nm, "termux-2.3.0-windows-x64.session"))
+                with open(src, "w", encoding="utf-8") as f:
+                    f.write(good.replace("NEWNAME52", "STALECANN53"))
+                old_t = time.time() - 3600
+                os.utime(src, (old_t, old_t))
+            d1, e1 = sess_run(td_nm, ROWS_C, COLS_C, [])
+            s1 = vt_text(ROWS_C, COLS_C, d1) or []
+            rA_ck("T14 快照写在【别的名字】旁边也要读得回来：exe 目录里所有 *.session 取"
+                  "最新那份（换 termux-2.3.1-windows-x64.exe 这种带版本号的产物名就等于丢历史）",
+                  have and e1 and any("NEWNAME52" in l for l in s1)
+                  and not [l for l in s1 if "STALECANN53" in l],
+                  "上一程留下档=%r 屏=%r" % (have, [l for l in s1 if "NAME52" in l or "CANN53" in l][:3]))
+        finally:
+            shutil.rmtree(td_nm, ignore_errors=True)
+
+        td_bd = sess_mkdir(SESS_INI_ON)
+        try:
+            with open(os.path.join(td_bd, "termux.session"), "w", encoding="utf-8") as f:
+                f.write("s 9\nu 1\nT 0 p\nP 1\nD BADVERSIONMARK54\n")
+            d0, e0 = sess_run(td_bd, ROWS_C, COLS_C, [b"echo AFTERBAD55\r"])
+            s0 = vt_text(ROWS_C, COLS_C, d0) or []
+            bad0 = [l for l in s0 if "── 会话：" in l]
+            rA_ck("T15 有档但版本不认 ⇒ 明说「读不认」，且不恢复、不崩（旧档整档不认这条口径不变）",
+               e0 and len(bad0) == 1 and "读不认" in bad0[0]
+               and not [l for l in s0 if "BADVERSIONMARK54" in l],
+               "屏里的说明行=%r" % bad0[:2])
+            f_bd = (sess_read(td_bd) or "").splitlines()[:1]
+            ck("T15b 认不出的那份【不被改坏】：本次退出重写成正经的 s 2（下一次还能用）",
+               f_bd == ["s 2"], "重写后的版本行=%r" % f_bd)
+        finally:
+            shutil.rmtree(td_bd, ignore_errors=True)
     finally:
         shutil.rmtree(td_col, ignore_errors=True)
 

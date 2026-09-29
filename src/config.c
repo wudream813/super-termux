@@ -20,7 +20,9 @@ int g_copy_move_deselect = 1;
 int g_confirm_on_exit = 0;
 int g_confirm_on_close = 0;
 int g_search_case_sensitive = 0;
-int g_session_persist = 0;        /* v2.3.0：`session = on` ⇒ 退出时存会话、下次启动恢复 */
+int g_session_persist = 1;        /* v2.3.0：`session = on` ⇒ 退出时存会话、下次启动恢复。
+                                 * v2.3.2 起默认开：默认关 = 用户没手动开过就永远看不到效果，
+                                 * 而「看不到效果」和「功能坏了」在现场是一模一样的。 */
 /* v2.1.7/8：终端只能整格重绘、没有半透明，所以「淡入」只能靠几帧之间把写给终端的颜色
  * 整体向页面底色混合来模拟 —— 时长也就只能是帧的倍数（动画期间约 8~15ms 一帧，实测
  * 110ms 出 7 档）。默认 110ms：够看出方向，又短到不会让人觉得要点一下等一下。
@@ -122,7 +124,7 @@ void init_default_config(void) {
     g_confirm_on_exit = 0;
     g_confirm_on_close = 0;
     g_search_case_sensitive = 0;
-    g_session_persist = 0;              /* 默认关：不碰任何人的现有行为 */
+    g_session_persist = 1;              /* v2.3.2：默认开（ini 里写 session = off 可关） */
     theme_init();
     keymap_init();
 #ifdef _WIN32
@@ -205,7 +207,7 @@ static int apply_general_key(const char *key, const char *val) {
     if (_stricmp(key, "confirm_on_exit") == 0) { g_confirm_on_exit = config_parse_bool(val, 0); return 1; }
     if (_stricmp(key, "confirm_on_close") == 0) { g_confirm_on_close = config_parse_bool(val, 0); return 1; }
     if (_stricmp(key, "search_case_sensitive") == 0) { g_search_case_sensitive = config_parse_bool(val, 0); return 1; }
-    if (_stricmp(key, "session") == 0)  { g_session_persist = config_parse_bool(val, 0); return 1; }
+    if (_stricmp(key, "session") == 0)  { g_session_persist = config_parse_bool(val, 1); return 1; }   /* 值写坏了当开：这行存在就说明想开 */
     if (_stricmp(key, "anim") == 0) {
         /* off/none 与 0 都是关；写个认不出来的单词时不要把它当成 0 关掉动画，
          * 按默认走 —— 用户手打 ini 打错字是常事，静默关掉功能最难查。 */
@@ -369,6 +371,16 @@ void load_config(void) {
     fclose(f);
 
     if (parsed_count > 0) g_chooser_item_count = parsed_count;
+
+    /* v2.3.2 的开发/CI 把手（与 main.c 那个 TERMUX_DUMP 同族）：TERMUX_NO_SESSION=1 ⇒
+     * 本进程一律不读不写会话快照。为什么判据需要它：`session` 从这一版起默认开，而
+     * 跑判据的脚本多半直接拿仓库里那支 exe —— exe 旁边只要留下一份 termux.session，
+     * 下一轮启动就会把它灌回屏上，渲染类判据（如 lastcol 的「满宽行原样发到宿主」）
+     * 会因为多出来的两行而分块位置改变、红得莫名其妙。产品路径不受影响。 */
+    {
+        const char *ns = getenv("TERMUX_NO_SESSION");
+        if (ns && *ns && *ns != '0') g_session_persist = 0;
+    }
     theme_apply();
 }
 
@@ -398,7 +410,7 @@ void save_config(void) {
         "# theme: github-dark | one-dark | nord | gruvbox-dark | dracula\r\n"
         "# prefix: 前缀键，C- = Ctrl，M- = Alt，S- = Shift，例如 C-a\r\n"
         "# anim: 设置页过渡动画 off | short | normal（也可写毫秒数，上限 600）\r\n"
-        "# session: on ⇒ 退出时把会话（各窗格已滚出去的历史 + 标签与分屏布局，含颜色）写进\r\n"
+        "# session: on ⇒ 退出时把会话（各窗格已滚出去的历史 + 标签与分屏布局，含颜色）写进（默认 on，off 可关）\r\n"
         "#          termux.session，下次启动灌回来（关窗口也存；进程本身不保留，见 README）\r\n";
     fwrite(header, 1, strlen(header), f);
 

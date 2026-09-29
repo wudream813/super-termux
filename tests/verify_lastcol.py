@@ -105,6 +105,7 @@ def main():
         os.chdir(td)
         os.environ["TERM"] = "xterm-256color"; os.environ["SHELL"] = "/bin/sh"
         os.environ["TERMUX_DUMP"] = "1"
+        os.environ["TERMUX_NO_SESSION"] = "1"   # 本判据量渲染分块，会话恢复会挪动它
         try:
             os.execv(EXE, ["termux"])
         finally:

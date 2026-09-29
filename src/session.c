@@ -28,6 +28,11 @@
 #include <string.h>
 #include <time.h>          /* time() —— POSIX 那边被别的头顺带拉进来了，MinGW 不会：
                             * 少这一行就是 implicit-function-declaration，Windows 作业直接红。 */
+#ifndef _WIN32
+#include <dirent.h>        /* v2.3.2：exe 目录里找最新那份 *.session */
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
 
 #define SESS_MAX_BYTES      (6 * 1024 * 1024)   /* 快照文件上限：更大的直接不认 */
 #define SESS_MAX_LINES      4000                /* 每个窗格最多存这么多逻辑行 */
@@ -39,6 +44,13 @@
 /* 恢复时写在窗格最前面那行说明的前缀。写的和读的要认的是同一个串 ⇒ 只在这里写一次
  * （sess_feed 拼的就是「SESS_MARK_HEAD + 「N 行；…）」，存盘时按同一前缀把它剔掉）。 */
 #define SESS_MARK_HEAD      "\xe2\x94\x80\xe2\x94\x80 \xe4\xb8\x8a\xe6\xac\xa1\xe4\xbc\x9a\xe8\xaf\x9d\xe7\x9a\x84\xe5\x8e\x86\xe5\x8f\xb2\xef\xbc\x88\xe5\x85\xb1 "
+
+/* v2.3.2：session = on 但这次什么都没读回来时，在屏上留一行说明 —— 免得「没恢复」和
+ * 「功能没开」「快照读不认」三种情况长成同一个样子（前一轮就是被这个坑到的：判据全绿，
+ * 用户那边只是「什么也没发生」）。以 SESS_NOTE_HEAD 开头的行存盘时同样剔掉。 */
+#define SESS_NOTE_HEAD      "\xe2\x94\x80\xe2\x94\x80 \xe4\xbc\x9a\xe8\xaf\x9d\xef\xbc\x9a"
+#define SESS_NOTE_NONE      SESS_NOTE_HEAD "\xe6\xb2\xa1\xe6\x9c\x89\xe5\x8f\xaf\xe8\xaf\xbb\xe7\x9a\x84\xe5\xbf\xab\xe7\x85\xa7\xef\xbc\x88\xe9\x80\x80\xe5\x87\xba\xe6\x97\xb6\xe4\xbc\x9a\xe5\x86\x99\xe5\x88\xb0 exe \xe5\x90\x8c\xe7\x9b\xae\xe5\xbd\x95 termux.session\xef\xbc\x89\xe2\x94\x80\xe2\x94\x80"
+#define SESS_NOTE_BAD       SESS_NOTE_HEAD "\xe6\x89\xbe\xe5\x88\xb0\xe4\xba\x86\xe5\xbf\xab\xe7\x85\xa7\xe4\xbd\x86\xe8\xaf\xbb\xe4\xb8\x8d\xe8\xae\xa4\xef\xbc\x8c\xe6\x9c\xac\xe6\xac\xa1\xe6\x8c\x89\xe6\x97\xa0\xe5\xbf\xab\xe7\x85\xa7\xe5\xa4\x84\xe7\x90\x86 \xe2\x94\x80\xe2\x94\x80"
 #define SESS_MARK_TAIL      " \xe8\xa1\x8c\xef\xbc\x9b\xe8\xbf\x9b\xe7\xa8\x8b\xe6\xb2\xa1\xe6\x9c\x89\xe7\x95\x99\xe5\x9c\xa8\xe5\x90\x8e\xe5\x8f\xb0\xef\xbc\x89\xe2\x94\x80\xe2\x94\x80" 
 
 /* ---- 追加式小缓冲：写满上限就停止追加（宁少不错，绝不越界） ---- */
@@ -100,9 +112,123 @@ static void sess_unesc(SBuf *b, const char *s, int ver_esc) {
     }
 }
 
-/* 路径与 ini 用同一套定位（exe 旁边优先，其次主目录下的点文件），见 config_sibling_path。 */
+/* 路径与 ini 用同一套定位（exe 旁边优先，其次主目录下的点文件），见 config_sibling_path。
+ * 写永远只写这一支（「一次写盘」这条口径就看它）。 */
 static void sess_path(WCHAR *out, int out_len, int for_write) {
     config_sibling_path(out, out_len, for_write, SESS_PATH_NAME, SESS_HOME_NAME);
+}
+
+#ifndef _WIN32                       /* Windows 侧全程宽字符（FindFirstFileW/stat 用不上），
+                                      * 所以这支只在 POSIX 编出来，免得 -Wunused-function 撞上 -Werror */
+/* 宽字符路径 → UTF-8（POSIX 侧 opendir/stat 只吃窄字符）。 */
+static int sess_w2u(const WCHAR *w, char *dst, int dst_len) {
+    if (!w || !w[0] || dst_len <= 0) return 0;
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, dst, dst_len, NULL, NULL);
+    if (n <= 0) { dst[0] = 0; return 0; }
+    dst[dst_len - 1] = 0;
+    return 1;
+}
+#endif
+
+/* v2.3.2 读档的「发现」：不止认 exe 旁边那一个文件名。
+ *
+ * 为什么要这一支：换版本的人多半是把 termux-2.3.x-windows-x64.exe 直接扔进 Downloads
+ * 跑 —— 快照写在【上一次那个 exe 的名字】旁边，下一次换个名字启动就找不到，看着就像
+ * 「根本没存」。所以下次启动时：exe 目录里所有 *.session + 主目录那份点文件，谁最新
+ * 用谁（只读；写仍然只写规范名，不留一地文件）。
+ * ---------------------------------------------------------------------- */
+static time_t sess_mtime(const WCHAR *path) {
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) return 0;
+    if (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return 0;
+    /* FILETIME = 1601 起的 100ns 计数 ⇒ 换算成 Unix 秒（差值 11644473600） */
+    unsigned long long t = ((unsigned long long)fa.ftLastWriteTime.dwHighDateTime << 32)
+                          | (unsigned long long)fa.ftLastWriteTime.dwLowDateTime;
+    return (time_t)(t / 10000000ULL - 11644473600ULL);
+#else
+    char u[MAX_PATH * 4];
+    if (!sess_w2u(path, u, (int)sizeof(u))) return 0;
+    struct stat st;
+    if (stat(u, &st) != 0 || S_ISDIR(st.st_mode)) return 0;
+    return st.st_mtime;
+#endif
+}
+
+/* 目录里挑一个最新修改的 *.session 出来（连自己那份规范名一起比）。
+ * 找不到任何一份 ⇒ 返回 0，out 里放的是「本该写在哪」，给提示语用。 */
+static int sess_pick_newest(WCHAR *out, int out_len) {
+    WCHAR path[MAX_PATH] = { 0 };
+    sess_path(path, MAX_PATH, 1);                    /* exe 旁的规范名（一定先建目录串） */
+    wcsncpy(out, path, out_len - 1);
+    WCHAR *sep = wcsrchr(out, TERMUX_PATH_SEP);
+    if (!sep) return 0;
+    *sep = 0;                                        /* out 现在是目录 */
+
+    time_t best = 0;
+    WCHAR bestname[MAX_PATH] = { 0 };
+
+#ifdef _WIN32
+    WCHAR pat[MAX_PATH * 2] = { 0 };
+    _snwprintf(pat, (int)(sizeof(pat) / sizeof(pat[0])) - 1, L"%s" TERMUX_PATH_SEP_S L"*.session", out);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            WCHAR full[MAX_PATH * 2] = { 0 };
+            _snwprintf(full, (int)(sizeof(full) / sizeof(full[0])) - 1,
+                       L"%s" TERMUX_PATH_SEP_S L"%s", out, fd.cFileName);
+            time_t t = sess_mtime(full);
+            if (t > best) { best = t; wcsncpy(bestname, fd.cFileName, MAX_PATH - 1); }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+#else
+    char dir[MAX_PATH * 4];
+    if (sess_w2u(out, dir, (int)sizeof(dir))) {
+        DIR *d = opendir(dir);
+        if (d) {
+            size_t dlen = strlen(dir);
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                size_t nl = strlen(de->d_name);
+                if (nl < 8 || strcmp(de->d_name + nl - 8, ".session") != 0) continue;
+                char full[MAX_PATH * 6];
+                if (dlen + nl + 2 >= sizeof(full)) continue;
+                memcpy(full, dir, dlen);
+                full[dlen] = '/';
+                memcpy(full + dlen + 1, de->d_name, nl + 1);
+                struct stat st;
+                if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+                if (st.st_mtime > best) {
+                    best = st.st_mtime;
+                    for (size_t i = 0; i <= nl && i < MAX_PATH - 1; i++)
+                        bestname[i] = (WCHAR)(unsigned char)de->d_name[i];
+                }
+            }
+            closedir(d);
+        }
+    }
+#endif
+
+    /* 主目录那份也参评 */
+    const WCHAR *prof = plat_user_home();
+    if (prof) {
+        WCHAR alt[MAX_PATH] = { 0 };
+        _snwprintf(alt, MAX_PATH - 1, L"%s" TERMUX_PATH_SEP_S SESS_HOME_NAME, prof);
+        time_t t = sess_mtime(alt);
+        if (t > best) {
+            wcsncpy(out, alt, out_len - 1);
+            return 1;
+        }
+    }
+    if (!best || !bestname[0]) return 0;
+    WCHAR full[MAX_PATH * 2] = { 0 };
+    _snwprintf(full, (int)(sizeof(full) / sizeof(full[0])) - 1,
+               L"%s" TERMUX_PATH_SEP_S L"%s", out, bestname);
+    wcsncpy(out, full, out_len - 1);
+    return 1;
 }
 
 /* =========================================================================
@@ -294,6 +420,7 @@ static void sess_write_pane(ScreenBuffer *s, SBuf *b) {
     memset(&scr, 0, sizeof(scr));
     int keep = b->len;
     int mlen = (int)strlen(SESS_MARK_HEAD);
+    int nlen = (int)strlen(SESS_NOTE_HEAD);
     for (int i = 0; i < n; i++) {
         int to = (i + 1 < n) ? starts[i + 1] - 1 : s->rows - 1;
         int used = 0, head = 1, mark = 0, cut = 0, code = 0;   /* code 逐行重算：上一行的颜色不许替这一行补复位 */
@@ -305,7 +432,8 @@ static void sess_write_pane(ScreenBuffer *s, SBuf *b) {
             if (r <= 0) continue;                          /* 空行（或全空白）不进这一条 */
             if (head) {
                 head = 0;
-                if (r >= mlen && memcmp(scr.p, SESS_MARK_HEAD, (size_t)mlen) == 0) {
+                if ((r >= mlen && memcmp(scr.p, SESS_MARK_HEAD, (size_t)mlen) == 0) ||
+                    (r >= nlen && memcmp(scr.p, SESS_NOTE_HEAD, (size_t)nlen) == 0)) {
                     mark = 1;
                     break;
                 }
@@ -614,30 +742,45 @@ static void sess_feed(Pane *p, SBuf *hist, int lines) {
     free(f.p);
 }
 
+/* 一行说明，只往当前窗格打（lines=0 ⇒ sess_feed 不会补「上次会话的历史」那行）。 */
+static void sess_notice(const char *msg) {
+    int ai = g_mux.active_pane;
+    if (ai < 0 || ai >= g_mux.pane_count) return;
+    SBuf b;
+    memset(&b, 0, sizeof(b));
+    /* 两头都要换行：此刻游标正停在 shell 已经打出来的那行提示符后面，贴着它写 ⇒ 这行
+     * 从第二列才开始，存盘时「按前缀剔掉说明行」那条判据就抓不到它（实测会被当历史
+     * 存下去，于是下一轮又多一行）。先 \r\n 起新行、写完再 \r\n 让提示符回到新行。 */
+    sbuf_str(&b, "\r\n");
+    sbuf_str(&b, msg);
+    sbuf_str(&b, "\r\n");
+    sess_feed(&g_mux.panes[ai], &b, 0);
+    free(b.p);
+}
+
 int session_restore(void) {
     if (!g_session_persist) return 0;
 
     WCHAR path[MAX_PATH] = { 0 };
-    sess_path(path, MAX_PATH, 0);
-    FILE *f = _wfopen(path, L"rb");
+    /* v2.3.2：不再只认 exe 旁那个固定名字 —— 目录里所有 *.session 与主目录那份一起
+     * 比时间，取最新的（换了 exe 文件名就等于换了快照目录，上一版栽在这上面）。 */
+    int have = sess_pick_newest(path, MAX_PATH);
+    FILE *f = have ? _wfopen(path, L"rb") : NULL;
+    int why = have ? 2 : 1;                       /* 1 = 一份快照都没有；2 = 有但读不认 */
     if (!f) {
-        const WCHAR *prof = plat_user_home();
-        if (!prof) return 0;
-        WCHAR alt[MAX_PATH] = { 0 };
-        _snwprintf(alt, MAX_PATH - 1, L"%s" TERMUX_PATH_SEP_S SESS_HOME_NAME, prof);
-        f = _wfopen(alt, L"rb");
-        if (!f) return 0;
+        sess_notice(why == 1 ? SESS_NOTE_NONE : SESS_NOTE_BAD);
+        return 0;
     }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > SESS_MAX_BYTES) { fclose(f); return 0; }
+    if (sz <= 0 || sz > SESS_MAX_BYTES) { fclose(f); sess_notice(SESS_NOTE_BAD); return 0; }
     char *raw = (char *)malloc((size_t)sz + 1);
-    if (!raw) { fclose(f); return 0; }
+    if (!raw) { fclose(f); sess_notice(SESS_NOTE_BAD); return 0; }
     size_t rd = fread(raw, 1, (size_t)sz, f);
     fclose(f);
     raw[rd] = 0;
-    if (rd == 0) { free(raw); return 0; }
+    if (rd == 0) { free(raw); sess_notice(SESS_NOTE_BAD); return 0; }
 
     /* 从现在起会动窗格（建 tab / 失败回滚都走 close_pane）⇒ 这段时间不许采集，
      * 免得把「恢复到一半」当成一份快照存下去。suppress 必须和这里的每一条 return
@@ -717,6 +860,9 @@ done:
     g_sess_suppress = 0;
     free(recs);
     free(raw);
+    /* 文件在、也打开了，但一条都没恢复出来（版本不认 / 结构坏了 / 空快照）⇒ 同样要
+     * 说一声：「有档」和「有档但读不认」在用户那边长成同一个样子，不能靠猜。 */
+    if (why && tabs < 1) sess_notice(SESS_NOTE_BAD);
     if (tabs < 1) return 0;
     if (focus_pane >= 0 && focus_pane < g_mux.pane_count) switch_pane(focus_pane);
     g_mux.needs_redraw = 1;
