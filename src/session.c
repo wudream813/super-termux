@@ -595,6 +595,8 @@ static int sess_write_keep(void) {
 
 int session_save(void) {
     if (!g_session_persist || g_sess_exit_flush) return 0;
+    session_pump_pending_all();   /* v2.3.4：挂着的快照先落地再采集，否则「恢复了但没来得及
+                                     * 显示」的那一段会在这一轮存盘时凭空消失 */
     session_note_now();      /* 窗格还活着的话此刻再采一次（多半已是同一份） */
     return sess_write_keep();
 }
@@ -613,6 +615,7 @@ int session_save(void) {
  * 拿锁只等有限时间（TryEnter 200 次 ≈ 400ms）：信号/事件可能打在别的线程持锁中间，
  * 死等等于把退出路径挂在锁上。等不到就用上一次采集的那份落盘（宁少不错）。 */
 int session_flush_now(int for_exit_path) {
+    session_pump_pending_all();   /* v2.3.4：同上，信号里存盘也要先把挂起的快照落地 */
     if (!g_session_persist || g_sess_flushing) return 0;
     g_sess_flushing = 1;
     int locked = 0;
@@ -728,23 +731,104 @@ static int sess_index_lines(char *raw, SRec **out) {
 
 /* 把某个窗格的快照文本灌回屏幕缓冲。锁只在这一句上（create_pane_shell 内部也要拿
  * 锁，见 wincompat.h 里那句「必须可重入」—— 可重入不等于该套着拿）。 */
+/* v2.3.4：把「灌快照」与「shell 第一帧」排出先后 —— 快照【挂起】到该窗格收到第一帧真
+ * 输出之后再落屏。为什么要排：Windows 上 shell 起来那一帧，ConPTY 会重绘【整个视口】，
+ * 快照若是先落进去的那一批行，就被这一记原地盖掉 —— 用户看到的正是「闪了一下历史，
+ * 马上没了」（Linux 的 pty 不重绘整屏 ⇒ 本仓库这套判据一直量不到，v2.3.0~2.3.3 都栽在
+ * 这）。Windows Terminal 从另一头解决：`TermControl::_InitializeTerminal` 里「有
+ * _restorePath 就先恢复 buffer，否则才 Connection().Start()」（TermControl.cpp:1402-1408），
+ * 让两者不撞车。我们不必为此把 create_pane_shell 拆成「建屏」+「起进程」（两平台各 150 行
+ * 启动路径，风险不对等），改成把【灌入】排到首帧之后：同一个不变量，而且对任意长度的历史
+ * 都成立（排在前面时，短历史仍整块留在视口里、照样被盖）。 */
+static void sess_apply(Pane *p, const char *buf, int len) {
+    EnterCriticalSection(&g_mux.cs);
+    screen_process_output(&p->screen, buf, len);
+    LeaveCriticalSection(&g_mux.cs);
+}
+
 static void sess_feed(Pane *p, SBuf *hist, int lines) {
     if (!p || !p->active || (lines <= 0 && hist->len <= 0)) return;
     SBuf f;
     memset(&f, 0, sizeof(f));
-    sbuf_str(&f, "\x1b[m");                      /* 先清掉残留样式，别把整段历史染色 */
-    sbuf_add(&f, hist->p ? hist->p : "", hist->len);
+    /* 先清掉残留样式（别把整段历史染色），再换行 —— 这个 \r\n 是必需的：不另起一行，说明行
+     * 会被接在 shell 提示符同一行后面（`$ ── 上次会话的历史…`），锚定到「快照首行」时它就
+     * 落在窗口上面那一格，屏上永远看不到（自查实测）。 */
+    sbuf_str(&f, "\x1b[m\r\n");
+    /* 说明行回到块首：视图现在锚到「快照的第一行」（见 session_pump_pending），它就落在
+     * 屏幕第一行，不会被顶出去（v2.3.3 挪到块尾是为了绕开顶出去，那一条由此接管）。
+     * 存盘侧剔说明行是逐行按前缀判的，位置不影响。 */
     if (lines > 0) sbuf_fmt(&f, "%s%d%s\r\n", SESS_MARK_HEAD, lines, SESS_MARK_TAIL);
-    /* v2.3.3：说明行从「历史前面」挪到「历史末尾」。放前面时，长历史（例：32 行）会把
-     * 它顶出视口 —— 用户看到的就是「要能滚动才看得到这行说明」（实测）。挪到末尾之后，
-     * 它是恢复出来的最后一行、紧贴 shell 的提示符，第一屏必定看得见；更早的那些行本来就该
-     * 在滚动缓冲里（滚轮 / PgUp 回看），这也和本仓库「历史归 scrollback」的口径一致。
-     * 注：不用 scroll_offset 去「启动就摊开到历史开头」—— 那条路要跨过 render 的 vo 夹取
-     * （screen_scroll_limit）与 switch_pane 的复位，实测会把画面停在半中间，得不偿失。 */
-    EnterCriticalSection(&g_mux.cs);
-    screen_process_output(&p->screen, f.p, f.len);
-    LeaveCriticalSection(&g_mux.cs);
-    p->scroll_offset = 0;
+    sbuf_add(&f, hist->p ? hist->p : "", hist->len);
+    free(p->sess_pend);                            /* 理论上只该有一次；重复灌以后者为准 */
+    p->sess_pend = NULL;
+    p->sess_pend_len = 0;
+    p->sess_pend_armed = 0;
+    if (f.p && f.len > 0) {                        /* 所有权直接交给窗格，少一次拷贝 */
+        p->sess_pend = f.p;
+        p->sess_pend_len = f.len;
+        p->sess_pend_armed = 1;
+    } else {
+        free(f.p);
+    }
+}
+
+/* 落地：灌进屏 + 把视图锚到快照第一行。
+ * vo 的算法：本仓库的回看是「从底部往上跳几个显示行」，而 Windows Terminal 用的是绝对行
+ * （Terminal::UserScrollViewport(viewTop)：_scrollOffset = realTop - viewTop，Terminal.cpp:1107）。
+ * 两者可换算：要让快照首行（下标 h0）落在屏幕第一行，取 vo = (h1 - rows) - h0 = limit - h0，
+ * 其中 h0/h1 = 灌之前/之后的 reflow 内容总高。这个 vo 恒 <= limit ⇒ 不必放宽 render.c 的夹取，
+ * 也不碰 screen_reflow_height() 那条「首末内容之外的空白不落位」（v1.8.52 靠它避免「历史开头
+ * 一片空白」），上一轮我垫空行 + vo=hist 就是撞在这两条上。 */
+void session_pump_pending(int pane_idx) {
+    if (pane_idx < 0 || pane_idx >= MAX_PANES) return;
+    Pane *p = &g_mux.panes[pane_idx];
+    if (!p->active || !p->sess_pend_armed) return;
+    p->sess_pend_armed = 0;
+    if (p->sess_pend_len <= 0 || !p->sess_pend) return;
+    ScreenBuffer *sb = &p->screen;
+    int cols = sb->cols;
+    /* 首帧到达时窗格尺寸可能还没落地（cols/rows 未定 ⇒ reflow 高度量不出来，h0 会是 0，
+     * 锚就退化成「停在内容顶端」，说明行被顶上/顶下半行）；退一步用光标行当块首下标，
+     * 两者差不过一两行 ⇒ 判据钉的是「在第一屏前几行内」（<=3），不是咬死某一行。 */
+    int h0 = cols > 0 ? screen_reflow_height(sb, cols) : 0;
+    if (h0 <= 0) h0 = sb->cursor_y;
+    int plen = p->sess_pend_len;
+    sess_apply(p, p->sess_pend, plen);
+    free(p->sess_pend);
+    p->sess_pend = NULL;
+    p->sess_pend_len = 0;
+    /* 记【绝对锚】而不是记死一个 scroll_offset：回看偏移在本引擎里是「从底部往上跳几行」，
+     * 之后 shell 每出一行都会把它顶偏一行（实测就是这样差一行，说明行被推出屏外）。
+     * Windows Terminal 用绝对行号所以天然稳定（_scrollOffset = realTop - viewTop，
+     * Terminal.cpp:1107；新输出到达时 _PreserveUserScrollOffset 按 viewportDelta 补偿，
+     * Terminal.cpp:1096）⇒ 这里同构地存锚，由 render 每帧换算。 */
+    /* 往上多留一行（锚 = h0-1）：说明行落在屏幕第 1 行而不是第 0 行。两个理由：
+     * 1) h0 在「首帧到达时窗格尺寸还没落地」那种场合只能拿光标行兜底，可能差一两行 ——
+     *    留一行余量，误差方向怎么偏说明行都还在屏上（判据按 0~1 行钉）；
+     * 2) 上面正好是 shell 那句提示符，看着比贴着标签栏更顺。 */
+    p->rf_anchor = h0 > 1 ? h0 - 1 : 0;
+    p->restore_view = 1;
+    int lim = screen_scroll_limit(sb);
+    p->scroll_offset = (lim - p->rf_anchor) > 0 ? lim - p->rf_anchor : 0;
+    g_mux.needs_redraw = 1;
+    dump_mark("[sess] pump pane=%d len=%d anchor=%d lim=%d vo=%d hist=%d",
+              pane_idx, plen, p->rf_anchor, lim, p->scroll_offset, sb->hist_lines);
+}
+
+void session_pump_pending_all(void) {
+    for (int i = 0; i < MAX_PANES; i++) session_pump_pending(i);
+}
+
+/* 窗格要没了（或快照不再打算显示）⇒ 丢弃挂起块。 */
+void session_drop_pending(int pane_idx) {
+    if (pane_idx < 0 || pane_idx >= MAX_PANES) return;
+    Pane *p = &g_mux.panes[pane_idx];
+    free(p->sess_pend);
+    p->sess_pend = NULL;
+    p->sess_pend_len = 0;
+    p->sess_pend_armed = 0;
+    p->restore_view = 0;
+    p->rf_anchor = 0;
 }
 
 /* 一行说明，只往当前窗格打（lines=0 ⇒ sess_feed 不会补「上次会话的历史」那行）。 */

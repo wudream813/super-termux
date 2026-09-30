@@ -59,6 +59,12 @@ int session_save(void);
  * 别的线程持有的锁上。返回 1 = 写了文件。 */
 int session_flush_now(int for_exit_path);
 
+/* v2.3.4：把挂起的快照灌进屏（排在窗格第一帧输出之后）。pane.c 的读路径在收到第一帧时调
+ * 单个窗格那支；session_save()/session_flush_now() 前调 all 那支兜底。 */
+void session_pump_pending(int pane_idx);
+void session_pump_pending_all(void);
+void session_drop_pending(int pane_idx);   /* 关窗格时丢弃未落地的挂起块 */
+
 /* 启动时调用（第一个窗格建好之后、首次渲染之前）。返回恢复出的标签页数；
  * 0 = 没有快照或版本/格式不认 ⇒ 一切照旧启动，绝不让启动失败。 */
 int session_restore(void);

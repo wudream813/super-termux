@@ -13,6 +13,14 @@ extern int g_split_zoom;
 
 void write_to_pane_internal(Pane *pane, const char *data, int len) {
     if (!pane || !pane->active) return;
+    /* v2.3.4 = Windows Terminal 的 Terminal::TrySnapOnInput（Terminal.cpp:495）：摊开的
+     * 快照只是视图，不是模式；按键照常送进 shell，一个字节都不吞。 */
+    if (pane->restore_view) {
+        pane->restore_view = 0;
+        pane->rf_anchor = 0;
+        pane->scroll_offset = 0;
+        g_mux.needs_redraw = 1;
+    }
     plat_write_fd(pane->pipe_in, data, len);
 }
 
@@ -102,6 +110,11 @@ unsigned __stdcall pane_read_thread(void *arg) {
          * 由 screen_repaint_reanchor 把提示符顶回底行。 */
         screen_repaint_align(&pane->screen, buf, br);
         screen_process_output(&pane->screen, buf, (size_t)br);
+        /* v2.3.4：这一格的第一帧真输出【已经落进屏】⇒ 此刻才把挂着的快照接上，于是
+         * 快照是屏上最后被写入的一批行，Windows 上 shell 启动那记整视口重绘盖不到它
+         * （顺序为什么这样排、以及与 WT `_InitializeTerminal` 的对应关系，见 session.c
+         * 里 sess_feed 上方的注释）。只在第一帧后做一次（armed 位就地清）。 */
+        session_pump_pending((int)(pane - g_mux.panes));
         /* 搜索开着时，新输出里的关键词也要能被找到（重扫在主循环里做，每帧一次）。
          * 只有活动窗格的内容会被搜索，别的窗格来了输出不用置脏。 */
         if (idx == g_mux.active_pane) search_mark_dirty();
@@ -554,6 +567,7 @@ void close_pane(int idx) {
     pane->thread = NULL_HANDLE;
 
     EnterCriticalSection(&g_mux.cs);
+    session_drop_pending(idx);   /* v2.3.4：还没落地的快照块随窗格一起丢掉（内存 + 挂起位） */
     free(pane->rf_grid); pane->rf_grid = NULL; pane->rf_valid = 0; pane->rf_rows = pane->rf_cols = 0;
     screen_free(&pane->screen);
     LeaveCriticalSection(&g_mux.cs);
@@ -572,7 +586,9 @@ void switch_pane(int idx) {
         split_init_tab(idx);
     }
     g_mux.active_pane = idx;
-    g_mux.panes[idx].scroll_offset = 0;
+    /* v2.3.4：session_restore() 末尾正是用这支落焦点，顺手清零会把刚设好的「停在快照
+     * 第一行」抹掉 ⇒ 恢复视图期间不复位。 */
+    if (!g_mux.panes[idx].restore_view) g_mux.panes[idx].scroll_offset = 0;
     g_mux.needs_redraw = 1;
 }
 

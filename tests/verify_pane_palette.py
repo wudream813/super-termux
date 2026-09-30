@@ -437,7 +437,8 @@ def sess_mkdir(ini_text):
     return td
 
 
-def sess_run(td, rows, cols, keys, quit_keys=(b"\x02d",), exit_wait=12.0, sig=None):
+def sess_run(td, rows, cols, keys, quit_keys=(b"\x02d",), exit_wait=12.0, sig=None,
+             env_extra=None):
     """在【已存在的】目录里起一次 termux：发完 keys 后【先存一份屏幕字节】，再发 quit_keys
     等它自己退出。返回 (退出前最后一帧的字节, 是否正常退出)。
 
@@ -454,6 +455,8 @@ def sess_run(td, rows, cols, keys, quit_keys=(b"\x02d",), exit_wait=12.0, sig=No
         os.environ["TERM"] = "xterm-256color"
         os.environ["SHELL"] = "/bin/sh"
         os.environ["PS1"] = "$ "
+        for _k, _v in (env_extra or {}).items():      # v2.3.4：T16c 要用 $ENV 挂 shell 启动脚本
+            os.environ[_k] = _v
         try:
             os.execv(os.path.join(td, "termux"), ["termux"])
         finally:
@@ -2669,7 +2672,14 @@ int main(int argc, char **argv) {
            ex1 and r1[:1] == ["s 2"] and txt.count("\nT ") == 1
            and [l[2:] for l in r1 if l.startswith("T ")] == ["0 v50pp"]
            and right1[:2] == ["$ echo RIGHTSEED42", "RIGHTSEED42"] and 2 <= len(right1) <= 3
-           and left1[0].endswith("echo LEFTSEED41") and 4 <= len(left1) <= 6
+           # 提示符那一行：可能和紧随的回显同一行（`$ echo LEFTSEED41`），也可能独占一行
+           # （上面注释里说的「两种都出现过」）。这里把两种形状都写死成结构，而不是靠放宽
+           # 条数上限放过 —— v2.3.4 复核：同一份场景拿已发布的 v2.3.3 档跑，两种形状都出现，
+           # 且与本次改动无关（本树与 v2.3.3 各 3 次，结果一模一样）。
+           and (left1[0].endswith("echo LEFTSEED41")
+                or (left1[0].rstrip() in ("$", "$ ") and len(left1) > 1
+                    and left1[1].endswith("echo LEFTSEED41")))
+           and 4 <= len(left1) <= 6
            and sum(1 for x in left1 if x.endswith("LEFTSEED41")) == 2
            and sum(1 for x in left1 if x.endswith("中文测试甲")) == 2
            and sum(1 for x in right1 if x.endswith("RIGHTSEED42")) == 2
@@ -2981,17 +2991,53 @@ int main(int argc, char **argv) {
             sess_run(td_mk, ROWS_C, COLS_C, [seed])                  # 第一程：留一份长历史
             dl, el = sess_run(td_mk, ROWS_C, COLS_C, [])             # 第二程：只看恢复完那一屏
             sl = vt_text(ROWS_C, COLS_C, dl) or []
-            rows_mark = [i for i, l in enumerate(sl) if "上次会话的历史" in l]
+            rows_mark0 = [i for i, l in enumerate(sl) if "上次会话的历史" in l]
             first_line = re.compile(r"LONGHIST1\s*$")
             older = [i for i, l in enumerate(sl) if first_line.search(l)]
-            rA_ck("T16 长历史（40 条 ⇒ 远超一屏）恢复后，那行「── 上次会话的历史 ──」必须在"
-                  "【第一屏】就看得见（v2.3.2 把它放在历史最前面 ⇒ 被顶出屏幕，用户说"
-                  "「内容过长，能够滚动时才可以显示」）；同时屏上是最新那几行",
-                  el and len(rows_mark) == 1 and rows_mark[0] >= ROWS_C // 2
-                  and sum(1 for l in sl if "LONGHIST" in l) >= 6 and not older,
-                  "说明行行号=%r（屏共 %d 行）LONGHIST 可见=%d 最早那行是否被挤上屏=%r"
-                  % (rows_mark, ROWS_C, sum(1 for l in sl if "LONGHIST" in l), older[:1]))
-            dw, ew = sess_run(td_mk, ROWS_C, COLS_C, [b"\x1b[5~"] * 40)   # PgUp ×40 = 往上翻
+            rows_mark = rows_mark0
+            nvis = sum(1 for l in sl if "LONGHIST" in l)
+            rA_ck("T16 v2.3.4 口径：长历史恢复后视图【锚在快照的第一行】⇒ 说明行落在第一屏第"
+                  " 0~3 行（上面还留着 shell 那句提示符），且最早那行 LONGHIST1 当场可见（v2.3.2 把说明行放块首 ⇒ 被顶出屏；"
+                  "v2.3.3 挪到块尾 ⇒ 只能看到最新几行，用户两次都报「要能滚动才看得到」）",
+                  el and len(rows_mark) == 1 and rows_mark[0] <= 3 and nvis >= 10 and older,
+                  "说明行行号=%r（屏共 %d 行）LONGHIST 可见=%d 最早那行=%r"
+                  % (rows_mark, ROWS_C, nvis, older[:1]))
+            # T16c：把 Windows 上那一帧的形状搬到 Linux 上复现 —— 让 shell 在起完提示符之后
+            # 自己输出「全视口逐行重绘 + ED(2)」（$ENV 是 dash 交互 shell 的启动脚本，纯输出
+            # 侧、不经按键 ⇒ 不会触发 snap-on-input）。v2.3.0~v2.3.3 的历史正是被这一记盖掉的，
+            # 而本地 pty 平时不重绘整屏 ⇒ 前面几版判据全都量不到。
+            rc = os.path.join(td_mk, "rc.sh")
+            paint = ["sleep 1", "printf '\\033[2J\\033[H'"]
+            for _i in range(1, ROWS_C + 1):
+                paint.append("printf '\\033[%d;1H\\033[2KPAINT%02d'" % (_i, _i))
+            paint.append("printf '\\033[%d;1H'" % ROWS_C)
+            with open(rc, "w", encoding="utf-8") as _f:
+                _f.write("\n".join(paint) + "\n")
+            dr, er = sess_run(td_mk, ROWS_C, COLS_C, [], env_extra={"ENV": rc})
+            sr = vt_text(ROWS_C, COLS_C, dr) or []
+            rA_ck("T16c shell 吐完整视口重绘那一帧之后，恢复出来的说明行与最早那行仍在屏上"
+                  "（快照排在首帧之后落地 + 视图按绝对行锚定，等价于 WT 的「先恢复 buffer 再"
+                  " Start()」与 UserScrollViewport 绝对行）；拿 v2.3.3 的发布档反向对照过，"
+                  "它在这一条上是红的",
+                  er and any("上次会话的历史" in l for l in sr)
+                  and any(first_line.search(l) for l in sr),
+                  "屏里说明行/最早行=%r" % [l for l in sr if "上次会话的历史" in l or "LONGHIST1" in l][:2])
+            # T16d：按任意键 ⇒ 摊开的视图交还实时底部（WT Terminal::TrySnapOnInput），
+            # 但键本身必须照常进 shell —— 一个字节都不许吞。
+            dk, ek = sess_run(td_mk, ROWS_C, COLS_C, [b"echo SNAPKEY56\r"])
+            sk = vt_text(ROWS_C, COLS_C, dk) or []
+            rA_ck("T16d 按键之后摊开视图让位（说明行不再占屏）且该键照常送进 shell："
+                  "SNAPKEY56 出现在屏上",
+                  ek and any("SNAPKEY56" in l for l in sk) and not any("上次会话的历史" in l for l in sk),
+                  "屏=%r" % [l for l in sk if "SNAPKEY56" in l][:1])
+            # T16b 自己开一份干净的目录：前面几条（T16c 的重绘帧、T16d 的按键）都往同一个 td 里
+            # 追加过过程，滚到顶时看到的是「被这些过程改写过的屏」，量不出「老行没丢」这条本身。
+            td_up = sess_mkdir(SESS_INI_ON)
+            try:
+                sess_run(td_up, ROWS_C, COLS_C, [seed])
+                dw, ew = sess_run(td_up, ROWS_C, COLS_C, [b"\x1b[5~"] * 40)   # PgUp ×40 = 往上翻
+            finally:
+                shutil.rmtree(td_up, ignore_errors=True)
             sw = vt_text(ROWS_C, COLS_C, dw) or []
             rA_ck("T16b 更早的那些行没丢：PgUp 回看能找到 LONGHIST1（历史归 scrollback，"
                   "这条口径没变 ⇒ 说明行挪位置不许顺手把老行扔掉）",

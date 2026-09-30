@@ -131,6 +131,13 @@ typedef struct {
     char title[64];
     char full_title[256];
     int scroll_offset;
+    int restore_view;       /* v2.3.4：启动视图停在「快照第一行」（= WT 的 UserScrollViewport
+                             * 绝对行 + TrySnapOnInput）；用户按键或滚轮就交还控制权 */
+    int rf_anchor;          /* v2.3.4：restore_view 期间，希望落在屏幕首行的 reflow 显示行下标
+                             * （每帧由 render 换算成 scroll_offset，故新输出不会把它顶走） */
+    char *sess_pend;        /* v2.3.4：待灌入的快照文本（排在窗格第一帧输出之后，见 pane.c） */
+    int sess_pend_len;
+    int sess_pend_armed;
     int color;
     int is_settings;
     int is_about;

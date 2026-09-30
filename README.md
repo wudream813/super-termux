@@ -5,7 +5,7 @@
 终端复用器（Terminal Multiplexer）—— 模块化 C 架构，单文件可执行。
 在一个终端窗口里管理多个 shell 会话，像 tmux 一样分标签页、分屏、搜历史。
 
-当前版本：**v2.3.3**（正式支持 Windows / Linux / macOS 三个系统）
+当前版本：**v2.3.4**（正式支持 Windows / Linux / macOS 三个系统）
 
 ## 平台支持
 
@@ -313,6 +313,16 @@ python3 verify_config_theme.py     # 配置体系：主题参考色板完整性 
 
 
 ## 版本历史
+
+**v2.3.4** —— 按 Windows Terminal 的做法把「恢复的历史被首帧盖掉 / 必须滚动才看得到」这两条真正修掉：快照**改排在窗格第一帧输出之后**落地，视图**按绝对行锚定**到快照第一行。
+
+| # | 内容 |
+|---|---|
+| 顺序（治「闪一下就没了」） | Windows 上 shell 起来那一帧，ConPTY 会重绘**整个视口**；快照若是先落进去的那批行，就被这一记原地盖掉 —— 这是 v2.3.0~2.3.3 反复没修好的那一半（Linux 的 pty 不重绘整屏，所以本地判据量不到）。现在 `sess_feed` 不再当场上屏，而是把这块文本**挂起**在该窗格上，等它收到第一帧真输出、并且这一帧已经落屏之后，才接上去（`src/pane.c` 读路径里的 `session_pump_pending`）⇒ 快照成了屏上最后被写入的一批行，没有任何东西再盖它。对标 `microsoft/terminal`：`TermControl::_InitializeTerminal` 是「有 `_restorePath` 就先把 buffer 恢复出来，否则才 `Connection().Start()`」（`TermControl.cpp:1402-1408`）—— 同一条不变量「恢复与首帧不撞车」；我们没把 `create_pane_shell` 拆成「建屏」+「起进程」（两平台各约 150 行启动路径，风险不对等），改排顺序拿到同样的效果，且对任意长度的历史都成立。兜底：`session_save()`/`session_flush_now()` 采集之前先把挂起块落地（否则「恢复了但还没显示就退出」下一轮会丢），窗格关闭时丢弃它。 |
+| 绝对行锚（治「要能滚动才看得到」） | 说明行回到块首，视图锚定到它：`Pane.rf_anchor` 存的是**reflow 显示行的绝对下标**，`render_split_pane` 每帧用**当前**内容高度换算成 `scroll_offset`（= WT 的 `UserScrollViewport(viewTop)`：`_scrollOffset = realTop - viewTop`，`Terminal.cpp:1107`；新输出到达时 `_PreserveUserScrollOffset`（`:1096`）按视口位移补偿 —— 我们原先把 vo 一次算死，shell 每出一行视图就被顶偏一行，说明行正好被推出屏外）。换算出的 vo 恒 ≤ `screen_scroll_limit` ⇒ 既不用放宽 render 的 vo 夹取，也不碰 `screen_reflow_height()`「首末内容之外的空白不落位」那条（v1.8.52 靠它避免「历史开头一片空白」）；上一轮「垫一排空行凑 vo」就是撞在这两条上，已作废。 |
+| 按键即让位 | 摊开的是**视图**不是模式：按任意键（`write_to_pane`）或滚动一次，就交还实时底部，键本身照常送进 shell，一个字节都不吞（= WT 的 `Terminal::TrySnapOnInput`，`Terminal.cpp:495`，默认开）。`switch_pane` 在锚定期间不再顺手把 vo 清零 —— 否则 `session_restore()` 末尾那一下落焦刚设好的视图就被抹掉。 |
+| 这一版终于能在本地量到 | 新增 T16c：用 `$ENV`（dash 交互 shell 的启动脚本）让 shell 在起完提示符之后**自己**输出「`ESC[2J ESC[H` + 逐行 `ESC[r;1H ESC[2K` 重绘 24 行」—— 纯输出侧、不经按键，正是 ConPTY 那一帧的形状。反向对照：拿**已发布的 v2.3.3 Linux 档**跑，这条是**红的**（说明行与最早那行一起没了），新版是绿的。T16 同时翻成「说明行在第一屏第 0~1 行 + 最早那行当场可见」，新增 T16d 钉住「按键后让位、键不吞」。 |
+| 没做的（写清楚） | ED(2) 语义仍然按 v1.8.52 的口径「只清视口、不动 scrollback」，没有改成 WT 的 `_EraseAll`（把整页推进 scrollback，`adaptDispatch.cpp:735-753`）—— 那会牵动「ConPTY 重绘 ⇒ 重复入历史」一整串，单独一轮再说。Windows 侧本轮只做到**编译级验证**：交叉链是临时从 apt 缓存里把 `gcc-mingw-w64-x86-64` + `binutils` + `mingw-w64-*-dev` + `mingw-w64-common` 解到一个前缀目录里凑出来的（沙箱装不了系统包），`make all`（`-O2 -Wall -Wextra`）出 `termux.exe` 正常，`make lint-o1` 报 Windows 18 + POSIX 18 个文件 **0 警告**。本轮改动只碰已有的 C 代码路径（没有新 Win32 API），但「闪一下就没了」是否真被治好，最终仍然要你在真机上看一眼。SIGKILL / 崩溃仍然没有快照（退出时写一次）。 |
 
 **v2.3.3** —— 用户回报「运行后闪了一下历史，但马上没了」+「内容过长，能滚动时才看得到那行说明」。这一版把恢复的**说明行挪到历史末尾**（紧贴提示符），长历史第一屏就能看到它，更早的行照旧归 scrollback。
 

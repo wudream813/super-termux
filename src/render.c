@@ -5701,6 +5701,17 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
     ScreenBuffer *s = &pane->screen;
     int pos = *posp;
     if (pane->scroll_offset < 0) pane->scroll_offset = 0;
+    /* v2.3.4：快照摊开视图（绝对锚）。每帧用【当前】内容高度换算 vo，新输出到达不会把
+     * 视图顶偏；锚到不了的地方（内容不足一屏）自然退化成 vo=0，画面仍是正常底部对齐。 */
+    if (pane->restore_view) {
+        int rw_a = rc->cols < s->cols ? rc->cols : s->cols;
+        int h_a = screen_reflow_height(s, rw_a);
+        int vo_a = h_a - s->rows - pane->rf_anchor;
+        int lim_a = screen_scroll_limit(s);
+        if (vo_a < 0) vo_a = 0;
+        if (lim_a > 0 && vo_a > lim_a) vo_a = lim_a;
+        pane->scroll_offset = vo_a;
+    }
     if (pane->scroll_offset > 0) {
         /* 夹取必须按【实际渲染宽度】算，不能按 s->cols。拖动分屏边框时渲染宽度是
          * min(rc->cols, s->cols)，而 s->cols 已被冻结在拖动前的值（见
