@@ -129,6 +129,7 @@ static void handle_input(void) {
         }
 
         reap_dead_panes();
+        session_pump_due();   /* v2.3.5：宽限期一过就把还挂着的快照补上（不依赖读线程那一处） */
         if (g_mux.active_pane < 0 || !g_mux.panes[g_mux.active_pane].active) {
             int f = -1;
             for (int i = 0; i < g_mux.pane_count; i++) if (g_mux.panes[i].active) { f = i; break; }

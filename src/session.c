@@ -615,7 +615,6 @@ int session_save(void) {
  * 拿锁只等有限时间（TryEnter 200 次 ≈ 400ms）：信号/事件可能打在别的线程持锁中间，
  * 死等等于把退出路径挂在锁上。等不到就用上一次采集的那份落盘（宁少不错）。 */
 int session_flush_now(int for_exit_path) {
-    session_pump_pending_all();   /* v2.3.4：同上，信号里存盘也要先把挂起的快照落地 */
     if (!g_session_persist || g_sess_flushing) return 0;
     g_sess_flushing = 1;
     int locked = 0;
@@ -624,6 +623,13 @@ int session_flush_now(int for_exit_path) {
         else Sleep(2);
     }
     if (locked) {
+        /* v2.3.5：挂起块的落地【挪到这里】。v2.3.4 把它放在函数最上面，走的是无条件
+         * EnterCriticalSection —— 而这支函数是 Windows 的 CTRL_CLOSE_EVENT（点窗口 X、
+         * 关掉 WT 标签页）处理器里调的：那一刻 ConPTY 读线程多半正持着这把锁，处理器里
+         * 死等 = 系统给的几秒钟耗尽后直接终止进程 ⇒ 一次盘都没落（用户回报「没有记录
+         * 终端」）。本函数自己的注释就写着「死等等于把退出路径挂在锁上」，v2.3.4 亲手
+         * 违反了这条。拿不到锁就照旧用上一次采集的那份落盘（宁少不错）。 */
+        session_pump_pending_all();      /* 持锁调用：里面的 sess_apply 重入同一把锁，安全 */
         LeaveCriticalSection(&g_mux.cs);
         session_note_now();              /* 它自己会拿锁（可重入），这里先明着放掉 */
     }
@@ -740,6 +746,9 @@ static int sess_index_lines(char *raw, SRec **out) {
  * 让两者不撞车。我们不必为此把 create_pane_shell 拆成「建屏」+「起进程」（两平台各 150 行
  * 启动路径，风险不对等），改成把【灌入】排到首帧之后：同一个不变量，而且对任意长度的历史
  * 都成立（排在前面时，短历史仍整块留在视口里、照样被盖）。 */
+/* v2.3.5：宽限期的到期时刻（GetTickCount64 毫秒）。0 = 没有挂起块。 */
+static ULONGLONG g_sess_pump_by = 0;
+
 static void sess_apply(Pane *p, const char *buf, int len) {
     EnterCriticalSection(&g_mux.cs);
     screen_process_output(&p->screen, buf, len);
@@ -767,6 +776,7 @@ static void sess_feed(Pane *p, SBuf *hist, int lines) {
         p->sess_pend = f.p;
         p->sess_pend_len = f.len;
         p->sess_pend_armed = 1;
+        g_sess_pump_by = GetTickCount64() + 400;   /* v2.3.5：宽限期兜底，见 session_pump_due */
     } else {
         free(f.p);
     }
@@ -817,6 +827,18 @@ void session_pump_pending(int pane_idx) {
 
 void session_pump_pending_all(void) {
     for (int i = 0; i < MAX_PANES; i++) session_pump_pending(i);
+}
+
+/* v2.3.5：宽限期兜底。挂起块原本只在「读线程收到该窗格第一帧」那一刻落地，那等于把
+ * 「历史能不能显示」押在一条特定的读取路径上 —— Windows 的 ConPTY 起 shell 时会连着来
+ * 好几帧（首帧 + resize 后的整屏重打），任何一帧没经过那个调用点，快照就烂在挂起态里
+ * 一辈子（用户看到的即「没有历史」）。所以主循环每轮问一次：武装着且过了宽限期（默认
+ * 400ms，从最后一次 arm 算起）就在这里补上 —— 主循环持锁渲染，锁语义和读线程那条一致。 */
+void session_pump_due(void) {
+    if (!g_sess_pump_by) return;
+    if (GetTickCount64() < g_sess_pump_by) return;
+    g_sess_pump_by = 0;
+    session_pump_pending_all();
 }
 
 /* 窗格要没了（或快照不再打算显示）⇒ 丢弃挂起块。 */

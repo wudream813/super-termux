@@ -5,7 +5,7 @@
 终端复用器（Terminal Multiplexer）—— 模块化 C 架构，单文件可执行。
 在一个终端窗口里管理多个 shell 会话，像 tmux 一样分标签页、分屏、搜历史。
 
-当前版本：**v2.3.4**（正式支持 Windows / Linux / macOS 三个系统）
+当前版本：**v2.3.5**（正式支持 Windows / Linux / macOS 三个系统）
 
 ## 平台支持
 
@@ -313,6 +313,15 @@ python3 verify_config_theme.py     # 配置体系：主题参考色板完整性 
 
 
 ## 版本历史
+
+**v2.3.5** —— 拿 v2.3.4 上 Windows 真机试过的回报是「这次没有闪一下了，但是没有历史」+「没有记录终端」。顺着这两句查到：v2.3.4 为了「恢复了但还没显示就退出」在 `session_flush_now()` 最上面加了一句会**无条件拿锁**的落地调用，而那支函数正是 Windows `CTRL_CLOSE_EVENT` 处理器里调的 —— 那一刻 ConPTY 读线程多半正持着 `g_mux.cs`，处理器就此挂住，系统几秒钟后强杀进程 ⇒ **一个字都没写**；于是下一次启动既没有历史可恢复（不闪了），也再攒不出快照。
+
+| # | 内容 |
+|---|---|
+| 退出路径只限时等锁 | `session_pump_pending_all()` 从 `session_flush_now()` 的函数头**挪进 `if (locked)` 里面**（持锁调用，`sess_apply` 重入同一把可重入锁，安全）；拿不到锁就照旧用上一次采集的那份落盘 —— 该函数自己的注释早就写着「死等等于把退出路径挂在锁上」，v2.3.4 亲手违反了它。 |
+| 落地不再只认一条读取路径 | 挂起块原本只在「读线程收到该窗格第一帧」那一刻落地；Windows 的 ConPTY 起 shell 时连着来好几帧（首帧 + resize 后整屏重打），任何一帧没走那个调用点，快照就烂在挂起态里 = 「没有历史」。现在主循环每轮问一次 `session_pump_due()`：武装着且过了 400ms 宽限期就地补上（与读线程那条同锁语义；两条都在，谁先到算谁）。 |
+| 新判据：静态那条才是 catcher | `tools/check_exit_path_locks.py`（已挂进 `make check-posix`）抽出 `session_flush_now` 的函数体，要求 `TryEnterCriticalSection` 之前不出现无条件 `EnterCriticalSection(`、`session_pump_pending_all()` 只能出现在 `if (locked)` 内、并且这两件事都得还在（不许为了绕开锁把功能整个删掉），另加一条「主循环必须问 `session_pump_due()`」。**拿 v2.3.4 那份 `src/session.c` 跑它是红的**（`session_pump_pending_all() 出现在 if (locked) 之外`），本树绿。行为侧新增 T17：让 shell 正刷 400 行时发信号 ⇒ 进程须几秒内自退且档里有那些行；POSIX 上信号不跑在处理器里，多半挂不住 ⇒ T17 是护栏，catcher 是上面那条静态判据（这点写在这里，不含糊）。 |
+| 顺带修的沙箱坑 | 判据依赖的 `tools/vmini` 丢了可执行位 ⇒ `PermissionError`，`chmod +x` 补回（与产品代码无关，记一句免得下次再查）。 |
 
 **v2.3.4** —— 按 Windows Terminal 的做法把「恢复的历史被首帧盖掉 / 必须滚动才看得到」这两条真正修掉：快照**改排在窗格第一帧输出之后**落地，视图**按绝对行锚定**到快照第一行。
 

@@ -238,6 +238,11 @@ unittest-posix-input:
 # v2.0.5：alt 屏满宽最后一列不能被 \x1b[K 擦掉（真 PTY 起 termux + libvterm 回放）。
 # 需要 POSIX 二进制，所以不进 verify_all.py（那个在 Windows 作业也跑）。
 # v2.0.6：[theme] pane_* 窗格 palette 端到端（真 PTY + libvterm 回放）。
+# v2.3.5：「进程马上就没了」那几条路（Windows 的 CTRL_CLOSE_EVENT / POSIX 信号）不许出现
+# 无条件拿锁 —— v2.3.4 就是在这里把存盘挂死的（用户回报「没有记录终端」）。见脚本文档。
+exitpath-posix:
+	@python3 tools/check_exit_path_locks.py
+
 palette-posix: posix-build
 	TERMUX_PALETTE_EXE=$$(ls termux-linux termux-macos 2>/dev/null | head -1) python3 tests/verify_pane_palette.py
 
@@ -285,7 +290,7 @@ unittest-posix-env:
 	/tmp/termux_ee
 
 # POSIX 侧一把梭：编译 + 不变量检查 + 三个 POSIX 单测 + 真 pty 冒烟 + 剪贴板/配置
-check-posix: posix-build verify-port unittest-posix-input unittest-posix-write unittest-posix-cmdline unittest-posix-env smoke-posix clip-posix lastcol-posix palette-posix
+check-posix: posix-build verify-port unittest-posix-input unittest-posix-write unittest-posix-cmdline unittest-posix-env smoke-posix clip-posix lastcol-posix exitpath-posix palette-posix
 	@echo "POSIX 检查全部通过"
 
 

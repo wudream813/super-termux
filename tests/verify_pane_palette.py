@@ -3046,6 +3046,26 @@ int main(int argc, char **argv) {
         finally:
             shutil.rmtree(td_mk, ignore_errors=True)
 
+        # T17（v2.3.5）：「进程马上就没了」那一路也得把快照写下去，而且不许为了落地快照
+        # 把退出路径挂在锁上。形状：让 shell 正刷屏（读线程大概率持着 g_mux.cs）时发信号，
+        # 要求进程自己几秒内退掉 + 档里有刚才那些行。v2.3.4 的 session_flush_now 第一句是
+        # 无条件拿锁的 pump —— Windows 上那正是 CTRL_CLOSE_EVENT 处理器里调的，处理器挂住
+        # = 系统强杀 = 一个字都没写（用户回报「没有记录终端」）。POSIX 侧这条能当护栏
+        # （信号不跑在处理器里，多半不会真挂）；真正抓得住上一版的是 tools/check_exit_path_locks.py
+        # 那条静态判据（拿 v2.3.4 的 src/session.c 跑它 => 红）。
+        td_sig = sess_mkdir(SESS_INI_ON)
+        try:
+            _, e_sig = sess_run(td_sig, ROWS_C, COLS_C,
+                                [b"i=0; while [ $i -lt 400 ]; do echo FLOOD$i; i=$((i+1)); done\r"],
+                                quit_keys=(), sig=signal.SIGTERM, exit_wait=8.0)
+            txt_sig = sess_read(td_sig) or ""
+            rA_ck("T17 刷屏正酣时来信号 ⇒ 进程要在几秒内自己退掉，且快照落下去、里面有刚打"
+                  "的那些行（退出路径上不许有死等：见 tools/check_exit_path_locks.py）",
+                  e_sig and txt_sig.count("\nD ") >= 5 and "FLOOD1" in txt_sig,
+                  "退出正常=%r D条数=%d" % (e_sig, txt_sig.count("\nD ")))
+        finally:
+            shutil.rmtree(td_sig, ignore_errors=True)
+
         td_bd = sess_mkdir(SESS_INI_ON)
         try:
             with open(os.path.join(td_bd, "termux.session"), "w", encoding="utf-8") as f:
