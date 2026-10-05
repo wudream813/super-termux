@@ -234,6 +234,11 @@ void screen_free(ScreenBuffer *s) {
     screen_repaint_snapshot_free(s);
     s->resize_repaint_pending = 0;
     s->resize_repaint_pass = 0;
+    /* v2.3.6：图形转发的待发包 + 采集缓冲跟着窗格一起走（不留在堆上）。 */
+    for (int i = 0; i < s->gfx_qn; i++) { free(s->gfx_q[i].p); s->gfx_q[i].p = NULL; }
+    s->gfx_qn = 0;
+    free(s->gfx_cur); s->gfx_cur = NULL; s->gfx_cur_cap = s->gfx_cur_len = 0;
+    s->gfx_state = 0; s->gfx_escpend = 0; s->gfx_sawfile = 0; s->gfx_oversize = 0;
 }
 
 CHAR_INFO *screen_cell(ScreenBuffer *s, int row, int col) {

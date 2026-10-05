@@ -20,7 +20,7 @@ gcc -O1 -Wall -Wextra -Werror -DTERMUX_CONPTY_DEFAULT_DLL -Itests/loaderstub -Ii
     tests/test_conpty_loader.c src/conpty_loader.c -o "$BIN_A" || exit 1
 
 for c in system auto_dll auto_nodll dll_only_missing dll_partial \
-         flags_hex flags_dec flags_bad idempotent; do
+         flags_hex flags_dec flags_bad idempotent passthrough; do
     if "$BIN" "$c"; then :; else rc=1; fi
 done
 

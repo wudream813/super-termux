@@ -134,9 +134,9 @@ crosscheck-embedded-c:
 	 [ $$bad -eq 0 ]
 
 crosscheck-win-harness:
-	@for h in tests/render_harness.c tests/sb_drag_harness.c tests/cascade_probe.c; do \
+	@for h in tests/render_harness.c tests/sb_drag_harness.c tests/cascade_probe.c tests/test_gfx_relay.c; do \
 	  case $$h in \
-	    *cascade_probe*) S="src/screen.c src/vt.c src/utf8.c src/theme.c" ;; \
+	    *cascade_probe*|*test_gfx_relay*) S="src/screen.c src/vt.c src/utf8.c src/theme.c" ;; \
 	    *)               S="$(HARNESS_SRC) tests/render_harness_shims.c" ;; \
 	  esac; \
 	  printf "  交叉编译 %-32s " "$$h"; \
@@ -238,6 +238,17 @@ unittest-posix-input:
 # v2.0.5：alt 屏满宽最后一列不能被 \x1b[K 擦掉（真 PTY 起 termux + libvterm 回放）。
 # 需要 POSIX 二进制，所以不进 verify_all.py（那个在 Windows 作业也跑）。
 # v2.0.6：[theme] pane_* 窗格 palette 端到端（真 PTY + libvterm 回放）。
+# v2.3.6：图形协议（sixel DCS / kitty APC / iTerm2 OSC 1337）的捕获状态机。
+# 与 T18（tests/verify_pane_palette.py，真 pty + libvterm）的分工：那一格验「字节确实到了
+# 宿主」，要 400 秒、缺 libvterm 就 SKIP；这一格只跑采集，毫秒级、无外部依赖，
+# 抓的是「某条协议整个静默消失」这类编译期看不出的错（本项目栽过两次：状态号跳到
+# 一个不存在的 case、以及 iTerm2 的 File= 模式大小写对不上）。
+gfx-posix:
+	$(POSIX_CC) -O1 -std=gnu11 -Wall -Wextra -Werror -Iinclude \
+	   src/screen.c src/vt.c src/utf8.c src/theme.c tests/test_gfx_relay.c \
+	   -o /tmp/termux_gfx -lm
+	@/tmp/termux_gfx
+
 # v2.3.5：「进程马上就没了」那几条路（Windows 的 CTRL_CLOSE_EVENT / POSIX 信号）不许出现
 # 无条件拿锁 —— v2.3.4 就是在这里把存盘挂死的（用户回报「没有记录终端」）。见脚本文档。
 exitpath-posix:
@@ -290,11 +301,11 @@ unittest-posix-env:
 	/tmp/termux_ee
 
 # POSIX 侧一把梭：编译 + 不变量检查 + 三个 POSIX 单测 + 真 pty 冒烟 + 剪贴板/配置
-check-posix: posix-build verify-port unittest-posix-input unittest-posix-write unittest-posix-cmdline unittest-posix-env smoke-posix clip-posix lastcol-posix exitpath-posix palette-posix
+check-posix: posix-build verify-port unittest-posix-input unittest-posix-write unittest-posix-cmdline unittest-posix-env smoke-posix clip-posix lastcol-posix exitpath-posix gfx-posix palette-posix
 	@echo "POSIX 检查全部通过"
 
 
 clean:
-	rm -f $(TARGET) $(TARGET_CPP) termux-linux termux-macos *.o
+	rm -f $(TARGET) $(TARGET_CPP) termux-linux termux-macos *.o /tmp/termux_gfx
 
-.PHONY: all cpp test unittest lint-o1 posix-build clean planA planB plans v19 v20 v21 v22 v23 v24 linux darwin posix verify-loader unittest-posix-input unittest-posix-write unittest-posix-cmdline unittest-posix-env smoke-posix clip-posix lastcol-posix palette-posix check-posix verify-port
+.PHONY: all cpp test unittest lint-o1 posix-build clean planA planB plans v19 v20 v21 v22 v23 v24 linux darwin posix verify-loader unittest-posix-input unittest-posix-write unittest-posix-cmdline unittest-posix-env smoke-posix clip-posix lastcol-posix palette-posix gfx-posix check-posix verify-port

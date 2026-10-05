@@ -31,6 +31,17 @@ HRESULT conpty_resize(HPCON hPC, COORD size);
 void    conpty_close(HPCON hPC);
 
 DWORD conpty_default_flags(void);
+
+/* v2.3.6：图形协议直通所需的 PSEUDOCONSOLE_PASSTHROUGH_MODE(0x8)。
+ * 官方 conpty.h 没这个位（它只定义了 INHERIT_CURSOR 与字宽掩码），而且只有
+ * Windows 11 22H2（build 22621）以上的 in-box conhost 认它，所以这里自己写死值。
+ * 三态：0=auto（按 build 决定）/ 1=on（强试）/ -1=off。纯函数，便于单测。 */
+#define TERMUX_PSEUDOCONSOLE_PASSTHROUGH 0x8
+#define TERMUX_PASSTHROUGH_MIN_BUILD     22621
+int  conpty_passthrough_wanted(int tri, unsigned long build);
+int  conpty_passthrough_tri_from_text(const char *s);   /* auto/on/off，认不出一律 auto(0) */
+void conpty_set_passthrough(int tri);                    /* 由 main 在读完 ini 后调用 */
+int  conpty_passthrough_state(void);                     /* 1 = 本进程的 ConPTY 真带上了 0x8 */
 const char *conpty_source_name(void);   /* 诊断用："conpty.dll" / "kernel32" */
 int conpty_is_bundled(void);
 

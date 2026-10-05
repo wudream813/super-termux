@@ -3066,6 +3066,97 @@ int main(int argc, char **argv) {
         finally:
             shutil.rmtree(td_sig, ignore_errors=True)
 
+        # ---- T18（v2.3.6）：图形协议直通（sixel DCS / kitty APC / iTerm2 OSC 1337）----
+        # 判据一律看【宿主收到的原始字节流】。图形协议本来就不该进屏幕文本，
+        # 用 libvterm 回放的屏上去查它是错的口径；只有「穿透到宿主」这件事本身
+        # 能在 raw 流上量。载荷全部挑不含 CR/LF 的写法：宿主 tty 若还开着 ONLCR
+        # 会把裸 LF 改写成 CR LF，判据字节就会假红（真实编码器给的 base64 没有裸 LF）。
+        GF_SIX = b"\x1bP0;1;0q\"1;1;11;13#5;2;97;11;23#5!11~-!11~\x1b\\"
+        GF_KIT = b"\x1b_Ga=T,f=100,m=0;iVBORw0KGgoAAAANSUhEUg\x1b\\"
+        GF_ITE = b"\x1b]1337;File=inline=1;size=8;width=100;aGVsbG8td29ybGQ=\x07"
+        GF_HALF = b"\x1bP0;1;0q\"1;1;11;13#5;2;97;11;23"
+        GF_BIG = b"\x1b_Ga=T,f=100,m=0;" + b"A" * 9000 + b"\x1b\\"
+
+        def gfx_files(td):
+            for nm, by in (("img.sixel", GF_SIX), ("img.kitty", GF_KIT),
+                           ("img.iterm", GF_ITE), ("img.bad", GF_HALF), ("img.big", GF_BIG)):
+                with open(os.path.join(td, nm), "wb") as f:
+                    f.write(by)
+
+        td_gf = sess_mkdir("[general]\nanim = off\ngraphics = on\n")
+        gfx_files(td_gf)
+        try:
+            cat_all = b"cat img.sixel; cat img.kitty; cat img.iterm; echo GFXA1\r"
+            g_on, e_on = sess_run(td_gf, ROWS_C, COLS_C, [cat_all])
+            ck("T18a graphics = on ⇒ 三种协议的字节【原样】出现在宿主流里（逐字节相同，"
+                  "不多一个转义也不少一个）—— 拿 v2.3.5 的发布档跑这一条是红的，那时这一层"
+                  "把 sixel/kitty 直接吞掉，iTerm2 也只在 conhost 放行的前提下勉强过去",
+                  e_on and GF_SIX in g_on and GF_KIT in g_on and GF_ITE in g_on,
+                  "sixel=%r kitty=%r iterm=%r" % (GF_SIX in g_on, GF_KIT in g_on, GF_ITE in g_on))
+            ck("T18b 图片之后那句 echo 照常到达，且载荷没被当文字重画一遍（要么转发、要么丢掉，"
+               "绝不两条路都走）",
+               b"GFXA1" in g_on and g_on.count(b"#5;2;97") <= 1 and g_on.count(b"a=T,f=100") <= 1,
+               "GFXA1=%r sixel份数=%d kitty份数=%d"
+               % (b"GFXA1" in g_on, g_on.count(b"#5;2;97"), g_on.count(b"a=T,f=100")))
+        finally:
+            shutil.rmtree(td_gf, ignore_errors=True)
+
+        td_gf = sess_mkdir("[general]\nanim = off\ngraphics = off\n")
+        gfx_files(td_gf)
+        try:
+            g_off, e_off = sess_run(td_gf, ROWS_C, COLS_C, [b"cat img.sixel; cat img.kitty; cat img.iterm; echo GFXO0\r"])
+            ck("T18c graphics = off ⇒ 一条都不转发（回退到「当未知序列丢掉」的老行为），文字照常",
+               e_off and GF_SIX not in g_off and GF_KIT not in g_off and GF_ITE not in g_off
+               and b"GFXO0" in g_off,
+               "sixel=%r kitty=%r iterm=%r GFXO0=%r"
+               % (GF_SIX in g_off, GF_KIT in g_off, GF_ITE in g_off, b"GFXO0" in g_off))
+        finally:
+            shutil.rmtree(td_gf, ignore_errors=True)
+
+        td_gf = sess_mkdir("[general]\nanim = off\ngraphics = on\n")
+        gfx_files(td_gf)
+        try:
+            g_h, e_h = sess_run(td_gf, ROWS_C, COLS_C, [b"cat img.bad; echo GFXB2-DONE\r"])
+            ck("T18d 半截 DCS（没有 ST/BEL 收尾）整段丢弃：宿主侧绝不出现没有结尾的 DCS ——"
+               "半张图会把宿主的 sixel 解析器停在半截上，之后每行文字都被它当数据吃掉，"
+               "比「看不到图」糟得多",
+               e_h and b"P0;1;0q" not in g_h and b"GFXB2-DONE" in g_h,
+               "半截出现=%r 后文=%r" % (b"P0;1;0q" in g_h, b"GFXB2-DONE" in g_h))
+        finally:
+            shutil.rmtree(td_gf, ignore_errors=True)
+
+        td_gf = sess_mkdir("[general]\nanim = off\ngraphics = on\ngraphics_max = 4\n")
+        gfx_files(td_gf)
+        try:
+            g_m, e_m = sess_run(td_gf, ROWS_C, COLS_C, [b"cat img.big; cat img.sixel; echo GFXM3\r"])
+            ck("T18e 超过 graphics_max(4KB) 的那条整段丢弃、不发半截，同屏小图照常转发",
+               e_m and b"a=T,f=100" not in g_m and GF_SIX in g_m and b"GFXM3" in g_m,
+               "超限条目出现=%r 小图=%r GFXM3=%r"
+               % (b"a=T,f=100" in g_m, GF_SIX in g_m, b"GFXM3" in g_m))
+        finally:
+            shutil.rmtree(td_gf, ignore_errors=True)
+
+        # 行为页第 7 个开关：设置页必须管得到它，且改完就落 ini（与 session 那一格同口径）
+        g_off_pg = capture_page_keys(ROWS_C, COLS_C, [b"\x02s", b"b"],
+                                     ini="[general]\nanim = off\ngraphics = off\n", keep_ini=True)
+        s_offg = vt_text(ROWS_C, COLS_C, g_off_pg[0]) or []
+        row_offg = [i for i, l in enumerate(s_offg) if "] graphics" in l]
+        g_on_pg = capture_page_keys(ROWS_C, COLS_C,
+                                    [b"\x02s", b"b"] + [b"\x1b[B"] * 6 + [b" "],
+                                    ini="[general]\nanim = off\ngraphics = off\n", keep_ini=True)
+        s_ong = vt_text(ROWS_C, COLS_C, g_on_pg[0]) or []
+        row_ong = [i for i, l in enumerate(s_ong) if "graphics" in l and "图形协议" in l]
+        ck("T18f 行为页那个开关真落盘：进页面（关着）⇒ ini 里 graphics = off；移到第 7 行"
+           "按 Space ⇒ 同一份 ini 被改写成 graphics = on（开关不是只改内存）",
+           re.search(r"^graphics\s*=\s*off", g_off_pg[1] or "", re.M) is not None
+           and re.search(r"^graphics\s*=\s*on", g_on_pg[1] or "", re.M) is not None,
+           "ini_off=%r ini_on=%r" % ((g_off_pg[1] or "")[-60:], (g_on_pg[1] or "")[-60:]))
+        rA_ck("T18g 行为页第 7 行画出来了：「graphics 图形协议直通…」，没打勾时空框、"
+              "按过 Space 之后是 [x]，且两次都在同一行",
+              bool(row_offg) and bool(row_ong) and row_offg[0] == row_ong[0]
+              and "[ ]" in s_offg[row_offg[0]] and "[x]" in s_ong[row_ong[0]],
+              "行=%r→%r" % (row_offg, row_ong))
+
         td_bd = sess_mkdir(SESS_INI_ON)
         try:
             with open(os.path.join(td_bd, "termux.session"), "w", encoding="utf-8") as f:

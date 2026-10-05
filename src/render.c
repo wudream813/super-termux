@@ -3806,6 +3806,7 @@ static void render_settings_behavior(char *out, int bs, int *posp, int host_rows
         {"confirm_on_close", "关闭窗格 / 标签前二次确认",          g_confirm_on_close},
         {"search_case_sensitive", "搜索锁定大小写（区分大小写）",  g_search_case_sensitive},
         {"session",           "退出时保存会话（下次启动恢复历史与布局）", g_session_persist},
+        {"graphics",          "图形协议直通（sixel / kitty / iTerm2 图片交给宿主终端）", g_graphics_relay},
     };
     for (int i = 0; i < SETTINGS_BEHAVIOR_TOGGLES; i++) {
         int row = settings_behavior_row_view(host_rows, SETTINGS_BEHAVIOR_ROW0 + i);
@@ -5701,6 +5702,10 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
     ScreenBuffer *s = &pane->screen;
     int pos = *posp;
     if (pane->scroll_offset < 0) pane->scroll_offset = 0;
+    /* v2.3.6：记下「这块窗格本帧画在宿主的哪个矩形」，图形转发的落点要用它。 */
+    pane->gfx_paint_row = rc->r0; pane->gfx_paint_col = rc->c0;
+    pane->gfx_paint_rows = rc->rows < s->rows ? rc->rows : s->rows;
+    pane->gfx_paint_ok = 1;
     /* v2.3.4：快照摊开视图（绝对锚）。每帧用【当前】内容高度换算 vo，新输出到达不会把
      * 视图顶偏；锚到不了的地方（内容不足一屏）自然退化成 vo=0，画面仍是正常底部对齐。 */
     if (pane->restore_view) {
@@ -6057,6 +6062,61 @@ static void render_split(char *out, int bs, int *posp) {
     render_split_borders(out, bs, posp, rects);
 }
 
+/* ================= v2.3.6：图形协议（sixel / kitty / iTerm2）转发 =================
+ * 采集在解析线程（见 vt.c 的 gfx_tap），发送必须在【主线程的一帧输出之后】—— 宿主只有一个
+ * 屏幕，游标归本帧的渲染器管，所以这里只是把队列里的字节「取出来」，真正写出去放在
+ * render_screen() 发完本帧差分之后。
+ * 落点：采集时记的是「该窗格视口内的行/列 + 当时的历史行数」，取的时候本帧历史行数可能已经
+ * 变了（worker 采、主线程发，中间 shell 又滚了几行）⇒ 用
+ *     host_row = 本帧这块窗格的首行 + (采集时的 hist + 采集时的 y - 现在的 hist)
+ * 抵掉那段位移。落到矩形外（已经滚走 / 窗格太小）就丢掉：宁可不画，也不画在错的地方。
+ * 只在实时视图（scroll_offset==0）转发 —— 图像是「此刻的画面」，不进历史、不随回看重画，
+ * 与 tmux 的 allow-passthrough 同一档语义（用户已确认这档就够）。 */
+#define GFX_OUTBOX (GFX_RELAY_QUEUE * MAX_PANES)
+static struct TermuxGfxItem g_gfx_out[GFX_OUTBOX];
+static int g_gfx_outn = 0;
+
+static void gfx_collect_locked(void) {
+    for (int i = 0; i < g_mux.pane_count && i < MAX_PANES; i++) {
+        Pane *p = &g_mux.panes[i];
+        ScreenBuffer *s = &p->screen;
+        for (int k = 0; k < s->gfx_qn; k++) {
+            struct TermuxGfxItem *it = &s->gfx_q[k];
+            int row = -1, col = -1;
+            int rel = it->hist + it->y - s->hist_lines;
+            if (p->gfx_paint_ok && p->scroll_offset == 0 && g_graphics_relay
+                && g_mux.panes[i].gfx_paint_rows > 0
+                && rel >= 0 && rel < p->gfx_paint_rows
+                && g_gfx_outn < GFX_OUTBOX) {
+                row = p->gfx_paint_row + rel;
+                col = p->gfx_paint_col + it->x;
+                if (col < p->gfx_paint_col) col = p->gfx_paint_col;
+            }
+            if (row < 0) { free(it->p); it->p = NULL; continue; }   /* 这一帧不配发：直接丢 */
+            g_gfx_out[g_gfx_outn] = *it;
+            g_gfx_out[g_gfx_outn].host_row = row;
+            g_gfx_out[g_gfx_outn].host_col = col;
+            g_gfx_outn++;
+            it->p = NULL; it->len = 0;
+        }
+        s->gfx_qn = 0;
+    }
+}
+
+static void gfx_emit_outbox(void) {
+    for (int k = 0; k < g_gfx_outn; k++) {
+        char cup[32];
+        int n = snprintf(cup, sizeof(cup), "\x1b[%d;%dH",
+                         g_gfx_out[k].host_row + 1, g_gfx_out[k].host_col + 1);
+        if (n > 0) host_write(cup, n);
+        if (g_gfx_out[k].p && g_gfx_out[k].len > 0)
+            host_write(g_gfx_out[k].p, g_gfx_out[k].len);
+        free(g_gfx_out[k].p);
+        g_gfx_out[k].p = NULL; g_gfx_out[k].len = 0;
+    }
+    g_gfx_outn = 0;
+}
+
 void render_screen(void) {
     EnterCriticalSection(&g_mux.cs);
     /* 诊断帧号在这里自增，且【无条件】——本函数下面有多条提前 return 的路径
@@ -6074,7 +6134,13 @@ void render_screen(void) {
         g_mux.needs_redraw = 1;
     }
     g_cd_len = 0;
-    for (int i = 0; i < MAX_PANES; i++) g_cd_pane[i].valid = 0;
+    /* v2.3.6：图形直通的「本帧这块窗格画在哪儿」必须逐帧重记。help_mode / settings_mode
+     * 那两条分支根本不走画窗格的路径，不清的话上一帧的矩形还挂着，图片就会被盖到设置页
+     * 头上（与 g_cd_pane[i].valid 同一个道理，挨着放）。 */
+    for (int i = 0; i < MAX_PANES; i++) {
+        g_cd_pane[i].valid = 0;
+        g_mux.panes[i].gfx_paint_ok = 0;
+    }
     if (g_mux.host_cols < 1 || g_mux.host_rows < 1 || g_mux.total_host_rows < 1) { LeaveCriticalSection(&g_mux.cs); return; }
     update_host_title();
 
@@ -6134,6 +6200,13 @@ void render_screen(void) {
                 if (pane->scroll_offset > lim_sc) pane->scroll_offset = lim_sc;
             }
             int vo = pane->scroll_offset, rr = s->rows < g_mux.host_rows ? s->rows : g_mux.host_rows, rc = s->cols < g_mux.host_cols ? s->cols : g_mux.host_cols;
+            /* v2.3.6：单窗格（整屏）路径也要记账。分屏那条在 render_split_pane 里记，
+             * 但绝大多数时候只有一个窗格、走的是这里 —— 少记这一处，图形直通在这条
+             * 主路径上整个不生效（第一版就是这么错的：探针里 sixel 被正确收下、又被
+             * 「本帧没画过这个窗格」的理由丢掉，屏幕上什么痕迹都没有）。
+             * 整屏内容从宿主第 1 行（0 基）起、共 rr 行，见下面 CUP 用的 y + 2。 */
+            pane->gfx_paint_row = 1; pane->gfx_paint_col = 0;
+            pane->gfx_paint_rows = rr; pane->gfx_paint_ok = 1;
             int show_sb = render_sb_cols_ok(g_mux.host_cols, s->in_alt_screen);
             /* 与分屏路径同理：光标压在右缘列时，那一行不画滚动条轨道，
              * 否则刚敲的字被盖掉、看着像光标卡住。 */
@@ -6722,6 +6795,7 @@ void render_screen(void) {
     if (g_mux.active_pane >= 0 && g_mux.active_pane < g_mux.pane_count && g_mux.panes[g_mux.active_pane].active)
         dump_render_output(out, pos, g_mux.panes[g_mux.active_pane].screen.cols, g_mux.panes[g_mux.active_pane].screen.rows, g_mux.host_cols, g_mux.host_rows);
     g_mux.needs_redraw = 0;
+    gfx_collect_locked();   /* v2.3.6：待转发的图形序列在本帧的锁内取出（发送在帧尾） */
     LeaveCriticalSection(&g_mux.cs);
 
     theme_remap(out, pos);
@@ -6776,6 +6850,7 @@ void render_screen(void) {
         dump_delta_output(out, pos, (int)pos);
         host_write(out, pos);
     }
+    gfx_emit_outbox();   /* v2.3.6：本帧的图片序列跟在差分后面原样发给宿主 */
 }
 
 void render_cleanup(void) {

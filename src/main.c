@@ -287,8 +287,13 @@ int main(void) {
     }
     SetConsoleCtrlHandler(ctrl_handler, TRUE);
     load_config();
-    dump_mark("[boot] config-loaded mouse=%d default_startup=%d",
-              (int)g_mouse_enabled, (int)g_default_startup);
+    /* v2.3.6：把 ini 里的 conpty_passthrough 交给 loader。必须在这里、第一个窗格开出来
+     * 之前 —— loader 是懒初始化（pane.c 第一次 CreatePseudoConsole 时才读环境变量），
+     * 而 ini 的优先级要高于 TERMUX_CONPTY_PASSTHROUGH。 */
+    conpty_set_passthrough(conpty_passthrough_tri_from_text(conpty_passthrough_text()));
+    dump_mark("[boot] config-loaded mouse=%d default_startup=%d gfx=%d pas=%s",
+              (int)g_mouse_enabled, (int)g_default_startup, g_graphics_relay,
+              conpty_passthrough_text());
 
     /* mouse = false 时既不申请控制台鼠标事件，也不打开 VT 鼠标追踪 */
     if (!g_mouse_enabled) SetConsoleMode(g_mux.hIn, im & ~(DWORD)ENABLE_MOUSE_INPUT);

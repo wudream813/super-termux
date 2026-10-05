@@ -20,9 +20,21 @@ int g_copy_move_deselect = 1;
 int g_confirm_on_exit = 0;
 int g_confirm_on_close = 0;
 int g_search_case_sensitive = 0;
-int g_session_persist = 1;        /* v2.3.0：`session = on` ⇒ 退出时存会话、下次启动恢复。
-                                 * v2.3.2 起默认开：默认关 = 用户没手动开过就永远看不到效果，
-                                 * 而「看不到效果」和「功能坏了」在现场是一模一样的。 */
+/* v2.3.0：`session = on` ⇒ 退出时把会话写进 termux.session、下次启动灌回来。
+ * v2.3.2 起默认开：默认关 = 用户没手动开过就永远看不到效果，
+ * 而「看不到效果」和「功能坏了」在现场是一模一样的。 */
+int g_session_persist = 1;
+/* 图形直通这两个全局的定义在 src/vt.c —— 状态机在那儿，而 tests/ 里好几个 harness
+ * 只链 vt.c 不链 config.c（cascade_probe、以及它派生的那几个回归构建）。定义放这儿
+ * 它们就链得上；放 config.c 则每个 harness 都要自己补一份，早晚漏一个。 */
+/* v2.3.6：Windows 侧 ConPTY 要不要带 PSEUDOCONSOLE_PASSTHROUGH_MODE(0x8)。
+ * 这里只存文本（auto | on | off），解释在 conpty_loader.c 的纯函数里：config.c 两侧
+ * 都编译，而 loader 只有 Windows 有 —— 让 config 直接调它会链不动。main.c 读完 ini
+ * 之后把这段文本交给 conpty_set_passthrough()。留空 = auto。 */
+static char g_passthrough_val[12] = {0};
+const char *conpty_passthrough_text(void) {
+    return g_passthrough_val[0] ? g_passthrough_val : "auto";
+}
 /* v2.1.7/8：终端只能整格重绘、没有半透明，所以「淡入」只能靠几帧之间把写给终端的颜色
  * 整体向页面底色混合来模拟 —— 时长也就只能是帧的倍数（动画期间约 8~15ms 一帧，实测
  * 110ms 出 7 档）。默认 110ms：够看出方向，又短到不会让人觉得要点一下等一下。
@@ -125,6 +137,9 @@ void init_default_config(void) {
     g_confirm_on_close = 0;
     g_search_case_sensitive = 0;
     g_session_persist = 1;              /* v2.3.2：默认开（ini 里写 session = off 可关） */
+    g_graphics_relay = 1;               /* v2.3.6：图形协议直通，默认开 */
+    g_graphics_max_kb = 32768;
+    g_passthrough_val[0] = 0;
     theme_init();
     keymap_init();
 #ifdef _WIN32
@@ -207,6 +222,24 @@ static int apply_general_key(const char *key, const char *val) {
     if (_stricmp(key, "confirm_on_exit") == 0) { g_confirm_on_exit = config_parse_bool(val, 0); return 1; }
     if (_stricmp(key, "confirm_on_close") == 0) { g_confirm_on_close = config_parse_bool(val, 0); return 1; }
     if (_stricmp(key, "search_case_sensitive") == 0) { g_search_case_sensitive = config_parse_bool(val, 0); return 1; }
+    if (_stricmp(key, "graphics") == 0) { g_graphics_relay = config_parse_bool(val, 1); return 1; }
+    if (_stricmp(key, "conpty_passthrough") == 0) {
+        /* 先夹长度再拷：snprintf("%s") 写进 12 字节的缓冲会被 -Wformat-truncation 骂
+         * （lint-o1 那一道门禁就是为这类「编得过、跑起来截断」而设的）。 */
+        size_t n = strlen(val);
+        if (n >= sizeof(g_passthrough_val)) n = sizeof(g_passthrough_val) - 1;
+        memcpy(g_passthrough_val, val, n);
+        g_passthrough_val[n] = 0;
+        return 1;
+    }
+    if (_stricmp(key, "graphics_max") == 0) {
+        /* KB 为单位；下限 4KB（再小就没意义了），上限 262144KB=256MB（别让手滑把内存吃光）。 */
+        int n = atoi(val);
+        if (n < 4) n = 4;
+        if (n > 262144) n = 262144;
+        g_graphics_max_kb = n;
+        return 1;
+    }
     if (_stricmp(key, "session") == 0)  { g_session_persist = config_parse_bool(val, 1); return 1; }   /* 值写坏了当开：这行存在就说明想开 */
     if (_stricmp(key, "anim") == 0) {
         /* off/none 与 0 都是关；写个认不出来的单词时不要把它当成 0 关掉动画，
@@ -411,7 +444,11 @@ void save_config(void) {
         "# prefix: 前缀键，C- = Ctrl，M- = Alt，S- = Shift，例如 C-a\r\n"
         "# anim: 设置页过渡动画 off | short | normal（也可写毫秒数，上限 600）\r\n"
         "# session: on ⇒ 退出时把会话（各窗格已滚出去的历史 + 标签与分屏布局，含颜色）写进（默认 on，off 可关）\r\n"
-        "#          termux.session，下次启动灌回来（关窗口也存；进程本身不保留，见 README）\r\n";
+        "#          termux.session，下次启动灌回来（关窗口也存；进程本身不保留，见 README）\r\n"
+        "# graphics: on | off —— 图形协议直通（sixel / kitty / iTerm2 图片原样交给宿主终端）\r\n"
+        "# graphics_max: 单条序列的大小上限（KB，4..262144，默认 32768）；超过就整段丢弃\r\n"
+        "# conpty_passthrough: auto | on | off —— 仅 Windows。auto=只在 Win11 22H2+ 给 ConPTY\r\n"
+        "#          加 PSEUDOCONSOLE_PASSTHROUGH_MODE（不加它 conhost 会自己吃掉 sixel/kitty）\r\n";
     fwrite(header, 1, strlen(header), f);
 
     len = snprintf(buf, sizeof(buf),
@@ -424,6 +461,9 @@ void save_config(void) {
         "confirm_on_close = %s\r\n"
         "search_case_sensitive = %s\r\n"
         "session = %s\r\n"
+        "graphics = %s\r\n"
+        "graphics_max = %d\r\n"
+        "conpty_passthrough = %s\r\n"
         "anim = %s\r\n"
         "default_startup = %d\r\n\r\n",
         theme_name(), keymap_prefix_text(), g_scrollback_lines,
@@ -433,6 +473,9 @@ void save_config(void) {
         g_confirm_on_close ? "true" : "false",
         g_search_case_sensitive ? "true" : "false",
         g_session_persist ? "true" : "false",
+        g_graphics_relay ? "on" : "off",
+        g_graphics_max_kb,
+        conpty_passthrough_text(),
         anim_ini_text(),
         g_default_startup);
     if (len > 0) fwrite(buf, 1, len, f);

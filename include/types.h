@@ -30,6 +30,18 @@ typedef struct {
     int used;         /* 本行由终端输出实际写到的最右 cell+1；保留行尾真实空格 */
 } ScreenLine;
 
+#define GFX_RELAY_QUEUE 16      /* 每窗格最多攒几条待转发的图形序列（一帧里连发多图的场景） */
+
+/* v2.3.6：一条待转发的图形序列（原始字节，含 ESC P / ESC _ / ESC ] 起头与结尾）。
+ * hist/y/x 用来在转发那一帧换算宿主行列：见 src/render.c 的 gfx_collect_locked 注释。 */
+struct TermuxGfxItem {
+    char *p;
+    int len;
+    int hist;      /* 采集时该窗格的物理历史行数（用来抵消采集与重绘之间的滚动） */
+    int y, x;      /* 采集时光标在视口内的行/列 */
+    int host_row, host_col;   /* render 换算出来的宿主行列（0 基，-1 = 本帧不转发） */
+};
+
 typedef struct {
     ScreenLine *lines;
     int cols, rows, total_lines, scroll_top;
@@ -114,6 +126,29 @@ typedef struct {
      * 的行滚进它自己的滚动缓冲后，重绘只带最新那几行；拿它和这个数一比就知道该不该
      * 重新锚定、该下移几行（见 screen_repaint_reanchor）。 */
     int repaint_snap_content;
+
+    /* ---- v2.3.6：图形协议直通（graphics = on）----
+     * 本引擎是「自己维护屏幕模型 + 按帧差分重绘」，没有原始字节中继，所以 sixel(DCS q)、
+     * kitty(APC _G)、iTerm2(OSC 1337;File=) 这类序列以前在 vt.c 里被整段吞掉 —— 图片根本
+     * 到不了宿主（用户报「不支持传递图形协议」）。现在解析时【并行】挂一个 tap：命中这三种
+     * 就把整段原样存进下面的队列，由 render 在本帧末尾按宿主坐标写出去（实时语义：不进网格、
+     * 不进历史，向上滚/resize 之后就没了，与 tmux 的 allow-passthrough 同一档）。
+     * 任何一条不完整的（中途出现不认识的 ESC、超上限）⇒ 整段丢弃，宁可不画也不能把半截
+     * DCS 发给宿主：那会让宿主的 sixel 解析器停在半张图上，后面全是乱码。 */
+    /* 状态号必须与 vt.c 那个 switch 的 case 一一对应：跳进一个不存在的状态会被 default
+       清态，表现是「这条协议整个静默消失」，编译期一点症状都没有（本项目真栽过一次）。
+       0 空闲 / 1 刚见 ESC / 2 DCS 参数段（还没到 q）/ 3 载荷采集中（sixel 与 kitty 共用，
+       两者都以 ST 或 BEL 收尾）/ 4 APC 前缀（等 G）/ 6 OSC 编号 / 7 OSC 载荷（1337） */
+    int gfx_state;
+    int gfx_escpend;               /* 采集态里刚见到 ESC，等下一个字节是不是 '\' */
+    int gfx_sawfile;               /* OSC 1337 载荷开头匹配到 "File=" 的第几个字符；-1 = 已否定 */
+    int gfx_oversize;              /* 这条超上限 ⇒ 收到结尾也只丢不发 */
+    char *gfx_cur;                 /* 正在采集的那一条 */
+    int gfx_cur_len, gfx_cur_cap;
+    int gfx_cap;                   /* 单条上限，单位 KB（gfx_put 里 *1024 换算成字节），来自 ini graphics_max */
+    struct TermuxGfxItem gfx_q[GFX_RELAY_QUEUE];   /* 待转发队列（定长，满了丢最新的） */
+    int gfx_qn;
+    int gfx_oscnum;              /* OSC 编号暂存（只用来认 1337） */
 } ScreenBuffer;
 
 typedef struct {
@@ -131,6 +166,8 @@ typedef struct {
     char title[64];
     char full_title[256];
     int scroll_offset;
+    int gfx_paint_row, gfx_paint_col, gfx_paint_rows, gfx_paint_ok;   /* v2.3.6：本帧这块窗格
+                                                                          * 画在宿主的哪个矩形 */
     int restore_view;       /* v2.3.4：启动视图停在「快照第一行」（= WT 的 UserScrollViewport
                              * 绝对行 + TrySnapOnInput）；用户按键或滚轮就交还控制权 */
     int rf_anchor;          /* v2.3.4：restore_view 期间，希望落在屏幕首行的 reflow 显示行下标

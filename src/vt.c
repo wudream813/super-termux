@@ -1,4 +1,5 @@
 #include "vt.h"
+#include "config.h"        /* v2.3.6：graphics / graphics_max */
 
 static void screen_put_cp(ScreenBuffer *s, unsigned int cp) {
     s->cup_eol_row = -1;   /* 写了内容，「刚 CUP 到底行末列」的判定窗口即作废 */
@@ -785,9 +786,153 @@ static void screen_process_byte(ScreenBuffer *s, unsigned char c) {
     }
 }
 
+/* ================= v2.3.6：图形协议直通（sixel / kitty / iTerm2）=================
+ * 开关与上限的定义放在本文件（config.h 里 extern、ini 解析在 config.c）：状态机在这里，
+ * 而 tests/cascade_probe.c 那批 harness 只链 vt.c、不链 config.c —— 定义放 config.c
+ * 就得每个 harness 自己补一份，早晚漏一个（漏了就是链接错，CI 才发现）。
+ * 默认值是「生效」：与 session 同一口径，要静默得自己在 ini 里写 off。 */
+int g_graphics_relay = 1;
+int g_graphics_max_kb = 32768;   /* 32 MB：够 imgcat 塞进一张大 PNG，也挡住失控的 cat */
+
+/* 逐字节挂在正常状态机【之前】跑一个小判定：认出这三种序列就整段原样收下，交给 render 在
+ * 本帧末尾按宿主坐标转发。为什么要「整段或什么都没有」：半截 DCS-SetGraphicsAttributes 会
+ * 把宿主的 sixel 解析器停在半张图上，之后每一行文字都被它当图像数据吃掉 —— 那是比「看不到
+ * 图片」糟得多的故障，所以中途出错、超上限、结尾不是 ST/BEL 的，一律丢掉不发。
+ * 状态号（每种都必须在 switch 里有分支 —— 跳进一个不存在的 case 会被 default 清态，
+ * 表现是「这条协议整个静默消失」，本项目第一版就这么栽过一次）：
+ *   0 空闲 / 1 刚见 ESC / 2 DCS 参数段（还没到 'q'）/ 3 载荷采集中（sixel 与 kitty 共用，
+ *   因为两者都以 ST/BEL 收尾）/ 4 APC 前缀（等 'G'）/ 6 OSC 编号 / 7 OSC 载荷
+ *   （只有 1337 且载荷里出现 File= 才走到 7 并保留）。*/
+static int gfx_put(ScreenBuffer *s, unsigned char c) {
+    int need = s->gfx_cur_len + 1;
+    if (need > s->gfx_cap * 1024) { s->gfx_oversize = 1; return 0; }
+    if (need > s->gfx_cur_cap) {
+        int cap = s->gfx_cur_cap > 0 ? s->gfx_cur_cap : 4096;
+        while (cap < need) cap *= 2;
+        char *nb = (char *)realloc(s->gfx_cur, (size_t)cap);
+        if (!nb) { s->gfx_oversize = 1; return 0; }
+        s->gfx_cur = nb; s->gfx_cur_cap = cap;
+    }
+    s->gfx_cur[s->gfx_cur_len++] = (char)c;
+    return 1;
+}
+
+static void gfx_qpush(ScreenBuffer *s) {
+    if (s->gfx_cur_len <= 0 || s->gfx_oversize) return;
+    if (s->gfx_qn >= GFX_RELAY_QUEUE) return;      /* 队列满：丢弃最新的（不阻塞、不崩） */
+    struct TermuxGfxItem *it = &s->gfx_q[s->gfx_qn];
+    it->p = (char *)malloc((size_t)s->gfx_cur_len);
+    if (!it->p) return;
+    memcpy(it->p, s->gfx_cur, (size_t)s->gfx_cur_len);
+    it->len = s->gfx_cur_len;
+    it->hist = s->hist_lines;
+    it->y = s->cursor_y; it->x = s->cursor_x;
+    s->gfx_qn++;
+}
+
+static void gfx_done(ScreenBuffer *s) {         /* 收尾：入队 + 复位 */
+    gfx_qpush(s);
+    s->gfx_cur_len = 0;
+    s->gfx_state = 0; s->gfx_escpend = 0; s->gfx_sawfile = 0; s->gfx_oversize = 0;
+}
+
+static void gfx_abort(ScreenBuffer *s) {        /* 不完整/认不出：整段丢掉 */
+    s->gfx_cur_len = 0;
+    s->gfx_state = 0; s->gfx_escpend = 0; s->gfx_sawfile = 0; s->gfx_oversize = 0;
+}
+
+/* iTerm2 的载荷以 base64 为主，`File=` 出现在参数段里；只要认到它就整段收。 */
+/* 锚定匹配：iTerm2 的图片只有「载荷以 File= 开头」这一种写法。原来允许在整段
+ * base64 里任意位置找 "file="，于是 `1337;NotFile=1` 之类也会被当成图片转发；
+ * 一旦某个字符不匹配就把计数打成负数（粘住），收尾时按 <5 丢掉。 */
+static void gfx_scan_osc1337(ScreenBuffer *s, unsigned char c) {
+    /* 模式必须写成小写：下面把输入字符统一 tolower 再比（大小写不敏感）。
+     * 原来这里写的是 "File="，与小写化的 lc 永远配不上 —— 靠「4KB 内没认到才丢」
+     * 兜底才没出事；改成锚定判定后这条必须真配对，否则 BEL 收尾的图整条被判不是图片。 */
+    static const char pat[] = "file=";      /* 认到 5 就够，别把下标写出界 */
+    if (s->gfx_sawfile >= 5 || s->gfx_sawfile < 0) return;
+    char lc = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
+    if (lc == pat[s->gfx_sawfile]) s->gfx_sawfile++;
+    else s->gfx_sawfile = -1;               /* 第 5 个字符之后不再看 */
+}
+
+static void gfx_tap(ScreenBuffer *s, unsigned char c) {
+    if (!g_graphics_relay) { if (s->gfx_state) gfx_abort(s); return; }
+    switch (s->gfx_state) {
+        case 0:
+            if (c == 0x1B) {
+                /* 每次起头都重新读一遍上限：设置页里改 graphics_max（或另一路 ini）
+                 * 下一张图就生效，不必重启。gfx_cap 单位是 KB，与 ini 同口径。 */
+                s->gfx_cap = g_graphics_max_kb > 0 ? g_graphics_max_kb : 32768;
+                s->gfx_state = 1; s->gfx_cur_len = 0; s->gfx_oversize = 0; s->gfx_sawfile = 0;
+            }
+            break;
+        case 1:                                  /* ESC 之后看首字节分三种 */
+            if (c == 'P') { gfx_put(s, 0x1B); gfx_put(s, c); s->gfx_state = 2; }
+            else if (c == '_') { s->gfx_state = 4; s->gfx_escpend = 0; gfx_put(s, 0x1B); gfx_put(s, c); }
+            else if (c == ']') { s->gfx_state = 6; s->gfx_sawfile = 0; s->gfx_oscnum = 0; gfx_put(s, 0x1B); gfx_put(s, c); }
+            else s->gfx_state = 0;
+            break;
+        case 6:                                  /* OSC 的编号（十进制，到 ';' 为止） */
+            if (c >= '0' && c <= '9') {
+                if (s->gfx_oscnum <= 100000) s->gfx_oscnum = s->gfx_oscnum * 10 + (c - '0');
+                gfx_put(s, c);
+            } else if (c == ';' && s->gfx_oscnum == 1337) {
+                gfx_put(s, c); s->gfx_state = 7; s->gfx_sawfile = 0;
+            } else { gfx_abort(s); s->gfx_state = 0; }
+            break;
+        case 7:                                  /* iTerm2 载荷：认 File=，认结尾 */
+            if (s->gfx_escpend) {
+                s->gfx_escpend = 0;
+                /* 收尾这两个字节必须一起进缓冲：漏掉 '\\' 就等于把一条没有 ST 的 OSC
+                 * 发给宿主 —— 宿主的解析器会停在半截 OSC 上，之后整屏文字都被它当
+                 * 载荷吃掉。单测里「iTerm2 ST 收尾原样入队」红过一次就是这么来的。 */
+                if (c == '\\') { gfx_put(s, c); gfx_done(s); }
+                else gfx_abort(s);
+                break;
+            }
+            if (c == 0x07) {
+                if (s->gfx_sawfile >= 5) { gfx_put(s, c); gfx_done(s); }
+                else gfx_abort(s);               /* 载荷开头不是 File= ⇒ 这不是图片，整条丢掉 */
+                break;
+            }
+            if (c == 0x1B) { s->gfx_escpend = 1; gfx_put(s, c); break; }
+            gfx_scan_osc1337(s, c);
+            gfx_put(s, c);
+            break;
+        case 4:                                  /* APC：kitty 是 ESC _ G ...，其它 APC 不理 */
+            /* 状态号在 switch 里必须有对应分支：早先这里跳到 8，而下面根本没有
+             * case 8 —— 于是走 default、状态清零，kitty 整条静默消失（探针里
+             * sixel 与 iTerm2 都通、只有 kitty 不通，就是这个原因）。*/
+            if (c == 'G') { gfx_put(s, c); s->gfx_state = 3; s->gfx_sawfile = 0; }
+            else gfx_abort(s);
+            break;
+        case 2:                                  /* DCS 参数段：只有以 'q' 收尾的才是 sixel */
+            gfx_put(s, c);
+            if (c == 'q') s->gfx_state = 3;
+            else if (c >= 0x40 && c <= 0x7E) gfx_abort(s);   /* 别的 DCS（DECRQSS 之类）*/
+            break;
+        case 3:                                  /* 载荷段：sixel(DCS …q) 与 kitty(APC …G) 共用 */
+            if (s->gfx_escpend) {
+                s->gfx_escpend = 0;
+                if (c == '\\') { gfx_put(s, c); gfx_done(s); }
+                else gfx_abort(s);               /* 采集途中出现别的 ESC ⇒ 认不准，整段丢 */
+                break;
+            }
+            if (c == 0x1B) { s->gfx_escpend = 1; gfx_put(s, c); break; }
+            /* sixel 与 kitty 都允许 BEL 收尾（ST 的两种写法，规范上等价）*/
+            if (c == 0x07) { gfx_put(s, c); gfx_done(s); break; }
+            gfx_put(s, c);
+            break;
+        default: s->gfx_state = 0; break;
+    }
+}
+
 void screen_process_output(ScreenBuffer *s, const char *data, int len) {
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)data[i];
+
+        gfx_tap(s, c);        /* v2.3.6：图形协议直通的小判定（与状态机并行，互不影响） */
 
         /* CRLF 逻辑配对：普通文本会打断 CR；ESC 序列不打断，因为 ConPTY/cmd
          * 会把窗口标题 OSC 插在 CR 与 LF 之间（CR OSC LF 仍是一条真实换行）。

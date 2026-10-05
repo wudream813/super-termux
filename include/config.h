@@ -45,6 +45,10 @@ extern int g_search_case_sensitive;  /* 搜索是否锁定大小写（区分大�
  * 下次启动读回来（默认 off ⇒ 既不写也不读，与 v2.2.0 行为一致）。这不是常驻后台进程：
  * 关掉的那段时间里没有任何东西在跑，见 include/session.h。 */
 extern int g_session_persist;
+extern int g_graphics_relay;      /* v2.3.6：图形协议直通（sixel DCS / kitty APC / iTerm2 OSC 1337）
+                                   * 默认开；宿主不认这些协议会看到乱码时，ini 里 graphics = off。 */
+extern int g_graphics_max_kb;         /* v2.3.6：单条序列的字节上限（超限整段丢弃，不发半截） */
+const char *conpty_passthrough_text(void);   /* v2.3.6：ini 的 conpty_passthrough 原文（默认 "auto"）*/
 extern int g_anim_ms;                /* 设置页过渡动画时长 ms；0 = 关（ini `anim`） */
 extern int g_settings_show_presets;
 extern int g_preset_sel;

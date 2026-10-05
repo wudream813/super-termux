@@ -28,8 +28,9 @@
 #define SETTINGS_PANE_VALUE_OFF 22   /* 值段（'#'）在 col+VALUE_OFF-1（1 基）：1+16+1+2+1 = 21 列前缀 */
 #define SETTINGS_KEYS_ROW0      6
 #define SETTINGS_BEHAVIOR_ROW0  6
-#define SETTINGS_BEHAVIOR_TOGGLES 6   /* mouse / copy_move_deselect / confirm_on_exit / confirm_on_close
-                                       * / search_case_sensitive / session（v2.3.0 新增第 6 个）。
+#define SETTINGS_BEHAVIOR_TOGGLES 7   /* mouse / copy_move_deselect / confirm_on_exit / confirm_on_close
+                                       * / search_case_sensitive / session（v2.3.0 新增第 6 个）
+                                       * / graphics（v2.3.6 新增第 7 个）。
                                        * scrollback 那行不算 toggle，行号 = ROW0 + TOGGLES，会自动跟着挪；
                                        * 页内行数一变，凡引用行为页行号的判据都要重新实测（别照抄旧数字）。 */
 /* 相对 main_left 的按钮列偏移，渲染时用绝对定位写出，鼠标按同样的偏移命中。

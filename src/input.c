@@ -2194,6 +2194,9 @@ static void settings_behavior_toggle(int idx) {
     }
     /* v2.3.0：第 6 个开关 = 退出时保存会话。落盘由紧接着的 save_config() 顺手做掉。 */
     else if (idx == 5) g_session_persist = !g_session_persist;
+    /* v2.3.6：第 7 个开关 = 图形协议直通。关掉之后图片序列照旧被吞掉（不会像
+     * 以前那样在屏幕上留一堆乱码），开着才原样发给宿主。 */
+    else if (idx == 6) g_graphics_relay = !g_graphics_relay;
     save_config();
     g_mux.needs_redraw = 1;
 }

@@ -182,6 +182,27 @@ int main(int argc, char **argv)
         setenv("TERMUX_CONPTY", "system", 1); /* 应被忽略：已缓存 */
         expect_int("第二次", conpty_loader_init(), 1);
         expect_str("source 不被后来的环境变量改写", conpty_source_name(), "conpty.dll");
+    } else if (strcmp(c, "passthrough") == 0) {
+        /* v2.3.6：PSEUDOCONSOLE_PASSTHROUGH_MODE(0x8) 该不该加。这两个是纯函数，
+         * 真机上 build 号不由我们定，所以判定规则只能这样单测出来。 */
+        expect_int("位值必须是 0x8", TERMUX_PSEUDOCONSOLE_PASSTHROUGH, 0x8);
+        expect_int("auto + Win11 22H2(22621) ⇒ 加", conpty_passthrough_wanted(0, 22621), 1);
+        expect_int("auto + 26100(24H2) ⇒ 加", conpty_passthrough_wanted(0, 26100), 1);
+        expect_int("auto + 22000(21H2) ⇒ 不加", conpty_passthrough_wanted(0, 22000), 0);
+        expect_int("auto + 19045(Win10) ⇒ 不加", conpty_passthrough_wanted(0, 19045), 0);
+        expect_int("auto + 取不到版本(0) ⇒ 不加", conpty_passthrough_wanted(0, 0), 0);
+        expect_int("on + 老系统 ⇒ 照样试（失败由 create 退回不带位）", conpty_passthrough_wanted(1, 17763), 1);
+        expect_int("off + 新系统 ⇒ 不加", conpty_passthrough_wanted(-1, 26100), 0);
+        expect_int("文本 on", conpty_passthrough_tri_from_text("on"), 1);
+        expect_int("文本 true", conpty_passthrough_tri_from_text("true"), 1);
+        expect_int("文本 1", conpty_passthrough_tri_from_text("1"), 1);
+        expect_int("文本 off", conpty_passthrough_tri_from_text("off"), -1);
+        expect_int("文本 false", conpty_passthrough_tri_from_text("FALSE"), -1);
+        expect_int("文本 0", conpty_passthrough_tri_from_text("0"), -1);
+        expect_int("文本 auto", conpty_passthrough_tri_from_text("auto"), 0);
+        expect_int("文本空 = auto", conpty_passthrough_tri_from_text(""), 0);
+        expect_int("文本乱写 = auto", conpty_passthrough_tri_from_text("whatever"), 0);
+        expect_int("NULL = auto", conpty_passthrough_tri_from_text(NULL), 0);
     } else {
         printf("未知 case: %s\n", c);
         return 2;

@@ -5,7 +5,7 @@
 终端复用器（Terminal Multiplexer）—— 模块化 C 架构，单文件可执行。
 在一个终端窗口里管理多个 shell 会话，像 tmux 一样分标签页、分屏、搜历史。
 
-当前版本：**v2.3.5**（正式支持 Windows / Linux / macOS 三个系统）
+当前版本：**v2.3.6**（正式支持 Windows / Linux / macOS 三个系统）
 
 ## 平台支持
 
@@ -163,6 +163,9 @@ confirm_on_exit = false    # 退出 termux 前弹出 Y/N 二次确认
 confirm_on_close = false   # 关闭窗格 / 标签前弹出 Y/N 二次确认
 search_case_sensitive = false  # 历史搜索是否锁定大小写（false = 忽略大小写）
 session = true             # 退出时把会话存进 termux.session，下次启动恢复历史与布局（默认 on）
+graphics = on              # 图形协议直通：sixel / kitty / iTerm2 的图片序列原样交给宿主终端（off = 照旧丢掉）
+graphics_max = 32768       # 单条图形序列的大小上限（KB，4 - 262144）；超限整段丢弃，绝不发半截
+conpty_passthrough = auto  # 仅 Windows：要不要给 ConPTY 加 PSEUDOCONSOLE_PASSTHROUGH_MODE（auto | on | off）
 anim = normal              # 过渡动画（切页 / 浮层 / 气泡 / 切标签横滑）：off | short(60ms) | normal(110ms)，也可直接写毫秒数(≤600)
 default_startup = 0        # 0 = 启动进终端，1 = 启动显示帮助
 
@@ -233,7 +236,7 @@ default_startup = 0        # 0 = 启动进终端，1 = 启动显示帮助
 | 菜单项详细配置 | 单个条目的名称 / 命令行 / 启动目录 / 启动默认颜色。**侧栏不再列 `[1]`-`[9]`**（用户：左侧不要再额外放这些），从条目管理页点行或按 `[改]`/`Enter` 进来 | `Tab` 切换输入框，`Enter` 保存 |
 | **外观 / 主题** | 上下选择内置主题，`Enter`/点击**立即应用并写盘**；下方 16 个语义色带色块与十六进制值，`Enter` 进入编辑（6 位 hex），`R` 复位当前项，`Ctrl+R` 清除全部自定义 | 启动页按 `F2` |
 | **键位设置** | 第一行是前缀键，下面是全部 17 个动作；`Enter` 或点击 `[改]` 进入**按键录制**（直接按你想要的组合键即可），`R` 或 `[复位]` 恢复默认，`Ctrl+R` 全部复位 | 启动页按 `F3` / `K` |
-| **行为开关** | `mouse` / `copy_move_deselect` / `confirm_on_exit` / `confirm_on_close` / `search_case_sensitive` / `session` 六个开关，`scrollback` 用 `←/→` 或 `[-] [+]` 按 1000 步进调整 | 启动页按 `F4` / `B` |
+| **行为开关** | `mouse` / `copy_move_deselect` / `confirm_on_exit` / `confirm_on_close` / `search_case_sensitive` / `session` / `graphics` 七个开关（`graphics` = 图形协议直通，v2.3.6），`scrollback` 用 `←/→` 或 `[-] [+]` 按 1000 步进调整 | 启动页按 `F4` / `B` |
 | **窗格配色** | cmd / shell 文字的**默认背景、默认前景**、**滚动条滑块 / 轨道**与黑/红/绿/黄/蓝/紫/青/白及 8 个亮色共 20 项（即 `[theme] pane_*`），两列排布，`↑/↓` 选、`←/→` 换列，`Enter` 输 6 位 hex（预填值一打字就整段替换），`R` 复位当前项回「跟随终端」，`Ctrl+R` 全部清除；改完立即生效并写盘。顶部方案行 `Enter` 弹出**配色方案选择列表**（8 套，每行带实际色块预览，`↑/↓`/数字键选、`Enter` 应用、`Esc` 只关列表）。命令面板里也有 `pane-palette` 入口 | 启动页按 `F5` / `W` |
 
 侧栏用鼠标点，或在任意分类页按 `Ctrl+↑ / Ctrl+↓` 依次切换；`Esc` 从分类页返回启动页。
@@ -313,6 +316,18 @@ python3 verify_config_theme.py     # 配置体系：主题参考色板完整性 
 
 
 ## 版本历史
+
+**v2.3.6** —— 用户报「不支持传递图形协议」：`img2sixel` / `kitty +kitten icat` / `imgcat` 在本复用器里什么都不出现。原因是这一层把未知序列丢掉，而图形协议（sixel 的 DCS、kitty 的 APC、iTerm2 的 OSC 1337）正好是「未知」的三种。现在解析线程旁边挂一个小判定认出它们、整段原样收下，在主线程发完本帧差分之后按宿主坐标写出去 —— 实时直通，不进历史（滚动或缩放之后图像消失是可接受的口径）。Windows 侧另加 `PSEUDOCONSOLE_PASSTHROUGH_MODE`（0x8）：不加它，in-box conhost 会自己把 sixel 与 kitty 剔掉（微软那边是 issue #1173，至今没放行），我们转发得再干净也到不了宿主；该位只在 Win11 22H2（build 22621）以上存在，所以「带位试建、失败立刻退回不带位」。
+
+| # | 内容 |
+|---|---|
+| 1 | `src/vt.c`：图形序列采集状态机（三种协议、ST/BEL 两种收尾、`File=` 锚定判定、`graphics_max` 上限、中途出错整段丢弃）+ 每窗格 16 条的转发队列 |
+| 2 | `src/render.c`：锁内取出队列并按「本帧该窗格的首行/首列」换算宿主坐标，帧尾统一 `host_write`；不在实时视图（正在回看）就不发 |
+| 3 | `[general] graphics` / `graphics_max` / `conpty_passthrough` 三个 ini 键（读得进来、`save_config()` 也写回去），行为页第 7 个开关直接切 `graphics` |
+| 4 | `src/conpty_loader.c`：`RtlGetVersion` 取 build 号 + `conpty_passthrough_wanted()` / `conpty_passthrough_tri_from_text()` 两个纯函数（进 `make verify-loader` 的单测），带位失败自动退回 |
+| 5 | 判据：`make gfx-posix`（采集状态机 33 条定点断言，无外部依赖）+ `verify_pane_palette.py` T18a-T18f（真 pty 查宿主原始字节流；T18a 拿 v2.3.5 的发布档跑是红的） |
+
+三个坑都是「静默什么都不发生」型的，靠定点单测才当场抓到：① kitty 的载荷态跳到一个 switch 里不存在的状态号（走 `default` 被清态）；② `File=` 的模式串写成大写开头、与统一小写后的输入永远配不上（原来靠「4KB 内没认到才丢」兜住，改成锚定判定后立刻暴露）；③ iTerm2 用 `ESC \` 收尾时忘了把 `\` 一起收进缓冲 ⇒ 发出去的是**没有结尾的 OSC**，宿主的解析器会停在半截上、把之后每行文字都当载荷吃掉。
 
 **v2.3.5** —— 拿 v2.3.4 上 Windows 真机试过的回报是「这次没有闪一下了，但是没有历史」+「没有记录终端」。顺着这两句查到：v2.3.4 为了「恢复了但还没显示就退出」在 `session_flush_now()` 最上面加了一句会**无条件拿锁**的落地调用，而那支函数正是 Windows `CTRL_CLOSE_EVENT` 处理器里调的 —— 那一刻 ConPTY 读线程多半正持着 `g_mux.cs`，处理器就此挂住，系统几秒钟后强杀进程 ⇒ **一个字都没写**；于是下一次启动既没有历史可恢复（不闪了），也再攒不出快照。
 
