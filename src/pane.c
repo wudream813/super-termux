@@ -110,11 +110,11 @@ unsigned __stdcall pane_read_thread(void *arg) {
          * 由 screen_repaint_reanchor 把提示符顶回底行。 */
         screen_repaint_align(&pane->screen, buf, br);
         screen_process_output(&pane->screen, buf, (size_t)br);
-        /* v2.3.4：这一格的第一帧真输出【已经落进屏】⇒ 此刻才把挂着的快照接上，于是
-         * 快照是屏上最后被写入的一批行，Windows 上 shell 启动那记整视口重绘盖不到它
-         * （顺序为什么这样排、以及与 WT `_InitializeTerminal` 的对应关系，见 session.c
-         * 里 sess_feed 上方的注释）。只在第一帧后做一次（armed 位就地清）。 */
-        session_pump_pending((int)(pane - g_mux.panes));
+        /* v2.3.9：这里不再【立刻】落地快照。ConPTY 起 shell 时会先单独来一小块纯模式
+         * 序列（`ESC[?9001hESC[?1004h`），紧接着才是 cmd 的 `ESC[?25l ESC[2J ESC[H`
+         * 整屏重绘；落地太早就被那记重绘清掉（用户看到的「历史没有内容」= 一行不剩）。
+         * 现在只把落地时刻顺延到「静默 150ms」之后，由主循环的 session_pump_due 统一落。 */
+        session_note_output((int)(pane - g_mux.panes));
         /* 搜索开着时，新输出里的关键词也要能被找到（重扫在主循环里做，每帧一次）。
          * 只有活动窗格的内容会被搜索，别的窗格来了输出不用置脏。 */
         if (idx == g_mux.active_pane) search_mark_dirty();
@@ -132,7 +132,11 @@ unsigned __stdcall pane_read_thread(void *arg) {
             write_to_pane_internal(pane, pane->screen.response_buf, pane->screen.response_len);
             pane->screen.response_len = 0;
         }
-        if (idx == g_mux.active_pane) g_mux.needs_redraw = 1;
+        /* v2.3.7：以前只看 idx == active_pane。分屏里非活动窗格也有可见内容，
+         * 后台（比如另一边在跑编译）的输出就一直不重绘，画面停到下一次敲键/动鼠标
+         * 为止。render_pane_should_wake 把「上一帧确实画在宿主上」也算进来；
+         * 别的标签页 / 被 zoom 盖住的窗格仍然是 0，不白耗 CPU。 */
+        if (render_pane_should_wake(idx)) g_mux.needs_redraw = 1;
         LeaveCriticalSection(&g_mux.cs);
     }
     pane_mark_dead(idx);

@@ -134,7 +134,7 @@ crosscheck-embedded-c:
 	 [ $$bad -eq 0 ]
 
 crosscheck-win-harness:
-	@for h in tests/render_harness.c tests/sb_drag_harness.c tests/cascade_probe.c tests/test_gfx_relay.c; do \
+	@for h in tests/render_harness.c tests/sb_drag_harness.c tests/cascade_probe.c tests/test_gfx_relay.c tests/gfx_paint_harness.c; do \
 	  case $$h in \
 	    *cascade_probe*|*test_gfx_relay*) S="src/screen.c src/vt.c src/utf8.c src/theme.c" ;; \
 	    *)               S="$(HARNESS_SRC) tests/render_harness_shims.c" ;; \

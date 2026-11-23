@@ -208,7 +208,154 @@ int main(void) {
         screen_free(&s);
     }
 
-    if (failures) { printf("\n%d FAILURE(S)\n", failures); return 1; }
+    /* ---- 满行后的「延迟换行」何时作废（v2.3.7，conhost 实测） ----------------
+     * 写满 120 列后光标处于延迟换行态。conhost 的【擦除类】控制序列（EL/ED/ECH）
+     * 会清掉这个状态：下一条可见字符写回末列（覆盖），而不是折到下一行。
+     * SGR / 私有模式 / BEL 不清 —— 下一条字符照常折行。
+     * 这一列之差会让 120 列满行的流整屏内容错开一行（真机：mdt 滚动的状态行错位），
+     * 所以四条都钉住（前三条 conhost 实测 B 在 (0,119)，第四条在 (1,0)）。 */
+    {
+        const char *ctl[] = {"\x1b[K", "\x1b[16X", "\x1b[J"};
+        const char *name[] = {"EL", "ECH", "ED"};
+        for (int i = 0; i < 3; i++) {
+            ScreenBuffer s; screen_init(&s, 120, 6);
+            char buf[256];
+            int n = 0;
+            memset(buf, 'a', 120); n = 120;
+            memcpy(buf + n, ctl[i], strlen(ctl[i])); n += (int)strlen(ctl[i]);
+            buf[n++] = 'B';
+            screen_process_output(&s, buf, n);
+            CHAR_INFO *c = screen_cell(&s, 0, 119);
+            char det[160];
+            snprintf(det, sizeof det, "满行 + %s 清延迟换行：B 覆盖末列（B 在 (%d,%d)，%s）",
+                     name[i], s.cursor_y, s.cursor_x,
+                     c && c->Char.UnicodeChar == 'B' ? "末列是 B" : "末列不是 B");
+            ck(det, c && c->Char.UnicodeChar == 'B' && s.cursor_y == 0);
+            screen_free(&s);
+        }
+        {
+            ScreenBuffer s; screen_init(&s, 120, 6);
+            char buf[256];
+            int n = 0;
+            memset(buf, 'a', 120); n = 120;
+            memcpy(buf + n, "\x1b[38;2;1;2;3m", 13); n += 13;
+            buf[n++] = 'B';
+            screen_process_output(&s, buf, n);
+            CHAR_INFO *c = screen_cell(&s, 1, 0);
+            char det[160];
+            snprintf(det, sizeof det, "满行 + SGR 不清延迟换行：B 折到下一行（B 在 (%d,%d)）",
+                     s.cursor_y, s.cursor_x);
+            ck(det, c && c->Char.UnicodeChar == 'B');
+            screen_free(&s);
+        }
+    }
+
+
+    /* ---- 右缘「填充空格」不能吃掉真实内容里的空格（v2.3.8） ------------------
+     * 老规则：宽字符占满右缘（左邻是宽字次格 ch==0、光标 >= cols-2）时紧跟在后面
+     * 的空格一律丢弃。它修好了 ConPTY 的排版填充空格，但真实内容也会落在这个位置：
+     * mdt 把「，」摆在 116-117 列、真空格在 118 列、再往后是 SGR + 边框字符。
+     * 丢掉那一个空格 ⇒ 整行短一列 ⇒ 右缘边框落到 118 列、下一行开头挤到上一行末尾，
+     * 逐行累积成用户看到的「右侧滚动条/状态行错位」（2026-11-22 vttrace：22 处）。
+     * 新规则：先当普通空格写，下一个事件再定性 —— 可打印字符（可夹 SGR）= 内容，
+     * 保留；换行/光标移动/擦除 = 排版填充，撤回。
+     * 判据必须两头都钉：A 保住内容空格，B/C/D 保住「填充空格被丢弃」。 */
+    {
+        /* A：mdt 形态 —— 空格后面跟 SGR 再跟可打印字符，必须保留。 */
+        ScreenBuffer s; screen_init(&s, 120, 6);
+        char buf[512]; int n = 0;
+        memset(buf, 'a', 116); n = 116;                     /* 0..115 */
+        n += (int)snprintf(buf + n, sizeof buf - n, "\xe4\xb8\xad");  /* 中 116-117 */
+        buf[n++] = ' ';                                     /* 真空格 118 */
+        n += (int)snprintf(buf + n, sizeof buf - n, "\x1b[38;2;1;2;3m");
+        buf[n++] = 'B';                                     /* 119 */
+        screen_process_output(&s, buf, n);
+        CHAR_INFO *sp = screen_cell(&s, 0, 118);
+        CHAR_INFO *b119 = screen_cell(&s, 0, 119);
+        int used = s.lines[screen_phys_row(&s, 0)].used;
+        char det[200];
+        snprintf(det, sizeof det,
+                 "A 右缘真空格 + SGR + 字符：空格保留、不挤短整行（used=%d 空格=%d B在(%d,%d)）",
+                 used, sp ? (int)sp->Char.UnicodeChar : -1, s.cursor_y, s.cursor_x);
+        ck(det, sp && sp->Char.UnicodeChar == L' ' &&
+                b119 && b119->Char.UnicodeChar == 'B' && s.cursor_y == 0 && used == 120);
+        screen_free(&s);
+    }
+    {
+        /* B：ConPTY 形态 —— 空格后面直接换行，必须撤回（used 不涨）。
+         * 注意 LF 本身不回到行首（VT 语义），所以 Z 落在第 118 列；
+         * 判据只看「填充空格有没有把 used 撑到 119」。 */
+        ScreenBuffer s; screen_init(&s, 120, 6);
+        char buf[512]; int n = 0;
+        memset(buf, 'a', 116); n = 116;
+        n += (int)snprintf(buf + n, sizeof buf - n, "\xe4\xb8\xad");
+        buf[n++] = ' ';
+        buf[n++] = '\n';
+        buf[n++] = 'Z';
+        screen_process_output(&s, buf, n);
+        int used0 = s.lines[screen_phys_row(&s, 0)].used;
+        CHAR_INFO *z = screen_cell(&s, 1, 118);
+        char det[200];
+        snprintf(det, sizeof det,
+                 "B 右缘填充空格 + LF：撤回填充空格、整行不多占地（used=%d Z在(%d,%d)）",
+                 used0, s.cursor_y, s.cursor_x);
+        ck(det, used0 == 118 && z && z->Char.UnicodeChar == 'Z' && s.cursor_y == 1);
+        screen_free(&s);
+    }
+    {
+        /* C：空格后面跟 EL —— 同属排版填充，撤回后 used 只剩宽字符那一格。 */
+        ScreenBuffer s; screen_init(&s, 120, 6);
+        char buf[512]; int n = 0;
+        memset(buf, 'a', 116); n = 116;
+        n += (int)snprintf(buf + n, sizeof buf - n, "\xe4\xb8\xad");
+        buf[n++] = ' ';
+        memcpy(buf + n, "\x1b[K", 3); n += 3;
+        buf[n++] = 'B';
+        screen_process_output(&s, buf, n);
+        int used0 = s.lines[screen_phys_row(&s, 0)].used;
+        CHAR_INFO *b118 = screen_cell(&s, 0, 118);
+        char det[200];
+        snprintf(det, sizeof det,
+                 "C 右缘填充空格 + EL：撤回（used=%d B在(%d,%d)）",
+                 used0, s.cursor_y, s.cursor_x);
+        /* EL 会清掉 118..119，然后 B 写在 118（撤回把光标放回 118）。 */
+        ck(det, used0 == 119 && b118 && b118->Char.UnicodeChar == 'B' && s.cursor_y == 0);
+        screen_free(&s);
+    }
+    {
+        /* D：填充空格落在末列（cols-1）时也要撤回，且不留延迟换行。
+         * 后面接可打印字符时它是内容（见 A），所以这里必须跟换行。 */
+        ScreenBuffer s; screen_init(&s, 120, 6);
+        char buf[512]; int n = 0;
+        memset(buf, 'a', 117); n = 117;                     /* 0..116 */
+        n += (int)snprintf(buf + n, sizeof buf - n, "\xe4\xb8\xad");  /* 117-118 */
+        buf[n++] = ' ';                                     /* 119 */
+        buf[n++] = '\n';
+        screen_process_output(&s, buf, n);
+        int used0 = s.lines[screen_phys_row(&s, 0)].used;
+        char det[200];
+        snprintf(det, sizeof det,
+                 "D 末列填充空格 + LF：撤回、不留延迟换行、不折行（used=%d y=%d pending=%d）",
+                 used0, s.cursor_y, s.wraparound_pending);
+        ck(det, used0 == 119 && s.cursor_y == 1 && !s.wraparound_pending);
+        screen_free(&s);
+    }
+    {
+        /* E：远离右缘的真实空格不受影响（「洛谷 题解」这类）。 */
+        ScreenBuffer s; screen_init(&s, 120, 6);
+        char buf[256]; int n = 0;
+        memset(buf, 'a', 40); n = 40;
+        buf[n++] = ' ';
+        buf[n++] = 'B';
+        screen_process_output(&s, buf, n);
+        CHAR_INFO *sp = screen_cell(&s, 0, 40);
+        char det[160];
+        snprintf(det, sizeof det, "E 行中真实空格照旧保留（空格=%d）",
+                 sp ? (int)sp->Char.UnicodeChar : -1);
+        ck(det, sp && sp->Char.UnicodeChar == L' ');
+        screen_free(&s);
+    }
+
     printf("\nWIDE-WRAP CHECKS PASSED\n");
     return 0;
 }
@@ -218,7 +365,6 @@ int main(void) {
 def main() -> int:
     print("=== 宽字符强制换行清旧行末格验证 (verify_wide_wrap.py) ===")
     with tempfile.TemporaryDirectory() as td:
-        td = "/tmp/wrap_chk"
         os.makedirs(td, exist_ok=True)
         # 组装一个含补充类型的 stub windows.h。
         stub_win = os.path.join(STUB, "windows.h")
@@ -245,12 +391,12 @@ def main() -> int:
              os.path.join(td, "h.c"), os.path.join(td, "globs.c"),
              os.path.join(SRC, "screen.c"), os.path.join(SRC, "vt.c"),
              os.path.join(SRC, "utf8.c"), "-o", exe, "-lm"],
-            capture_output=True, text=True)
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
         if cp.returncode != 0:
             print(cp.stderr, file=sys.stderr)
             print("FAIL: 宽字符换行 harness 无法编译", file=sys.stderr)
             return 1
-        run = subprocess.run([exe], capture_output=True, text=True)
+        run = subprocess.run([exe], capture_output=True, text=True, encoding="utf-8", errors="replace")
         print(run.stdout)
         if run.returncode != 0 or "[FAIL]" in run.stdout:
             print(run.stderr, file=sys.stderr)

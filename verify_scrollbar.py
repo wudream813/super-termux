@@ -156,7 +156,13 @@ ck("整屏路径调用它（render_screen 的 show_sb）",
 ck("input.c 的鼠标命中调用它",
    "render_sb_cols_ok(sb_col + 1, s->in_alt_screen)" in INPUT)
 ck("分屏窗格路径的滚动条循环跳过光标行", "if (py == spare) continue;" in RENDER)
-ck("整屏路径的滚动条轨道跳过光标行", "show_sb && dist <= 10 && y != sb_spare" in RENDER)
+ck("整屏路径的滚动条轨道跳过光标行",
+   "show_sb && sb_hist && dist <= 10 && y != sb_spare" in RENDER)
+# v2.3.7：单窗格路径原来没有「有没有历史」门槛 ⇒ 无历史时整列被画成热态滑块、
+# 盖住每行最后一列，而且跨度 0 又拖不动。分屏路径一直有 s->hist_lines > 0。
+ck("整屏路径把「有没有历史」记进 sb_hist", "sb_hist = hist > 0;" in RENDER)
+ck("分屏路径的滚动条仍然要求有历史",
+   "is_hover && s->hist_lines > 0" in RENDER)
 ck("两条路径都调 render_sb_spare_row",
    RENDER.count("render_sb_spare_row(s->cursor_visible") == 2,
    "调用 %d 次" % RENDER.count("render_sb_spare_row(s->cursor_visible"))

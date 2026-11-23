@@ -61,6 +61,7 @@ for sig in ("static void line_free(",
             "static int reflow_append_rows(",
             "static int reflow_acc_cb(",
             "static int reflow_rows_for(",
+            "static int reflow_col_for(",
             "static int screen_row_reflow_len(",
             "static int screen_content_span(",
             "int screen_reflow_height(",
@@ -128,6 +129,7 @@ typedef struct {
     CHAR_INFO *alt_buffer;
     int in_alt_screen, alt_scroll_top;
     int origin_mode, auto_wrap, wraparound_pending;
+    int pad_pend, pad_x, pad_y;          /* 右缘「疑似填充空格」的延迟判定（见 src/vt.c） */
     int scroll_region_top, scroll_region_bottom;
     int app_cursor_keys, app_keypad;
     int mouse_tracking, mouse_sgr, bracketed_paste, win32_input_mode;
@@ -142,6 +144,7 @@ typedef struct {
     WORD *alt_fg_rgb, *alt_bg_rgb;
     unsigned char *alt_rgb_valid;
     int hist_lines;
+    int session_view;                    /* v2.4.0：恢复历史 + 实时内容合成底部锚定视图 */
     int alt_hist_lines;
     unsigned char *line_wrap;
     int resize_repaint_pending;
@@ -618,7 +621,7 @@ static int test_resize_enlarge_reflow_no_duplicate(void) {
     /* 2) reflow 视口逐 vo 上翻：每帧内容按时间单调递增、不含倒退/重复（v1.8.50 整窗统一坐标）。 */
     for (int vo = 0; vo <= s.hist_lines + s.rows; vo++) {
         RGlyph *ov = (RGlyph *)calloc(10 * 24, sizeof(RGlyph));
-        screen_reflow_view(&s, vo, 10, 24, ov);
+        screen_reflow_view(&s, vo, 10, 24, ov, NULL);
         int prev = -1;
         for (int y = 0; y < 10; y++) {
             WCHAR c = ov[y*24].ci.Char.UnicodeChar;
@@ -650,20 +653,22 @@ static int test_reflow_view(void) {
     if (s.hist_lines < 1) { fprintf(stderr, "FAIL: reflow 准备 hist<1\n"); return 1; }
 
     /* vo 自限（v1.8.52）：内容只有 3 个显示行（abcd/efgh/ij）< 视口 6 行时，
-     * 任何 vo 都滚不到「更老」——vo 被 cap 到 0，视图与 vo=0 相同：底部 ij、上方
-     * 不补「内容之上的空白 pad」；内容不丢。 */
+     * 任何 vo 都滚不到「更老」——vo 被 cap 到 0，视图与 vo=0 相同；内容不丢。
+     * v2.4.1：不足一屏时【贴顶】（普通终端语义）—— 旧版底部锚定会把内容压在
+     * 屏底、上方一片空白，用户看到的正是「历史在中间、提示符跑到最下面」。 */
     RGlyph *out = (RGlyph *)calloc(6 * 4, sizeof(RGlyph));
-    int n = screen_reflow_view(&s, 2, 6, 4, out);
+    int cursor_row = -1;
+    int n = screen_reflow_view(&s, 2, 6, 4, out, &cursor_row);
     if (n != 1) { fprintf(stderr, "FAIL: reflow_view 返回 %d（应1）\n", n); free(out); free_screen(&s); return 1; }
     {
-        const char *rp[6] = {"", "", "", "abcd", "efgh", "ij"};
+        const char *rp[6] = {"abcd", "efgh", "ij", "", "", ""};
         for (int y = 0; y < 6; y++) {
             for (int x = 0; x < 4; x++) {
                 char want = x < (int)strlen(rp[y]) ? rp[y][x] : ' ';
                 WCHAR got = out[y*4+x].ci.Char.UnicodeChar;
                 char gc = (got==0||got==L' ')?' ':(char)got;
                 if (gc != want) {
-                    fprintf(stderr, "FAIL: vo=2(cap) y%d x%d: 得 '%c' want '%c'（顶部出现空白 pad/内容偏移）\n", y, x, gc, want);
+                    fprintf(stderr, "FAIL: vo=2(cap) y%d x%d: 得 '%c' want '%c'（内容没贴顶/偏移）\n", y, x, gc, want);
                     free(out); free_screen(&s); return 1;
                 }
             }
@@ -671,13 +676,19 @@ static int test_reflow_view(void) {
     }
     free(out);
 
-    /* vo=0：视口 y5=ij（命令行）、y4=efgh、y3=abcd，y2 空白。 */
+    /* v2.4.1：光标行随贴顶视图一起算 —— 上面这条的内容占 y0..y2，光标在内容末行
+     * 下方那一行（shell 提示符后面），所以是 y3；旧逻辑一律返回最底行 y5。 */
+    if (cursor_row != 3) {
+        fprintf(stderr, "FAIL: 贴顶视图里光标应在 y3（内容末行 + 1 行空行），实际 y%d\n", cursor_row);
+        free_screen(&s); return 1;
+    }
+
+    /* vo=0（v2.4.1 贴顶）：视口 y0=abcd、y1=efgh、y2=ij，y3..y5 空白。 */
     RGlyph *out2 = (RGlyph *)calloc(6 * 4, sizeof(RGlyph));
-    screen_reflow_view(&s, 0, 6, 4, out2);
+    screen_reflow_view(&s, 0, 6, 4, out2, NULL);
     {
-        const char *r3 = "abcd", *r4 = "efgh", *r5 = "ij";
-        const char *rp[6] = {"","","",r3,r4,r5};
-        for (int y = 3; y < 6; y++) {
+        const char *rp[6] = {"abcd", "efgh", "ij", "", "", ""};
+        for (int y = 0; y < 3; y++) {
             for (int x = 0; x < 4; x++) {
                 char want = x < (int)strlen(rp[y]) ? rp[y][x] : ' ';
                 WCHAR got = out2[y*4+x].ci.Char.UnicodeChar;
@@ -688,25 +699,25 @@ static int test_reflow_view(void) {
                 }
             }
         }
-        WCHAR g2 = out2[2*4].ci.Char.UnicodeChar;
-        if (g2 != L' ' && g2 != 0) { fprintf(stderr, "FAIL: vo=0 y2 应空白，得 '%c'\n", (char)g2); free(out2); free_screen(&s); return 1; }
+        WCHAR g3 = out2[3*4].ci.Char.UnicodeChar;
+        if (g3 != L' ' && g3 != 0) { fprintf(stderr, "FAIL: vo=0 y3 应空白，得 '%c'\n", (char)g3); free(out2); free_screen(&s); return 1; }
     }
     free(out2);
 
-    /* 宽视口 20：折 1 行 abcdefghij，vo=0 视口底部 y5=整行。 */
+    /* 宽视口 20：折 1 行 abcdefghij，vo=0 贴顶落在 y0（v2.4.1 前的口径是屏底 y5）。 */
     RGlyph *out3 = (RGlyph *)calloc(6 * 20, sizeof(RGlyph));
-    screen_reflow_view(&s, 0, 6, 20, out3);
+    screen_reflow_view(&s, 0, 6, 20, out3, NULL);
     for (int x = 0; x < 10; x++) {
-        WCHAR got = out3[5*20+x].ci.Char.UnicodeChar;
+        WCHAR got = out3[0*20+x].ci.Char.UnicodeChar;
         if ((char)got != (char)('a'+x)) {
-            fprintf(stderr, "FAIL: 宽视口 vo=0 底部 y5 列%d: 得 '%c' want '%c'\n", x, (char)got, 'a'+x);
+            fprintf(stderr, "FAIL: 宽视口 vo=0 顶部 y0 列%d: 得 '%c' want '%c'\n", x, (char)got, 'a'+x);
             free(out3); free_screen(&s); return 1;
         }
     }
     free(out3);
 
     /* 软换行合并：历史 -1="xyz"(wrap=1) + -2="ab"(wrap=0) => 逻辑行 "abxyz"，
-     * vo=0 视口底部 y3=abxyz（宽10折1行）。 */
+     * vo=0 贴顶落在 y0（宽10折1行）。 */
     {
         ScreenBuffer t; memset(&t, 0, sizeof(t));
         alloc_alt(&t, 6, 4);
@@ -720,13 +731,13 @@ static int test_reflow_view(void) {
         t.line_wrap[r_new] = 1;
         t.line_wrap[r_old] = 0;
         RGlyph *o = (RGlyph *)calloc(4*10, sizeof(RGlyph));
-        int nn = screen_reflow_view(&t, 0, 4, 10, o);
+        int nn = screen_reflow_view(&t, 0, 4, 10, o, NULL);
         if (nn != 1) { fprintf(stderr, "FAIL: 软换行 reflow 返回 %d\n", nn); free(o); free_screen(&t); free_screen(&s); return 1; }
         const char *want = "abxyz";
         for (int x=0;x<5;x++) {
-            WCHAR got = o[3*10+x].ci.Char.UnicodeChar;
+            WCHAR got = o[0*10+x].ci.Char.UnicodeChar;
             if ((char)got != want[x]) {
-                fprintf(stderr, "FAIL: 软换行合并 底部列%d: 得 '%c' want '%c'\n", x, (char)got, want[x]);
+                fprintf(stderr, "FAIL: 软换行合并 顶部列%d: 得 '%c' want '%c'\n", x, (char)got, want[x]);
                 free(o); free_screen(&t); free_screen(&s); return 1;
             }
         }
@@ -734,7 +745,7 @@ static int test_reflow_view(void) {
     }
 
     free_screen(&s);
-    printf("  v1.8.47: reflow 统一视图（历史+可见）——窄折多行/宽折回/软换行合并/vo窗口底部锚定\n");
+    printf("  v1.8.47/v2.4.1: reflow 统一视图（历史+可见）——窄折多行/宽折回/软换行合并/不足一屏贴顶/光标行同源\n");
     return 0;
 }
 

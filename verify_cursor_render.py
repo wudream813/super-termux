@@ -43,15 +43,16 @@ typedef struct {
     int cols, rows;
     int cursor_x, cursor_y, cursor_visible;
     int wraparound_pending;
+    int session_view;
 } ScreenBuffer;
 """
 
 DRIVER = r"""
-static void expect(ScreenBuffer *s, int scroll, int hr, int hc, int visible,
-                   int want_visible, int want_row, int want_col) {
+static void expect(ScreenBuffer *s, int scroll, int session, int session_row, int hr, int hc,
+                   int visible, int want_visible, int want_row, int want_col) {
     int row = -1, col = -1;
     s->cursor_visible = visible;
-    int got = terminal_cursor_position(s, scroll, hr, hc, &row, &col);
+    int got = terminal_cursor_position(s, scroll, session, session_row, hr, hc, &row, &col);
     assert(got == want_visible);
     if (want_visible) {
         assert(row == want_row);
@@ -60,24 +61,30 @@ static void expect(ScreenBuffer *s, int scroll, int hr, int hc, int visible,
 }
 
 int main(void) {
-    ScreenBuffer s = {5, 3, 4, 2, 1, 0};
+    ScreenBuffer s = {5, 3, 4, 2, 1, 0, 0};
 
     /* Normal last cell and delayed-wrap last cell must both render at row 4,
      * column 5 (the pane starts below the one-row tab bar). */
-    expect(&s, 0, 3, 5, 1, 1, 4, 5);
+    expect(&s, 0, 0, -1, 3, 5, 1, 1, 4, 5);
     s.wraparound_pending = 1;
-    expect(&s, 0, 3, 5, 1, 1, 4, 5);
+    expect(&s, 0, 0, -1, 3, 5, 1, 1, 4, 5);
 
     /* Defensive clamp: a transient one-past column still uses the final
      * visible cell rather than hiding the cursor. */
     s.cursor_x = 5;
-    expect(&s, 0, 3, 5, 1, 1, 4, 5);
+    expect(&s, 0, 0, -1, 3, 5, 1, 1, 4, 5);
     s.cursor_y = 1;
-    expect(&s, 0, 3, 5, 1, 1, 3, 5);
+    expect(&s, 0, 0, -1, 3, 5, 1, 1, 3, 5);
+
+    /* v2.4.1：会话视图（恢复历史 + 实时内容）按 screen_reflow_view 算出的行定位 ——
+     * 内容不足一屏时视图贴顶，光标就在 prompt 那一行，不再钉在最底行。 */
+    s.cursor_y = 0;
+    expect(&s, 0, 1, 2, 3, 5, 1, 1, 4, 5);     /* 视口第 2 行（0 基）+2 = 宿主第 4 行 */
+    expect(&s, 0, 1, -1, 3, 5, 1, 1, 4, 5);    /* 未知行号才退回最底行 */
 
     /* A scrolled or hidden terminal deliberately hides the native cursor. */
-    expect(&s, 1, 3, 5, 1, 0, 0, 0);
-    expect(&s, 0, 3, 5, 0, 0, 0, 0);
+    expect(&s, 1, 0, -1, 3, 5, 1, 0, 0, 0);
+    expect(&s, 0, 0, -1, 3, 5, 0, 0, 0, 0);
     puts("terminal cursor regression passed: output last cell remains visible.");
     return 0;
 }

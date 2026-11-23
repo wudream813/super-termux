@@ -35,3 +35,6 @@ termux.ini
 termux.session
 *.session   # 会话快照（v2.3.0 起；跑判据时落在仓库根，别入库）
 RELEASE_NOTES.md
+
+# ---- 真机排查用的临时工作区（诊断脚本、抓包、临时目录）----
+.diag/

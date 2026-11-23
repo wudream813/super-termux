@@ -220,27 +220,40 @@ static int num3(const char *p) {
     return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
 }
 
-/* 等长就地替换：只命中 "038;2;RRR;GGG;BBB" / "048;2;RRR;GGG;BBB" 形式。
- * pane 内容里的颜色由 %d 输出（"38;2;121;192;255"），不带前导零的 038/048
- * 前缀，因此永远不会被误改。 */
+/* 等长就地替换：只命中 CSI/SGR 里的 "038;2;RRR;GGG;BBB" / "048;2;RRR;GGG;BBB"
+ * 形式（可以跟在 "0;" 之类的参数后面）。
+ *
+ * v2.3.7：匹配范围限制在 ESC [ ... m 这条 SGR【内部】。旧实现全帧线性扫
+ * "038;2;"，不要求前面是转义序列 —— 正文里恰好打印了这段字面量（`cat` 本仓库
+ * 源码、`echo '048;2;033;038;045m'`）时，只要 RGB 命中参考色板，11 个可见字符
+ * 就会被原地改成别的数字；framediff 的基准也跟着变，残字会一直留到该行重画，
+ * 而且从屏幕复制出来的是模型原文，显示与剪贴板对不上。 */
 void theme_remap(char *buf, int len) {
     if (g_identity || !buf || len < 17) return;
-    for (int i = 0; i + 17 <= len; i++) {
-        if (buf[i] != '0') continue;
-        if (buf[i + 1] != '3' && buf[i + 1] != '4') continue;
-        if (buf[i + 2] != '8' || buf[i + 3] != ';' || buf[i + 4] != '2' || buf[i + 5] != ';') continue;
-        char *p = buf + i + 6;
-        if (!digits3(p) || p[3] != ';' || !digits3(p + 4) || p[7] != ';' || !digits3(p + 8)) continue;
-        char term = p[11];
-        if (term != 'm' && term != ';') continue;
-        int r = num3(p), g = num3(p + 4), b = num3(p + 8);
-        for (int k = 0; k < g_map_count; k++) {
-            if (g_map[k].from_r == r && g_map[k].from_g == g && g_map[k].from_b == b) {
-                memcpy(p, g_map[k].to, 11);
-                break;
+    for (int i = 0; i + 2 < len; i++) {
+        if (buf[i] != '\x1b' || buf[i + 1] != '[') continue;
+        /* 找这条 CSI 的结束 'm'（只要 SGR）。窗口封顶，一条坏序列不会吞掉整帧。 */
+        int j = i + 2;
+        while (j < len && buf[j] != 'm' && buf[j] != '\x1b' && j - i < 256) j++;
+        if (j >= len || buf[j] != 'm') { i = j; continue; }
+        for (int p = i + 2; p + 17 <= j; p++) {
+            if (buf[p] != '0') continue;
+            if (buf[p + 1] != '3' && buf[p + 1] != '4') continue;
+            if (buf[p + 2] != '8' || buf[p + 3] != ';' || buf[p + 4] != '2' || buf[p + 5] != ';') continue;
+            char *q = buf + p + 6;
+            if (!digits3(q) || q[3] != ';' || !digits3(q + 4) || q[7] != ';' || !digits3(q + 8)) continue;
+            char term = q[11];
+            if (term != 'm' && term != ';') continue;
+            int r = num3(q), g = num3(q + 4), b = num3(q + 8);
+            for (int k = 0; k < g_map_count; k++) {
+                if (g_map[k].from_r == r && g_map[k].from_g == g && g_map[k].from_b == b) {
+                    memcpy(q, g_map[k].to, 11);
+                    break;
+                }
             }
+            p += 15;                 /* 已处理到 q[11] 之前，跳过这 16 字节 */
         }
-        i += 16;
+        i = j;
     }
 }
 

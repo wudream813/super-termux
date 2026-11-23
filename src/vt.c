@@ -1,9 +1,99 @@
 #include "vt.h"
 #include "config.h"        /* v2.3.6：graphics / graphics_max */
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* ================= TERMUX_VTTRACE：行边界诊断（仅在环境变量存在时写文件） =========
+ * 每遇到一次「自动折行 / 显式换行 / 右缘附近的 EL·ECH / 带 pending 的 CUP」就记一行。
+ * 行边界记账出错是「内容整体错位一两行」这类故障的根源，而帧日志只能看到结果、
+ * 看不到模型在哪一列决定换行。默认关闭，正式使用零开销。 */
+static FILE *g_vt_trace_fp = NULL;
+static int g_vt_trace_state = 0;      /* 0 未探测 / 1 开 / -1 关 */
+static long long g_vt_off = 0;        /* 本进程已处理的窗格字节数 */
+
+static void vt_trace_open(void) {
+    if (g_vt_trace_state) return;
+    g_vt_trace_state = getenv("TERMUX_VTTRACE") ? 1 : -1;
+    if (g_vt_trace_state == 1) g_vt_trace_fp = fopen("vttrace.log", "wb");
+}
+
+static void vt_trace(const char *fmt, ...) {
+    if (!g_vt_trace_fp) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_vt_trace_fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_vt_trace_fp);
+    /* 诊断进程常被 TerminateProcess 杀掉：不 flush 就一个字都留不下。 */
+    fflush(g_vt_trace_fp);
+}
+
+/* 一次同步更新（?2026h..?2026l）结束时，把模型里每一行的「最后非空格列」记下来。
+ * 与 conhost 屏幕对照时，这是最省事的行边界指纹：行数错位/折行提前都会露出来。 */
+static void vt_trace_rows(ScreenBuffer *s, const char *tag) {
+    if (!g_vt_trace_fp) return;
+    char buf[2048];
+    int p = 0;
+    for (int y = 0; y < s->rows && p < (int)sizeof buf - 16; y++) {
+        int w = 0;
+        for (int x = 0; x < s->cols; x++) {
+            WCHAR ch = 0;
+            if (s->in_alt_screen && s->alt_buffer) {
+                ch = s->alt_buffer[(size_t)y * s->cols + x].Char.UnicodeChar;
+            } else {
+                int pr = screen_phys_row(s, y);
+                if (pr >= 0 && pr < s->total_lines && s->lines && s->lines[pr].cells)
+                    ch = s->lines[pr].cells[x].Char.UnicodeChar;
+            }
+            if (ch && ch != L' ') w = x + 1;
+        }
+        p += snprintf(buf + p, sizeof buf - (size_t)p, "%d,", w);
+    }
+    vt_trace("%s off=%lld cursor=(%d,%d) widths=%s", tag, g_vt_off,
+             s->cursor_x, s->cursor_y, buf);
+}
+
+/* ===== 右缘「疑似填充空格」的延迟判定 =====
+ * ConPTY 在宽字符正好占满右缘时会补一个纯排版空格（实测窗格 40 列、「驱」占
+ * 36-37 列、空格落 38 列），写进模型会把 used 撑大，reflow 之后变成「驱 动」
+ * 这种凭空多出的空格。老做法是在 screen_put_cp 里直接丢弃，但同样的形状也会
+ * 出现在真实文本里：mdt 的界面就把「，」摆在 116-117 列、后面紧跟一个真空格
+ * 在 118 列，再往后还有光标移动与边框字符。直接丢弃会让整行少一格，右缘边框
+ * 落到 118 列、下一行开头被挤到上一行末尾，逐行累积成「右侧滚动条/状态行错位」
+ * （2026-11-22 的 vttrace 实测 22 处）。
+ * 所以改成两步：先按普通空格写入，等下一个事件再定性质——
+ *   紧跟可打印字符（中间可以夹 SGR/模式序列）= 内容里的真实空格，保留；
+ *   紧跟换行、光标移动、擦除 = 排版填充，撤回（等价于从未写入）。 */
+static void vt_pad_space_mark(ScreenBuffer *s, int x, int y) {
+    s->pad_pend = 1;
+    s->pad_x = x;
+    s->pad_y = y;
+}
+
+static void vt_pad_space_undo(ScreenBuffer *s) {
+    if (!s->pad_pend) return;
+    s->pad_pend = 0;
+    int x = s->pad_x, y = s->pad_y;
+    if (y < 0 || y >= s->rows || x < 0 || x >= s->cols) return;
+    WORD attr = build_attr(s);
+    /* screen_erase_range 擦到行尾时会把 used 收缩到起始列，正好等于「没写过」。 */
+    screen_erase_range(s, y, x, x, attr);
+    if (s->cursor_y == y && (s->cursor_x == x || s->cursor_x == x + 1)) {
+        s->cursor_x = x;
+        s->wraparound_pending = 0;
+    }
+    vt_trace("PADUNDO off=%lld x=%d y=%d", g_vt_off, x, y);
+}
 
 static void screen_put_cp(ScreenBuffer *s, unsigned int cp) {
+    vt_trace_open();
+    /* 来了一个真正的可打印字符：上一格那个可疑空格就是内容，保留。 */
+    s->pad_pend = 0;
     s->cup_eol_row = -1;   /* 写了内容，「刚 CUP 到底行末列」的判定窗口即作废 */
     if (s->wraparound_pending) {
+        vt_trace("WRAP off=%lld x=%d y=%d cp=U+%04X wide=%d cols=%d rows=%d",
+                 g_vt_off, s->cursor_x, s->cursor_y, cp, is_wide_cp(cp), s->cols, s->rows);
         s->cursor_x = 0;
         screen_newline(s);
         screen_mark_softwrap(s);   /* 自动折行：新物理行是上一行的软换行续行 */
@@ -15,13 +105,17 @@ static void screen_put_cp(ScreenBuffer *s, unsigned int cp) {
      * 落在 38 列）。这个空格是纯排版填充、不是内容，但一旦写进模型就会把 used 撑大，
      * 之后窗格变宽 reflow 把折行拼回去，它就永久夹在宽字符和下一个字之间——表现为
      * 「驱 动」「洛 谷」这类中文里凭空多出空格（cell_diag.log F104-F131 实测 26 条）。
-     * 判据：本格左邻是宽字符次格（ch==0）、且光标已贴近右缘。此时丢弃该空格。
-     * 阈值取 cols-2 而非 cols-1：conhost 自己算的右缘与本模型可能差一列（实测
-     * 「驱」占 36-37、cursor_x=38、cols=40，填充空格仍会发来），只卡 cols-1 会漏。
-     * 左邻非次格、或光标远离右缘（中文词间的真实空格，如「洛谷 题解」）都不受影响。 */
-    if (cp == 0x20 && s->cursor_x > 0 && s->cursor_x >= s->cols - 2) {
+     * 判据：本格左邻是宽字符次格（ch==0）、且光标已贴近右缘。阈值取 cols-2 而非
+     * cols-1：conhost 自己算的右缘与本模型可能差一列（实测「驱」占 36-37、
+     * cursor_x=38、cols=40，填充空格仍会发来），只卡 cols-1 会漏。
+     *
+     * 但这个形状在真实内容里也会出现（mdt 就在 118 列放过真空格，后面紧跟光标
+     * 移动与边框字符），当场丢弃会把整行挤短一格，累积成右侧边框错位。所以这里
+     * 只做「标记」，由下一个事件决定是保留还是撤回（见 vt_pad_space_undo）。 */
+    int maybe_pad_space = (cp == 0x20 && s->cursor_x > 0 && s->cursor_x >= s->cols - 2);
+    if (maybe_pad_space) {
         CHAR_INFO *prev = screen_cell(s, s->cursor_y, s->cursor_x - 1);
-        if (prev && prev->Char.UnicodeChar == 0) return;
+        maybe_pad_space = (prev && prev->Char.UnicodeChar == 0);
     }
     int wide = is_wide_cp(cp);
     if (wide && s->cursor_x >= s->cols - 1) {
@@ -43,6 +137,7 @@ static void screen_put_cp(ScreenBuffer *s, unsigned int cp) {
         screen_mark_softwrap(s);   /* 宽字符放不下整字换行：同样是软换行续行 */
         s->wraparound_pending = 0;
     }
+    int wx = s->cursor_x, wy = s->cursor_y;
     WORD attr = build_attr(s);
     if (cp >= 0x10000) {
         WCHAR high = (WCHAR)(0xD800 + ((cp - 0x10000) >> 10));
@@ -63,6 +158,7 @@ static void screen_put_cp(ScreenBuffer *s, unsigned int cp) {
         s->wraparound_pending = 1;
         if (s->detect_count <= 100) detect_conpty_width(s, 0);
     }
+    if (maybe_pad_space) vt_pad_space_mark(s, wx, wy);
 }
 
 static void screen_send_response(ScreenBuffer *s, const char *resp) {
@@ -262,6 +358,17 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
     int p2 = pc > 1 ? params[1] : 0;
 
     if (inter_len > 0) return;
+    /* 右缘可疑填充空格：只要来的是移动光标/擦除类 CSI，就确认它是排版填充并撤回。
+     * SGR（m）与私有模式开关（?h/?l）既不移光标也不动内容，不作结论。 */
+    switch (final) {
+        case 'H': case 'f': case 'A': case 'B': case 'C': case 'D': case 'E':
+        case 'F': case 'G': case 'd': case 'J': case 'K': case 'X': case 'L':
+        case 'M': case 'P': case 'S': case 'T': case '@':
+            vt_pad_space_undo(s);
+            break;
+        default:
+            break;
+    }
     /* CSI ? Ps h/l（DECTCEM 光标显隐、鼠标模式等私有开关）既不移光标也不动内容，
      * 不能作废「底行末列 CUP」的判定窗口 —— 真机字节里它就夹在那个 CUP 和随后的
      * CRLF 中间（uploads/termux_dump.log 2026-09-17 14:10 那批，pane0 偏移 3878）：
@@ -321,6 +428,7 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
                         break;
                     case 1049:
                         s->saved_cx = s->cursor_x; s->saved_cy = s->cursor_y;
+                        vt_trace("ALT_ON off=%lld", g_vt_off);
                         if (!s->in_alt_screen) {
                             s->in_alt_screen = 1; s->alt_scroll_top = s->scroll_top;
                             s->alt_hist_lines = s->hist_lines;
@@ -338,6 +446,9 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
                     case 2004: s->bracketed_paste = 1; break;
                     case 9001: s->win32_input_mode = 1; break;
                     case 6: s->origin_mode = 1; break;
+                    case 2026:
+                        vt_trace("SYNC_ON off=%lld x=%d y=%d", g_vt_off, s->cursor_x, s->cursor_y);
+                        break;
                 }
             }
         } else if (final == 'l') {
@@ -362,6 +473,7 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
                         break;
                     case 1049:
                         if (s->in_alt_screen) {
+                            vt_trace("ALT_OFF off=%lld", g_vt_off);
                             s->in_alt_screen = 0; s->scroll_top = s->alt_scroll_top;
                             s->hist_lines = s->alt_hist_lines;
                             s->cursor_x = s->saved_cx; s->cursor_y = s->saved_cy;
@@ -377,6 +489,9 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
                     case 2004: s->bracketed_paste = 0; break;
                     case 9001: s->win32_input_mode = 0; break;
                     case 6: s->origin_mode = 0; break;
+                    case 2026:
+                        vt_trace_rows(s, "SYNC_OFF");
+                        break;
                 }
             }
         }
@@ -411,6 +526,9 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
             if (s->cursor_y < 0) s->cursor_y = 0;
             if (s->cursor_x >= s->cols) s->cursor_x = s->cols - 1;
             if (s->cursor_x < 0) s->cursor_x = 0;
+            if (s->wraparound_pending)
+                vt_trace("CUP  off=%lld req=%d,%d -> x=%d y=%d (pending 被清)",
+                         g_vt_off, p1, p2, s->cursor_x, s->cursor_y);
             s->wraparound_pending = 0;
             /* 这里曾经有一整套「ConPTY 窄屏行内续写」的 line_wrap 特殊处理
              * （bug #11 加的置 1 + bug #15 第一层加的 CUP 换行清 0）。
@@ -467,13 +585,34 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
                 int pi = s->pane_index;
                 if (pi >= 0 && pi < MAX_PANES) g_mux.panes[pi].scroll_offset = 0;
             }
+            /* v2.4.2：整屏清（ED 2/3）之后，恢复历史【不再参与实时视图】。
+             * 之前 session_view 一旦置上就永不撤销，`cls` 只清掉了 ConPTY 的可见区，
+             * 而实时视图是「历史 + 可见区」的重排网格 ⇒ 旧内容照旧铺满屏幕，用户
+             * 看到的就是「cls 后光标回位了、内容没清」。清屏是明确的「从现在重新
+             * 开始看」的意图：视图退回普通实时屏（空屏 + 光标），历史仍在回滚缓冲里，
+             * 往上滚就能翻到 —— 与普通终端一致。ED(2) 不动 hist_lines，所以历史没丢。 */
+            if ((p1 == 2 || p1 == 3) && !s->in_alt_screen) {
+                s->session_view = 0;
+                int pi2 = s->pane_index;
+                if (pi2 >= 0 && pi2 < MAX_PANES) {
+                    g_mux.panes[pi2].session_view = 0;
+                    g_mux.panes[pi2].session_cursor_row = -1;
+                }
+            }
+            /* conhost 实测：ED 与 EL/ECH 一样会清掉「延迟换行」标志（120 列写满后
+             * 发 ESC[J 再写字符，字符落在末列而不是折到下一行）。 */
+            s->wraparound_pending = 0;
             break;
         }
         case 'K': {
             WORD attr = build_attr(s);
             int sx = (p1 == 1 || p1 == 2) ? 0 : s->cursor_x;
             int ex = (p1 == 0 || p1 == 2) ? s->cols - 1 : s->cursor_x;
+            if (s->cursor_x >= s->cols - 3 || s->wraparound_pending)
+                vt_trace("EL   off=%lld x=%d y=%d pending=%d p1=%d", g_vt_off,
+                         s->cursor_x, s->cursor_y, s->wraparound_pending, p1);
             screen_erase_range(s, s->cursor_y, sx, ex, attr);
+            s->wraparound_pending = 0;   /* conhost 实测：EL 会清掉延迟换行 */
             break;
         }
         case 'L': screen_scroll_down(s, s->cursor_y, s->scroll_region_bottom, p1 ? p1 : 1); break;
@@ -494,7 +633,11 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
         }
         case 'X': {
             int n = p1 ? p1 : 1; WORD attr = build_attr(s);
+            if (s->cursor_x >= s->cols - 3 || s->wraparound_pending)
+                vt_trace("ECH  off=%lld x=%d y=%d pending=%d n=%d", g_vt_off,
+                         s->cursor_x, s->cursor_y, s->wraparound_pending, n);
             screen_erase_range(s, s->cursor_y, s->cursor_x, s->cursor_x + n - 1, attr);
+            s->wraparound_pending = 0;   /* conhost 实测：ECH 也会清 */
             break;
         }
         case 'S': screen_scroll_up(s, s->scroll_region_top, s->scroll_region_bottom, p1 ? p1 : 1); break;
@@ -578,6 +721,8 @@ static void execute_csi_internal(ScreenBuffer *s, char final, char prefix, const
  * repaint_active + screen_scroll_viewport_up 处理，不需要靠猜裸 LF。 */
 static void screen_lf(ScreenBuffer *s, int real_newline) {
     (void)real_newline;
+    vt_trace("LF   off=%lld x=%d y=%d pending=%d cols=%d rows=%d",
+             g_vt_off, s->cursor_x, s->cursor_y, s->wraparound_pending, s->cols, s->rows);
     /* 形态 (2)：CUP 刚把光标收到【本行末列且本行是屏幕底行】，那么这个 LF 不是
      * 逻辑行结束，而是 conhost 为了继续写这条逻辑行而强制的一次滚动。 */
     int eol_cont = (s->cup_eol_row >= 0 && s->cup_eol_row == s->cursor_y);
@@ -652,6 +797,9 @@ static void screen_process_byte(ScreenBuffer *s, unsigned char c) {
                 /* CR 不打断（它与随后的 LF 是一对）；LF/VT/FF 由 screen_lf 消费；
                  * 其余 C0 一律作废「底行末列 CUP」的判定窗口。 */
                 if (c != 0x0A && c != 0x0B && c != 0x0C && c != 0x0D) s->cup_eol_row = -1;
+                /* 光标移动/换行类 C0：右缘那个可疑空格到此确认为排版填充。BEL 不动光标，
+                 * 不作结论（真实内容里空格后面跟一声提示音是可能的）。 */
+                if (c != 0x07 && c != 0x0E && c != 0x0F) vt_pad_space_undo(s);
                 switch (c) {
                     case 0x07: break;
                     case 0x08: if (s->cursor_x > 0) s->cursor_x--; s->wraparound_pending = 0; break;
@@ -931,6 +1079,7 @@ static void gfx_tap(ScreenBuffer *s, unsigned char c) {
 void screen_process_output(ScreenBuffer *s, const char *data, int len) {
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)data[i];
+        g_vt_off++;
 
         gfx_tap(s, c);        /* v2.3.6：图形协议直通的小判定（与状态机并行，互不影响） */
 

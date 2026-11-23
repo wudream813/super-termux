@@ -44,6 +44,10 @@ CHECKS = (
     "verify_resize_history.py",
     "verify_scrollbar.py",
     "verify_search_refresh.py",
+    "verify_gfx_paint.py",
+    "verify_anim_frame.py",
+    "verify_session_restore.py",
+    "verify_scroll_continuity.py",
 )
 
 

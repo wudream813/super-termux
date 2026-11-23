@@ -1,5 +1,6 @@
 #include "screen.h"
 #include "config.h"
+#include "vt.h"
 #include <stdlib.h>
 
 /* ---- resize 诊断 trace（TERMUX_DUMP=1 时启用，另见 main.c 的 dump 开关）----
@@ -420,6 +421,65 @@ void screen_scroll_up(ScreenBuffer *s, int top, int bottom, int count) {
             }
         }
     }
+}
+
+/* v2.3.9：把一段 ANSI 文本作为【历史】插到可见区之前 —— 可见区一行不动、光标不动。
+ *
+ * 为什么要这么绕：ConPTY 的 cursor 是**绝对行**，shell 之后既可能只发一个字符（回声），
+ * 也可能发 `ESC[r;cH` 重新定位。恢复出来的历史一旦写进可见区（v2.3.4 的做法），模型里
+ * 那些行就不再是 shell 自己的内容：用户一敲键，回声落在块尾、shell 的 `ESC[7;1H` 又把
+ * 提示符打在块中间 —— 屏幕上出现「提示符插进历史里」的乱码。历史只该出现在可见区之上，
+ * 往上滚时才看得到，这样行号永远和 conhost 对得上。
+ *
+ * 做法：用一块临时屏把文本喂真解析器（颜色、宽字、换行都照常算），再把它的行搬进 ring
+ * 里可见区之前的位置。放不下就丢块里【最老】的那几行。返回搬进去的行数。 */
+int screen_prepend_history_text(ScreenBuffer *s, const char *data, int len) {
+    if (!s || !data || len <= 0 || !s->lines || s->cols <= 0) return 0;
+    int cols = s->cols;
+    int est = 2;
+    for (int i = 0; i < len; i++) if (data[i] == '\n') est++;   /* 显式行数 */
+    est += len / cols + 2;                                      /* 再加可能的自动折行 */
+    if (est < 4) est = 4;
+    if (est > 600) est = 600;
+    ScreenBuffer t;
+    if (!screen_init(&t, cols, est)) return 0;
+    screen_process_output(&t, data, len);
+    /* 块尾通常跟着一个换行：最后一行空行不算内容，从光标行往上找真正写过的行 */
+    int last = -1;
+    for (int r = t.cursor_y; r >= 0 && r < t.rows; r--) {
+        int pr = screen_phys_row(&t, r);
+        if (pr >= 0 && pr < t.total_lines && t.lines[pr].cells && t.lines[pr].used > 0) { last = r; break; }
+    }
+    if (last < 0) { screen_free(&t); return 0; }
+    int nlines = last + 1;
+    int cap = s->total_lines - s->rows;          /* ring 里除可见区之外能放的历史行数 */
+    if (cap < 1) { screen_free(&t); return 0; }
+    int skip = 0;
+    if (s->hist_lines + nlines > cap) {
+        skip = s->hist_lines + nlines - cap;
+        if (skip >= nlines) { screen_free(&t); return 0; }
+    }
+    int keep = nlines - skip;
+    int added = 0;
+    for (int k = 0; k < keep; k++) {
+        int src_row = skip + k;
+        /* 现有历史是【本次会话】的（比上一轮新），所以块接在它们更老的那一头 */
+        int rel = -(s->hist_lines + keep - k);
+        int pr = screen_phys_row(s, rel);
+        if (pr < 0 || pr >= s->total_lines) continue;
+        if (!screen_ensure_line(s, pr)) continue;
+        line_fill_blank(&s->lines[pr], cols, s ? s->current_attr : 0);
+        int sp = screen_phys_row(&t, src_row);
+        if (sp >= 0 && sp < t.total_lines && t.lines[sp].cells)
+            line_copy(&s->lines[pr], &t.lines[sp], cols);
+        if (s->line_wrap) s->line_wrap[pr] = 0;   /* 历史行不是续行 */
+        added++;
+    }
+    s->hist_lines += added;
+    s->session_view = added > 0;        /* live 屏 + 恢复行需统一底部锚定 reflow */
+    if (s->hist_lines > cap) s->hist_lines = cap;
+    screen_free(&t);
+    return added;
 }
 
 void screen_scroll_viewport_up(ScreenBuffer *s, int count) {
@@ -968,6 +1028,25 @@ static int reflow_rows_for(const RGlyph *g, int n, int w) {
     return rows;
 }
 
+/* 一条逻辑行的前 n 个 glyph 按宽度 w 折行后，光标落在【最后一条显示行】的第几列
+ * （0 基）。折行判据与 reflow_rows_for / reflow_append_rows 完全一致。
+ * v2.3.7：resize 只重算 cursor_y、把 cursor_x 夹到 nc-1 是不够的 —— 光标在一条
+ * 软换行长逻辑行中间时，新列号由「光标之前 glyph 的显示宽度 mod 新宽」决定，
+ * 夹取会让光标画在行尾（拖窄窗格时每帧都闪到右边）。 */
+static int reflow_col_for(const RGlyph *g, int n, int w) {
+    if (w < 1) w = 1;
+    int col = 0;
+    for (int k = 0; k < n; ) {
+        WCHAR ch = g[k].ci.Char.UnicodeChar;
+        int gw = reflow_glyph_w(ch);
+        int adv = (gw == 2 && k + 1 < n) ? 2 : 1;
+        if (gw > 0 && col > 0 && col + gw > w) col = 0;
+        if (gw > 0) col += gw;
+        k += adv;
+    }
+    return col;
+}
+
 /* cb 上下文：把每条显示行追加到动态数组（行主序，每行 width 列）。 */
 typedef struct {
     RGlyph *buf;
@@ -1112,13 +1191,24 @@ int screen_reflow_height(ScreenBuffer *s, int width) {
 }
 
 int screen_scroll_limit(ScreenBuffer *s) {
-    if (!s) return 0;
+    if (!s || s->in_alt_screen) return 0;
     int h = screen_reflow_height(s, s->cols);
     int lim = h - s->rows;
+    if (s->session_view) {
+        /* 恢复视图的实时区也在 reflow 网格里（旧历史 + banner/prompt 合成并底部锚定），
+         * vo 必须用该网格的显示行单位；hist_lines 是物理行数，直接拿它当上限会滚过头。 */
+        return lim > 0 ? lim : 0;
+    }
+    /* 普通实时视图与普通回看都按物理行定位：top 是最老的有内容行，滚到顶时它贴着
+     * 视口第一行。窄窗回看另会转 reflow 网格，取两种口径较大的上限。 */
+    int top = 0, bot = 0;
+    if (!screen_content_span(s, &top, &bot)) return 0;
+    if (-top > lim) lim = -top;
     return lim > 0 ? lim : 0;
 }
 
-int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out) {
+int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out,
+                       int *cursor_row) {
     if (!s || !s->line_wrap || s->in_alt_screen || rows <= 0 || width <= 0 || !out) return 0;
     if (vo < 0) vo = 0;
     /* vo 自限：滚过内容末尾就不该再出现顶部空白（v1.8.52）。 */
@@ -1152,23 +1242,46 @@ int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out
      * 后更老内容无槽位，停止扫描。 */
     int cur = total - 1;
     int stop = 0;
+    /* v2.4.1：内容不足视口时贴顶（普通终端语义），并记住 shell 光标落在哪一行。
+     * cursor_idx 是 grid 下标；-1 = 这趟扫描没覆盖到光标所在行（光标在内容末行
+     * 下方的一串空行里，那些空行按本函数的口径不落位）。 */
+    int cursor_idx = -1;
+    int cursor_pending = 0;
+    int cursor_unkept = 0;      /* 光标所在逻辑行是空行、按口径不落位 */
+    int cursor_below = 0;       /* 看到光标行那一刻已经写下的「更新」显示行数 */
+    int filled = 0;             /* 已写下的显示行总数（含夹在内容之间的空行） */
+    int saw_text = 0;           /* 扫描（从新到老）已经遇到过正文行 */
 
     /* 处理当前累积的逻辑行（logrow 为【老→新】）：正向折行到 acc，再把显示行
      * 从最新到最老写入 grid[cur]、grid[cur-1]…。
      * 空逻辑行（logn==0，纯空白行）分两种：夹在两条内容之间的真实空行占 1 个显示行
      * （keep_blank=1，回看历史时空行可见、与实时屏幕一致，不丢「换行」）；首条内容
-     * 之上 / 末条内容之下的空白（命令行下方未用可见区等）不落位，历史内容才底部锚定、
-     * 随 vo 上移到最顶也不垫空白。区间边界见 screen_content_span。 */
+     * 之上 / 末条内容之下的空白（命令行下方未用可见区等）不落位 —— 「末条内容之下」
+     * 由 v2.4.1 的 saw_text 判定：扫描从最新往回走，还没遇到正文时看到的空行一定是
+     * 内容下方的尾巴空白，不能占位（否则它们会把内容顶出 grid、贴顶反而看不出内容）。
+     * 区间边界仍见 screen_content_span（内容之间的空行靠它区分）。 */
     #define RF_FLUSH_LOGROW() do {                                             \
-        if (logn != 0 || keep_blank) {                                         \
+        int _text = (logn != 0);                                               \
+        if (_text || (keep_blank && saw_text)) {                               \
             acc.count = 0;                                                     \
             reflow_append_rows(logrow, logn, width, reflow_acc_cb, &acc);      \
+            int _first = cur;                                                 \
             for (int _i = acc.count - 1; _i >= 0 && !stop; _i--) {            \
                 if (cur < 0) { stop = 1; break; }                             \
                 for (int x = 0; x < width; x++)                               \
                     grid[cur * width + x] = acc.buf[_i * width + x];           \
                 cur--;                                                         \
+                filled++;                                                      \
             }                                                                  \
+            if (_text) saw_text = 1;                                           \
+            if (cursor_pending) {                                              \
+                if (filled > cursor_below) cursor_idx = _first;                \
+                else cursor_unkept = 1;                                        \
+                cursor_pending = 0;                                            \
+            }                                                                  \
+        } else if (cursor_pending) {                                           \
+            cursor_unkept = 1;   /* 光标行是不落位的尾巴空行 */                \
+            cursor_pending = 0;                                                \
         }                                                                      \
         logn = 0;                                                              \
     } while (0)
@@ -1185,6 +1298,8 @@ int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out
          * 分组：wrap0 处结束上一条逻辑行；落位时由 keep_blank 决定是否显示。 */
         int len = screen_row_reflow_len(s, rel);
         int wrap = (s->line_wrap && s->line_wrap[pr]) ? 1 : 0;
+        if (rel == s->cursor_y) { cursor_pending = 1; cursor_below = filled; }
+                                                      /* 这条逻辑行就是光标所在行 */
 
         /* 段前插：本行段（扫描上更老）插到 logrow 开头，保持 logrow 老→新。 */
         if (logn + len > logcap) {
@@ -1212,13 +1327,12 @@ int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out
             RF_FLUSH_LOGROW();
         }
     }
-    /* 环顶最老一段：扫描到 -hist_lines 仍未遇到 wrap0（续行丢头）时整条在此收尾；
-     * 空行同样只有落在内容区间内才保留。 */
+    /* 环顶最老一段：扫描到 -hist_lines 仍未遇到 wrap0（续行丢头）时整条在此收尾。
+     * v2.4.1：原来是 `else if (logn == 0 && …)` 再补一行「环顶空行」，可那种空行若
+     * wrap==0，循环里最后那次 RF_FLUSH_LOGROW 已经把它落位了 —— 再补一次会在内容
+     * 上方多出一行空白（底部锚定时看不出来，贴顶后就把内容整体压下一行）。 */
     if (!stop && logn > 0) {
         keep_blank = 0;
-        RF_FLUSH_LOGROW();
-    } else if (!stop && logn == 0 && have && -s->hist_lines >= top && -s->hist_lines <= bot) {
-        keep_blank = 1;
         RF_FLUSH_LOGROW();
     }
     #undef RF_FLUSH_LOGROW
@@ -1226,15 +1340,34 @@ int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out
     free(logrow);
     free(acc.buf);
 
-    /* grid 底部锚定：grid[total-1] 是最新显示行，越老越靠上。向上回看 vo 行 = 跳过
-     * 最新 vo 个显示行，视口底 = grid[total-1-vo]，顶 = 再上 rows-1 行。 */
-    int bottom_idx = total - 1 - vo;
+    /* 视口取号：
+     *  - 内容放满（content_rows >= rows）：底部锚定 —— grid[total-1] 是最新显示行，
+     *    越老越靠上；向上回看 vo 行 = 跳过最新 vo 个显示行，视口 = grid[0..rows-1]。
+     *  - 内容不足一屏（content_rows < rows）：贴顶 —— v2.4.0 曾一律底部锚定，于是恢复
+     *    的历史与提示符被压在屏底、上面一片空白；用户要的是「像正常终端一样在最上面」。
+     *    尾巴空白（光标下方那串空行）不算内容，只影响视口里多显示几行空白。
+     * 光标行同源算出：cursor_idx 是 grid 下标，减去视口首行下标即可；光标落在不落位的
+     * 空行上时，落在「已渲染的最后一行之下」。cursor_row 为 NULL 时跳过（分屏路径不在
+     * 这里定位宿主光标）。 */
+    int content_rows = filled;
+    int pad = rows - content_rows;
+    int gi0 = (pad > 0) ? (total - filled) : 0;
+    if (gi0 < 0) gi0 = 0;
+    int cur_row = -1;
+    if (cursor_pending && !stop) cursor_unkept = 1;   /* 扫到环顶也没轮到它的落位 */
+    if (cursor_idx >= 0) cur_row = cursor_idx - gi0;
+    else if (cursor_unkept) cur_row = filled - cursor_below;
+    else if (stop) cur_row = rows - 1;                /* 视口被填满，光标在屏幕外 → 贴底 */
+    else if (content_rows > 0) cur_row = content_rows - 1;
+    if (cur_row < 0 || cur_row >= rows) cur_row = (pad > 0) ? (content_rows - 1) : (rows - 1);
+    if (cur_row < 0) cur_row = 0;
     for (int y = 0; y < rows; y++) {
-        int gi = bottom_idx - (rows - 1 - y);
+        int gi = gi0 + y;
         for (int x = 0; x < width; x++) {
             if (gi >= 0 && gi < total) out[y * width + x] = grid[gi * width + x];
         }
     }
+    if (cursor_row) *cursor_row = cur_row;
 
     free(grid);
     return 1;
@@ -1614,7 +1747,7 @@ static int screen_resize_reflow(ScreenBuffer *s, int nc, int nr) {
      * （cursor_rows）与「光标在自己那条逻辑行内的显示行偏移」（cursor_intra）。
      * 不重算的话 resize 后光标停在旧行号上（内容已按新宽度整体移位），下一条
      * 输出就会写进已有内容行、把它覆盖掉（放大窗格后最明显）。 */
-    int cursor_rows = -1, cursor_intra = 0;
+    int cursor_rows = -1, cursor_intra = 0, cursor_col = -1;
     for (int rel = -old_hist; rel < scan_end && !oom; rel++) {
         int pr = screen_phys_row(s, rel);
         if (pr < 0 || pr >= s->total_lines || !s->lines || !s->lines[pr].cells) continue;
@@ -1640,12 +1773,13 @@ static int screen_resize_reflow(ScreenBuffer *s, int nc, int nr) {
             line_open = 1;             /* 历史最老一段即续行（被淘汰丢头）的兜底 */
         }
         /* 此处 ring.count = 光标所在逻辑行【之前】的显示行数（上一条逻辑行刚折完
-         * 落位），log[0..logn-1] = 光标所在逻辑行在本物理行之前已累积的 glyph。 */
-        if (cursor_rows < 0 && rel == s->cursor_y) {
-            int upto = logn + (s->cursor_x < len ? s->cursor_x : len);
-            cursor_rows = ring.count;
-            cursor_intra = (log && upto > 0) ? reflow_rows_for(log, upto, nc) - 1 : 0;
-        }
+         * 落位），log[0..logn-1] = 光标所在逻辑行在本物理行之前已累积的 glyph。
+         *
+         * v2.3.7：光标那一行的 glyph 必须【先并进 log】再算行/列。旧实现先算后并，
+         * upto = logn + cursor_x 会读到 log 里还没写过的尾巴（realloc 未清零）：
+         * 软换行长行上 resize 后 cursor_y 会按「随机的每-glyph 宽度」算错（实测
+         * 70 列内容从 40 宽变 30 宽后落在第 1 行而不是第 2 行），cursor_x 同样错。 */
+        int logn_before = logn;
         if (len > 0) {
             if (logn + len > logcap) {
                 while (logn + len > logcap) logcap = logcap ? logcap * 2 : 512;
@@ -1661,6 +1795,15 @@ static int screen_resize_reflow(ScreenBuffer *s, int nc, int nr) {
                 g.v = ln->rgb_valid ? ln->rgb_valid[x] : 0;
                 log[logn++] = g;
             }
+        }
+        if (cursor_rows < 0 && rel == s->cursor_y) {
+            int upto = logn_before + (s->cursor_x < len ? s->cursor_x : len);
+            if (upto > logn) upto = logn;
+            cursor_rows = ring.count;
+            cursor_intra = (log && upto > 0) ? reflow_rows_for(log, upto, nc) - 1 : 0;
+            /* v2.3.7：同一条逻辑行里的【新列号】。cursor_x 是旧网格里的格下标，
+             * 折行后要换成「前缀 glyph 的显示宽度在新宽下的余数」。 */
+            cursor_col = (log && upto > 0) ? reflow_col_for(log, upto, nc) : 0;
         }
     }
     if (!oom && line_open) {
@@ -1756,10 +1899,14 @@ static int screen_resize_reflow(ScreenBuffer *s, int nc, int nr) {
      * 这里复位环头不影响用户的回看位置。 */
     s->scroll_top = 0;
     if (s->alt_hist_lines > nt - nr) s->alt_hist_lines = nt - nr;
-    if (s->cursor_x >= nc) s->cursor_x = nc - 1;
+    /* v2.3.7：列号按新宽重算；只有没扫到光标行（cursor_col<0，例如光标在扫描区间
+     * 之外）时才退回旧行为「夹到 nc-1」。 */
+    if (cursor_col >= 0) s->cursor_x = cursor_col >= nc ? nc - 1 : cursor_col;
+    else if (s->cursor_x >= nc) s->cursor_x = nc - 1;
     if (s->cursor_y >= nr) s->cursor_y = nr - 1;
     s->scroll_region_top = 0; s->scroll_region_bottom = nr - 1;
     s->wraparound_pending = 0;
+    s->pad_pend = 0;      /* 列宽变了，旧坐标上那个「疑似填充空格」不再有意义 */
     memset(s->tab_stops, 0, sizeof(s->tab_stops));
     for (int i = 0; i < nc && i < 512; i += 8) s->tab_stops[i] = 1;
     return 1;
@@ -1946,6 +2093,7 @@ static int screen_resize_legacy(ScreenBuffer *s, int nc, int nr) {
     if (s->cursor_y >= nr) s->cursor_y = nr - 1;
     s->scroll_region_top = 0; s->scroll_region_bottom = nr - 1;
     s->wraparound_pending = 0;
+    s->pad_pend = 0;      /* 列宽变了，旧坐标上那个「疑似填充空格」不再有意义 */
     memset(s->tab_stops, 0, sizeof(s->tab_stops));
     for (int i = 0; i < nc && i < 512; i += 8) s->tab_stops[i] = 1;
     return 1;

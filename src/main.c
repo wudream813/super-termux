@@ -16,6 +16,10 @@
 
 
 void host_write(const char *s, int len) {
+    /* v2.3.8 诊断：TERMUX_HOSTTRACE=1 时把每一次写给控制台的字节都落进
+     * hostwrite.log（含窗口标题 OSC 与图形直通 —— 这两处不在 render_dump 里）。 */
+    static int host_seq = 0;
+    dump_host_write(++host_seq, s, len);
     while (len > 0) {
         DWORD written = 0;
         DWORD chunk = (DWORD)len;

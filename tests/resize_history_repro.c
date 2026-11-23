@@ -739,6 +739,49 @@ int main(void) {
         screen_free(&t);
     }
 
+    /* ---- 组 13：resize 后 cursor_x / cursor_y 都必须按新宽重算（v2.3.7）----
+     * 旧实现只把 cursor_x 夹到 nc-1，而且算 cursor_y 时读的是 log 里【还没并进来的
+     * 尾巴】（软换行长行的续行上，realloc 未清零的字节被当成 glyph）。结果：40 列
+     * 下打完 70 个字符再缩到 30 列，光标落在 (行1, 列29) 而不是 (行2★, 列10)。
+     * ★行号按本文件的 0 基 rel 计。 */
+    {
+        ScreenBuffer s;
+        memset(&s, 0, sizeof s);
+        screen_init(&s, 40, 10);
+        char line[128];
+        memset(line, 'a', 70); line[70] = 0;
+        feed(&s, line);
+        int oldx = s.cursor_x, oldy = s.cursor_y;
+        screen_resize(&s, 30, 10);
+        char det[256];
+        snprintf(det, sizeof det,
+                 "resize 前=(x=%d,y=%d) 后=(x=%d,y=%d)，期望 (x=10,y=2)",
+                 oldx, oldy, s.cursor_x, s.cursor_y);
+        ck("resize 后 cursor_y 跟着软换行重排走（不是按垃圾 glyph 算）",
+           s.cursor_y == 2, det);
+        ck("resize 后 cursor_x 按新宽重算（不是夹到行尾）", s.cursor_x == 10, det);
+        screen_free(&s);
+    }
+
+    /* ---- 组 14：宽字符参与时同样按【显示宽度】算新列号 ---- */
+    {
+        ScreenBuffer s;
+        memset(&s, 0, sizeof s);
+        screen_init(&s, 20, 6);
+        /* 19 个 a + 一个汉字（占 2 列）= 21 列：汉字从第 20 列起放不下，整体换行 */
+        char pre[64];
+        memset(pre, 'a', 19); pre[19] = 0;
+        feed(&s, pre);
+        feed(&s, "\xe4\xb8\xad");
+        screen_resize(&s, 10, 6);
+        char det[256];
+        snprintf(det, sizeof det, "宽字符 resize 后=(x=%d,y=%d)，期望 (x=2,y=2)",
+                 s.cursor_x, s.cursor_y);
+        ck("宽字符 resize 后光标列按显示宽度（2 列）重算",
+           s.cursor_x == 2 && s.cursor_y == 2, det);
+        screen_free(&s);
+    }
+
     printf("\n%s\n", g_fail ? "RESIZE-HISTORY REPRO: FAILURE(S)" : "RESIZE-HISTORY REPRO: ALL PASS");
     return g_fail ? 1 : 0;
 }

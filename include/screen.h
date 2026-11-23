@@ -25,6 +25,8 @@ CHAR_INFO *screen_cell(ScreenBuffer *s, int row, int col);
 void screen_write_cell(ScreenBuffer *s, int row, int col, WCHAR ch, WORD attr);
 void screen_erase_range(ScreenBuffer *s, int row, int sx, int ex, WORD attr);
 void screen_scroll_up(ScreenBuffer *s, int top, int bottom, int count);
+/* v2.3.9：把一段 ANSI 文本当【历史】插到可见区之前（可见区与光标都不动）。返回行数。 */
+int screen_prepend_history_text(ScreenBuffer *s, const char *data, int len);
 /* ConPTY viewport repaint 用：移动可见行但绝不写入/删除 scrollback。 */
 void screen_scroll_viewport_up(ScreenBuffer *s, int count);
 void screen_repaint_snapshot(ScreenBuffer *s);      /* 整屏重绘前存一份可见行 */
@@ -50,8 +52,12 @@ typedef struct {
 
 /* 生成滚动历史的 reflow 视图：把物理行按软换行标志合并成逻辑行、按 width 重新
  * 折行，返回向上回看 vo 个显示行时、视口 rows×width 的内容到 out（行主序）。
+ * 内容不足视口时【贴顶】（与普通终端一致），放满时底部锚定（最新内容贴底）。
+ * cursor_row（可空）返回 shell 光标在视口里的行号（0 基，-1 = 视口里没有）；
+ * 调用方据此定位宿主光标 —— 会话视图下内容可能只有半屏，不能再一律认为光标在底行。
  * 返回有效行数；alt 屏/无 wrap 标志时返回 0（调用方回退到物理行直取）。 */
-int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out);
+int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out,
+                       int *cursor_row);
 /* 本地 reflow resize 后 ConPTY 会整屏重绘（重绘顶行按其自身滚动缓冲对齐）。若重绘的
  * 所有非空行与本地环从 rel=k(k>=1) 起逐行一致，把环前滚 k 行使 ConPTY 视口与本地对齐
  * （内容不变、历史行数增长），避免重绘覆盖吞行。命中并调整返回 1，否则 0/2。 */

@@ -396,4 +396,9 @@ int  settings_bars_mouse(int mx, int my, int press, int move);
 
 void render_cleanup(void);
 
+/* v2.3.7：窗格读线程用 —— 这块窗格刚来的输出值不值得点一次重绘。
+ * 活动窗格恒为 1；非活动窗格看上一帧有没有被画到宿主上（分屏里的其它可见窗格
+ * 为 1，别的标签页 / 被 zoom 盖住的为 0）。必须在持 g_mux.cs 时调用。 */
+int render_pane_should_wake(int pane);
+
 #endif // WIN_TERMUX_RENDER_H

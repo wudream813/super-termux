@@ -72,6 +72,20 @@ static void test_theme_remap(void) {
     theme_remap(buf, (int)strlen(buf));
     check(strstr(buf, "217;119;054") == NULL, "带 ;1 后缀的序列同样被替换");
 
+    /* v2.3.7：正文里恰好打印了同样形态的字面量（没有 ESC[）不得被改 ——
+     * 旧实现全帧扫 "038;2;"，`cat` 本仓库源码时这 11 个可见字符会被换掉。 */
+    snprintf(buf, sizeof(buf), "text 048;2;033;038;045m tail");
+    theme_remap(buf, (int)strlen(buf));
+    check(strstr(buf, "048;2;033;038;045m") != NULL, "正文里的 SGR 字面量原样保留");
+    snprintf(buf, sizeof(buf), "text 038;2;255;255;255m tail");
+    theme_remap(buf, (int)strlen(buf));
+    check(strstr(buf, "038;2;255;255;255m") != NULL, "正文里的前景色字面量原样保留");
+
+    /* "0;" 开头的 CSI（设置页有几行这么写）里的颜色仍要被替换 */
+    snprintf(buf, sizeof(buf), "\x1b[0;048;2;033;038;045mX");
+    theme_remap(buf, (int)strlen(buf));
+    check(strstr(buf, "048;2;033;038;045m") == NULL, "0; 开头的 CSI 里的颜色也被替换");
+
     theme_init();
 }
 

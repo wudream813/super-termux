@@ -312,10 +312,55 @@ python3 verify_cursor_render.py    # 终端输出区域最后一格光标回归
 python3 verify_menu_settings.py    # 菜单项设置排序/搜索禁用/删除/模态输入回归
 python3 verify_palette_interaction.py # 命令面板焦点/9 项编号/Esc 快照/颜色单元格回归
 python3 verify_config_theme.py     # 配置体系：主题参考色板完整性 + keymap/theme C 单元测试
+python3 tests/win_console_smoke.py # Windows：真控制台读屏/敲键（图片光标 / 分屏后台刷新 / UI）
 ```
+
+## 行边界诊断（`TERMUX_VTTRACE`）
+
+VT 解析里的「行边界记账」出错时会表现为**整屏内容错位一两行**（帧日志只能看到结果，看不到模型在哪一列决定换行）。设 `TERMUX_VTTRACE=1` 后，`src/vt.c` 会把下面这些事件逐条写进 `vttrace.log`（带已处理字节数，可与 `termux_dump.log` 的偏移对齐）：
+
+| 行 | 含义 |
+|---|---|
+| `WRAP off=… x=… y=… cp=U+…` | 自动折行：在哪个字节、哪一列、被哪个码点触发 |
+| `LF off=… x=… pending=…` | 显式换行（含 CRLF / 裸 LF） |
+| `EL` / `ECH` / `CUP` | 右缘附近（`x >= cols-3`）或带延迟换行的擦除/定位 |
+| `PADUNDO off=… x=… y=…` | 右缘那个「疑似填充空格」被撤回（见下面第 10 条） |
+| `ALT_ON` / `ALT_OFF` | 进出备用屏 |
+| `SYNC_ON` | 应用开始一次同步更新（`ESC[?2026h`） |
+| `SYNC_OFF off=… cursor=(x,y) widths=…` | 同步更新结束：模型里每一行「最后一个非空格列」的指纹 |
+
+`SYNC_OFF` 的 `widths` 和 conhost 的实际屏幕对照，就能定位「哪一次更新之后行边界开始偏」。默认不设这个变量时零开销。
+
+`TERMUX_HOSTTRACE=1` 另开一份 `hostwrite.log`：把**每一次**真正写给宿主控制台的字节按顺序记下来（`\e` 转义成字面量便于肉眼读）。它补的正是 `render_dump.log` 看不到的两处 —— 窗口标题那段 `ESC]0;…BEL`（`update_host_title`）与图形直通（`gfx_emit_outbox`）。排查「屏幕上闪出 ANSI 代码」这类问题时，先看这份日志里有没有一条**不完整**的序列（`[w … len …]` 行的末尾断在参数中间），或者两条写之间有没有交错。
 
 
 ## 版本历史
+
+**未发布（v2.4.0 候选）** —— 两处 v2.3.6 引入/暴露的渲染缺陷，都是在真 Windows 控制台上量出来的。
+
+| # | 内容 |
+|---|---|
+| 1 | 图形直通把宿主光标挪走：帧尾的光标段（CUP + `?25h/l`）原来在 `gfx_emit_outbox()` **之前**发，而每条图形序列自带绝对 CUP、发完不归位 ⇒ 有图片的帧结束后光标停在图片锚点（真机：`cursor=(行9,列0)`，应为 `(行10,列54)`）。现在图片之后把光标段再补发一次（`src/render.c`）。 |
+| 2 | 分屏里非活动窗格不刷新：读线程只在 `idx == active_pane` 时点 `needs_redraw` ⇒ 后台窗格（另一边在跑编译）的输出要等你敲键/动鼠标才出现。现在渲染每帧记 `Pane.visible_now`，`render_pane_should_wake()` 对「上一帧确实画在宿主上」的非活动窗格也点重绘；zoom 盖住的、别的标签页的仍然是 0，不白耗 CPU（`src/pane.c` / `src/render.c`）。 |
+| 3 | 判据：新增 `verify_gfx_paint.py` + `tests/gfx_paint_harness.c`（真 `render.c` + Win32 替身，17 条断言，变异都被抓住），已挂进 `verify_all.py` 与 `crosscheck-win-harness`；`verify_wide_wrap.py` 里写死的 `/tmp/wrap_chk` 改回 `TemporaryDirectory` 给的目录（Windows 上它原来直接 `PermissionError`）。真机 A/B（同一台机、同一份控制台探针）对两条修复都做了反向对照：不带修复的二进制分别得到「光标留在图片锚点」与「4.5 秒内后台输出一条都不增」。 |
+| 4 | 新增 `tests/win_console_smoke.py`（挂进 CI 的 windows 作业）：给 termux 一个自己的**真控制台**（`CreateProcess(CREATE_NO_WINDOW)` + `AttachConsole` + `ReadConsoleOutputW`/`WriteConsoleInputW`），绕开「嵌套 ConPTY 在没有交互控制台的 runner 上把子 shell 绑到宿主控制台」那个环境问题。硬断言：图片之后光标归位（先查 `termux_dump.log` 确认图片真到了，不然平凡通过）、分屏后台刷新、帮助/搜索/命令面板/设置页。 |
+| 5 | 分屏/zoom 下 emoji 的右半格被空格擦掉：模型里 emoji 是高低代理两格，分屏逐格渲染轮到低代理那格时走「代理 → 空格」兜底，正好盖在 emoji 的第二列上。现在低代理一律跳过（与 BMP 宽字符次格同口径），判据在 `verify_gfx_paint.py`。 |
+| 6 | 换主题后**正文里的 SGR 字面量被改写**：`theme_remap()` 原来全帧线性扫 `038;2;…`，`cat` 本仓库源码（里面有这种字面量）就会把 11 个可见字符改成别的数字。现在只在 `ESC [ … m` 这条 SGR 内部匹配，正文不动；判据加进 `make unittest`。 |
+| 7 | 单窗格**没有可回看的行时右列仍被画成滚动条**（分屏路径一直有 `hist>0` 门槛，整屏路径漏了）：鼠标靠近右缘时整列变成滑块、盖住每行最后一个字符，而且因为跨度 0 又拖不动。现在整屏路径也要求有历史。 |
+| 8 | resize 后**光标行列**：旧实现先算后并，`cursor_y` 会把 `log` 里还没写入的尾巴当 glyph 读（realloc 未清零）—— 70 列内容从 40 宽拖到 30 宽，光标落在第 1 行而不是第 2 行；`cursor_x` 只做 `>= nc` 夹取，于是总画在行尾。现在先并后算，并按显示宽度重算列号（宽字符算 2 列）；判据在 `verify_resize_history.py` 组 13/14。 |
+| 9 | **mdt 滚动时状态行/右缘滚动条错位**（用户报）：写满 120 列后光标处于「延迟换行」态，conhost 的**擦除类**序列（`EL`/`ED`/`ECH`）会把它清掉（下一条字符写回末列），`SGR`/私有模式/BEL 不会（逐条实测）。我们原来一律不清 ⇒ 下一条字符多折一行，整屏内容逐次错开，mdt 的状态行就被拆成两行、右缘出现两条 `│`。现在 `EL`/`ED`/`ECH` 清 `wraparound_pending`；判据在 `verify_wide_wrap.py`（满行 + 各控制序列 + `B` 的落点）。诊断开关见下面「行边界诊断」。 |
+| 10 | 同一条 mdt 现象修完后**仍能复现**，继续查出来是**右缘填充空格规则误伤真实内容**：`screen_put_cp` 原来在「左邻是宽字次格 + 光标贴着右缘」时把紧跟着的空格一律丢弃（那是 ConPTY 的排版填充）。可 mdt 的界面正好把「，」摆在 116-117 列、**真空格**在 118 列、再往后是 `SGR` + 边框字符 ⇒ 每行被挤短一列，右缘边框落到 118 列、下一行开头被并进上一行末尾，逐行累积成用户看到的错位（`TERMUX_VTTRACE` 实测一次会话 22 处 `PADUNDO`）。现在改成**延迟定性**：先按普通空格写，下一个事件再判 —— 可打印字符（中间可夹 `SGR`/模式序列）= 内容，保留；换行/光标移动/擦除 = 排版填充，撤回（`screen_erase_range` 擦到行尾会把 `used` 收回去，等价于从未写入）。判据在 `verify_wide_wrap.py` 组 A/B/C/D/E：A 钉住内容空格必须保留（去掉延迟判定立刻红），B/C/D 钉住填充空格必须撤回（去掉撤回立刻红），E 是行中空格的对照。 |
+| 11 | 交叉验证手段：本仓库自己的 VT 模型 vs 一份**独立**的参考模拟器（按 conhost 实测语义写的 120×29 回放）。拿用户的 `termux_dump.log` 逐块重放、在每个 `ESC[?2026l` 处比对每行「最后非空格列」：修前 29 个同步点里 20 个不一致，修后只剩 2 个（都是取样时机造成的假差异：mdt 进场前那一帧、以及最后一块里 `?1049l` 之后的画面）。 |
+| 12 | **新建一个跑不存在命令的 pane 时，屏幕上闪一下 ANSI 代码**（用户报，形如 `[4;1H`）：`anim` 开着时，切标签的滑入动画会把整帧重写一遍（`anim_slide_fill`）。重写光标段那半段时，行定位 `ESC[r;cH` 被换成了新列号，但循环只 `continue` 没有跳过原序列 ⇒ 原序列剩下的 `[r;cH` 被当正文又抄了一遍，宿主照原样打出来；下一帧重绘再把它盖掉，于是「闪一下就没」。正文段那条路径写的是 `i += L`，所以只有光标段中招 —— 这也解释了为什么只有光标列不为 1（提示符后面）时才出现。修法：替换后 `j += step - 1` 再 `continue`（`src/render.c`）。判据：新增 `verify_anim_frame.py` —— 从 `render.c` 里抽出真实的动画重写四段源码，喂真机形状的整帧（也支持 `--frame <render_dump 里的一帧>`）覆盖 `d = -cols..cols`，断言重写后的帧是合法 VT 流（没有「没有 ESC 的 `[r;cH`」）；变异（去掉那句 `j += step - 1`）立即红。`anim = off` 可绕开，但那是症状不是原因。 |
+| 13 | **会话恢复「每次历史都没有内容」**（用户报）：两处叠在一起。①**落地时机**：挂起块原来挂在「窗格第一帧输出」之后，而 ConPTY 起 shell 时先单独来一小块纯模式序列（`ESC[?9001hESC[?1004h`）—— 快照就落在那之后，紧跟着的 `ESC[?25l ESC[2J ESC[H` 整屏重绘把它清空。现在改成等输出**静默 150ms** 再落（硬上限 1.5s 从 arm 起算，持续刷输出的窗格也等得到），落在主循环的 `session_pump_due()` 里。②**落地位置**：v2.3.4 把块写进可见区，而 ConPTY 的光标是**绝对行** ⇒ 用户一敲键，回声落在块尾、shell 的 `ESC[7;1H` 又把提示符打进块中间（真机实测就是这种乱码）。现在整段改成 `screen_prepend_history_text()`：喂临时屏解析成行，再插到 ring 里**可见区之前**，可见区与光标一个字节都不动；`screen_scroll_limit()` 的下界取 `hist_lines`（否则当前会话内容不足一屏时 vo 恒为 0，历史永远滚不到）。③**视图不跳变**：v2.3.4~2.3.8 还会在开屏把视图「摊开」到历史、第一次敲键再跳回底部 —— 用户读作「一敲字符历史就没了」。现在视图就停在实时底部，历史躺在滚动缓冲里，往上滚一格就能看到（滚轮到顶还有余量，就是靠 ② 那条 limit 兜底），敲字没有任何跳变。判据：新增 `verify_session_restore.py`（真控制台 + 真 exe + 造一份 12 行快照）：A 开屏就同时看见恢复历史、本轮 banner 与底部提示符（v2.4.0 口径；v2.3.9 那一版断言的是「历史不占可见区」，已被用户否掉，见 #15）；B 历史不足一屏时轻滚不跳布局；C 敲命令的回声接在历史之后、历史仍在同一屏；D 存盘保留段落空行；E 存盘把历史也写回档里、不重复。`restore_view` 那条锚定通路保留但不再由恢复路径设置。 |
+| 14 | **回看历史「一滚动就跳到 / 跳出历史」**（用户报，承接 #13）：两套坐标撞在一起了。实时视图（`scroll_offset==0`）按**物理行**画 —— 内容贴顶，banner 在窗格第 1 行、提示符第 4 行，其余是空行；而 v1.8.52 起的回看路径（`vo>0`）走 `screen_reflow_view` 的**底部锚定**网格 —— 最后一行内容贴在视口底。于是滚一格（滚轮 3 行）整屏内容跳过一次（真机实测 banner 从第 1 行直接跳到第 26 行），历史与本轮输入看着接不上。现在回看也用物理行：视口 = ring 上从 `rel=-vo` 起的窗口，与实时视图同一套坐标 ⇒ 滚一格只挪一格，滚到顶时最老那行历史正好贴在视口第一行，**历史 → 说明行 → 本轮 banner → 提示符**自上而下连续。只有渲染宽度窄于模型宽度（拖动分屏边框）时才退回重排网格，那种场合必须按新宽折行。配套把 `screen_scroll_limit()` 改成「窗口顶端到最老**内容**行」的距离（`screen_content_span` 跳过内容之外的空白），取代原来的 `max(reflow 高度 - 屏高, hist_lines)`：后者是重排显示行口径，与物理行混用正是跳变的来源。判据：新增 `verify_scroll_continuity.py`（真控制台 + 一份 60 行快照 —— 必须比视口高，否则滚轮本来就无处可滚，A 量不到位移）：A 滚一格的位移是几行、连续两格一致（位移用「视口第一行是第几条历史」量，不依赖 banner 还留在屏上；变异回旧路径立刻红：banner 从第 1 行跳到第 26 行）；B 滚到顶时最老历史贴顶、往下逐行连续；C 滚回底回到原位、历史仍与提示符连续可见（v2.4.0 口径，见 #15）。 |
+| 15 | **恢复的历史必须与当前输入是「一段」内容**（用户报「历史没有内容」「一敲字符历史就没了」「要能边打字边看到历史」的收尾）：v2.3.9 把快照整段塞进回滚缓冲、视图停在实时底部，结果是**开屏看不见历史、要滚才看到**，而且实时的物理行与回看的 reflow 网格两套坐标（#14 的根因）在恢复场景下又撞了一次。v2.4.0 引入 `ScreenBuffer.session_view` / `Pane.session_view`：一旦插入过恢复历史，整窗就统一走 reflow 视图（`screen_reflow_view`），历史、说明行、本轮 banner、提示符在同一坐标系里连续排列；`screen_scroll_limit()` 在会话视图下改用该网格的显示行单位（`hist_lines` 是物理行数，拿它当上限会滚过头）。排布方向是这个版本之后的返工点，见 #17。 |
+| 16 | **存盘把回滚历史整段剪掉**（上一轮实测：退出时 `D HIST-01…` 一行都没写回档，用户读作「历史没有内容」）：`sess_collect_starts()` 用 `last_content < 0` 当「还没遇到内容」的哨兵，可历史行的 rel 本来就是**负数**（`-hist_lines…-1`）⇒ 每遇到一条历史逻辑行就把 `first_content` 重设成它自己，最后只剩可见区那几行入档 —— 恢复出来的历史、以及屏满之后滚进回滚缓冲的内容全部丢失。现在用独立的 `have_last` 标志。判据：`verify_session_restore.py` 的 E1/E2（存档里必须有 `D HIST-01…D HIST-12`、每行只出现一次、说明行不许被当历史存回去）+ F1-F3（拿 E 存出的档再开第二代：老历史与上一轮命令都回来，存回去仍只有一份）。顺带修两处被 v2.4.0 改动带坏的内嵌 harness：`verify_screen_state.py` 的 `ScreenBuffer` 替身缺 `session_view` 字段（编不过，报 `has no member named 'session_view'`）、`verify_cursor_render.py` 的驱动还按旧签名 6 个参数调 `terminal_cursor_position()`（现在多一个 `session_cursor_row`，并补了一条「会话视图按算出的光标行定位」的断言）。 |
+| 17 | **历史不足一屏时，prompt 被钉在屏幕最下面**（用户报，承接 #15）：v2.4.0 的会话视图一律**底部锚定** —— 恢复的历史、banner、提示符被压在屏底，上方一片空白，和普通终端「内容从第一行开始、prompt 紧接内容」完全不是一个观感。现在 `screen_reflow_view()` 在内容不足一屏时**贴顶**：先算这趟真正落位的显示行数 `filled`，`filled < rows` 就把视口首行对上内容首行（尾巴空白只多显示几行空白，不算内容）。同时两处「内容下方空白」的口径收紧了：① 扫描从最新往回走，**还没遇到正文时看到的空行一定是内容下方的尾巴空白**（旧的 `screen_content_span` 把最后一条逻辑行一律算到屏底，于是这些尾巴空白也被落位、把内容顶出 grid）；② 删掉循环结束后那句「环顶空行再补一行」—— 若环顶那行 `wrap==0`，循环里最后一次落位已经把它写了，再补一次会在内容上方多一行空白（底部锚定时看不出来，贴顶后就把内容整体压下一行）。光标也改为同源算出：`screen_reflow_view()` 多一个 `cursor_row` 出参（`terminal_cursor_position()` 新增 `session_cursor_row`），光标落在视口里「它所在逻辑行的末行」；光标停在内容下方未落位的空行上时，落在已渲染内容的下方一行。判据：`verify_session_restore.py` A4/A5（光标就在 prompt 那一行、`HIST-01` 是标签栏下第一条内容，不再要求光标贴 `srWindow.Bottom`）+ `verify_screen_state.py` 的 reflow 用例（3 行内容在 6 行视口里落 y0..y2、光标 y3；宽视口 1 行落 y0；软换行合并落 y0）。 |
+| 18 | **`cls` 之后内容没清空**（用户报，承接 #15/#17）：`session_view` 一旦在恢复时置上就**永不撤销**，而 `cls`/`clear` 只清 ConPTY 那一侧（cmd 是「EL 逐行 + ED(3) 清滚动缓冲」，MSYS 的 `clear` 是 `ESC[H ESC[2J`）。实时视图却是「恢复历史 + 可见区」的重排网格 ⇒ 可见区被清空后，恢复历史照旧从上方铺满屏幕，用户看到的就是「光标回位了、内容还在」。现在 `ED(2)`（清显示）和 `ED(3)`（清滚动缓冲）都顺手撤销 `session_view`（连同 `session_cursor_row`），视图退回普通实时屏：空屏 + 光标，历史只在回滚缓冲里。`ED(2)` 不动 `hist_lines`（xterm 语义，历史仍可用滚轮翻到）；`ED(3)` 按原样清历史 —— 与 conhost 的 `cls` 一致。判据：`verify_session_restore.py` G1-G3（真控制台 + 真 exe：`cls` 之后屏上没有 `HIST-01`、prompt 回到屏幕上方、光标就在 prompt 那一行）。 |
+
+> ① **零宽码点**（组合符 U+0300–036F、ZWJ、VS16、肤色修饰）在 `screen_put_cp` 里仍占一整格，显示端是 0 宽 ⇒ 帧尾光标列、选区/复制列、reflow 列都会右偏；整行写满时最右几列还会保留上一帧残字。修它要同时动解析器、reflow 与复制三处的坐标口径。
+> ② **分屏（含 zoom）下的复制模式 / 历史搜索高亮 / 右上角状态徽章没有画**：`render_split_pane` 只画正文与边框，帧尾 split 分支在 `g_copy_mode` 时直接 `?25l`。键盘仍在移动一个看不见的选区、Enter 仍会复制。要么把选区/高亮搬进分屏路径，要么分屏时禁用复制模式并提示。
 
 **v2.3.6** —— 用户报「不支持传递图形协议」：`img2sixel` / `kitty +kitten icat` / `imgcat` 在本复用器里什么都不出现。原因是这一层把未知序列丢掉，而图形协议（sixel 的 DCS、kitty 的 APC、iTerm2 的 OSC 1337）正好是「未知」的三种。现在解析线程旁边挂一个小判定认出它们、整段原样收下，在主线程发完本帧差分之后按宿主坐标写出去 —— 实时直通，不进历史（滚动或缩放之后图像消失是可接受的口径）。Windows 侧另加 `PSEUDOCONSOLE_PASSTHROUGH_MODE`（0x8）：不加它，in-box conhost 会自己把 sixel 与 kitty 剔掉（微软那边是 issue #1173，至今没放行），我们转发得再干净也到不了宿主；该位只在 Win11 22H2（build 22621）以上存在，所以「带位试建、失败立刻退回不带位」。
 
@@ -328,6 +373,9 @@ python3 verify_config_theme.py     # 配置体系：主题参考色板完整性 
 | 5 | 判据：`make gfx-posix`（采集状态机 33 条定点断言，无外部依赖）+ `verify_pane_palette.py` T18a-T18f（真 pty 查宿主原始字节流；T18a 拿 v2.3.5 的发布档跑是红的） |
 
 三个坑都是「静默什么都不发生」型的，靠定点单测才当场抓到：① kitty 的载荷态跳到一个 switch 里不存在的状态号（走 `default` 被清态）；② `File=` 的模式串写成大写开头、与统一小写后的输入永远配不上（原来靠「4KB 内没认到才丢」兜住，改成锚定判定后立刻暴露）；③ iTerm2 用 `ESC \` 收尾时忘了把 `\` 一起收进缓冲 ⇒ 发出去的是**没有结尾的 OSC**，宿主的解析器会停在半截上、把之后每行文字都当载荷吃掉。
+
+> **实测补充（2026-11-22，Windows 11 build 26200，in-box conhost）**：`conpty_source.log` 里 `pas=1`（`PSEUDOCONSOLE_PASSTHROUGH_MODE` 已被接受、`CreatePseudoConsole` 成功），但 **DCS（sixel）与 APC（kitty）仍然到不了本进程**：`TERMUX_DUMP=1` 时 `termux_dump.log` 里连一个字节都没有（`ESC P zzz ST` / `ESC _ XYZ ST` 这种最小序列也一样被吞），`WriteFile` 与 `WriteConsoleW` 两条写入路径都试过。只有 iTerm2 的 OSC 1337 能过 —— 而它在 passthrough 关掉时也能过，说明这一位的实际效果在本机为零。结论：**Windows 上目前真能用的只有 iTerm2 协议**；要 sixel/kitty 也通，得把窗格的 ConPTY 换成 Microsoft Terminal 那一份 `conpty.dll`/`OpenConsole.exe`（本仓库的 `TERMUX_CONPTY=dll` / Plan A 路径），改本仓库的代码补不上这一层。Linux/macOS 侧不受影响（pty 是原样字节流）。
+
 
 **v2.3.5** —— 拿 v2.3.4 上 Windows 真机试过的回报是「这次没有闪一下了，但是没有历史」+「没有记录终端」。顺着这两句查到：v2.3.4 为了「恢复了但还没显示就退出」在 `session_flush_now()` 最上面加了一句会**无条件拿锁**的落地调用，而那支函数正是 Windows `CTRL_CLOSE_EVENT` 处理器里调的 —— 那一刻 ConPTY 读线程多半正持着 `g_mux.cs`，处理器就此挂住，系统几秒钟后强杀进程 ⇒ **一个字都没写**；于是下一次启动既没有历史可恢复（不闪了），也再攒不出快照。
 

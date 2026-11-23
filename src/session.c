@@ -392,10 +392,67 @@ static int sess_row_text(ScreenBuffer *s, int ph, SBuf *out, int cap, int *had_c
 
 /* 从最后一行往前数逻辑行起点，最多 max 条，把起点（rel 行号）按正序写进 out[]。
  * 反向数 + 上限 ⇒ 代价与上限成正比，跟 scrollback 有多大无关（50 万行也一样快）。 */
+static int sess_row_has_text(ScreenBuffer *s, int rel) {
+    int pr = screen_phys_row(s, rel);
+    if (pr < 0 || pr >= s->total_lines || !s->lines || !s->lines[pr].cells) return 0;
+    ScreenLine *ln = &s->lines[pr];
+    int used = ln->used;
+    if (used > s->cols) used = s->cols;
+    if (used > ln->len) used = ln->len;
+    while (used > 0) {
+        WCHAR c = ln->cells[used - 1].Char.UnicodeChar;
+        if (c != L' ' && c != 0) break;
+        used--;
+    }
+    for (int x = 0; x < used; x++) {
+        WCHAR c = ln->cells[x].Char.UnicodeChar;
+        if (c != L' ' && c != 0 && c >= 0x20 && c != 0x7F) return 1;
+    }
+    return 0;
+}
+
 static int sess_collect_starts(ScreenBuffer *s, int *out, int max) {
+    int oldest = -s->hist_lines;
+    if (oldest < -(s->total_lines - s->rows)) oldest = -(s->total_lines - s->rows);
+    int first_content = 0, last_content = -1;
+    int have_last = 0;   /* v2.4.0：不能用 last_content<0 当「还没设」的哨兵 —— 历史行的
+                          * rel 本来就是负数，那样每遇到一条历史逻辑行都会把 first_content
+                          * 重设成它自己，最终只剩可见区那几行入档（恢复的历史、以及屏满之后
+                          * 滚进回滚缓冲的内容整段丢失）。 */
+    int opened = 0, group_start = oldest, group_has = 0;
+    /* 找「首条内容逻辑行」到「末条内容逻辑行」的范围。范围内的空逻辑行是
+     * 用户真的按 Enter 留下的历史，必须入档；范围外的 leading/trailing 空白则不存。 */
+    for (int rel = oldest; rel < s->rows; rel++) {
+        int pr = screen_phys_row(s, rel);
+        int wrap = (s->line_wrap && pr >= 0 && pr < s->total_lines) ? s->line_wrap[pr] : 0;
+        if (!opened || !wrap) {
+            if (opened && group_has) {
+                if (!have_last) first_content = group_start;
+                last_content = group_start;
+                have_last = 1;
+            }
+            group_start = rel;
+            group_has = 0;
+            opened = 1;
+        }
+        if (sess_row_has_text(s, rel)) group_has = 1;
+    }
+    if (opened && group_has) {
+        if (!have_last) first_content = group_start;
+        last_content = group_start;
+        have_last = 1;
+    }
+    if (!have_last) return 0;
+    if (getenv("TERMUX_SESSDBG"))
+        dump_mark("[sessdbg] collect oldest=%d first=%d last=%d rows=%d hist=%d",
+                  oldest, first_content, last_content, s->rows, s->hist_lines);
+
     int cnt = 0;
-    for (int rel = s->rows - 1; rel >= -s->hist_lines && cnt < max; rel--)
-        if (!s->line_wrap[screen_phys_row(s, rel)]) out[cnt++] = rel;
+    for (int rel = s->rows - 1; rel >= first_content && cnt < max; rel--) {
+        int pr = screen_phys_row(s, rel);
+        int wrap = (s->line_wrap && pr >= 0 && pr < s->total_lines) ? s->line_wrap[pr] : 0;
+        if ((rel == oldest || !wrap) && rel <= last_content) out[cnt++] = rel;
+    }
     for (int i = 0; i < cnt / 2; i++) {          /* 倒着数出来的，翻正 */
         int a = out[i];
         out[i] = out[cnt - 1 - i];
@@ -416,6 +473,11 @@ static void sess_write_pane(ScreenBuffer *s, SBuf *b) {
     int *starts = (int *)malloc((size_t)(SESS_MAX_LINES + 1) * sizeof(int));
     if (!starts) return;
     int n = sess_collect_starts(s, starts, SESS_MAX_LINES);
+    if (getenv("TERMUX_SESSDBG"))
+        dump_mark("[sessdbg] write pane hist=%d rows=%d cols=%d n=%d starts=%d,%d,%d session_view=%d",
+                  s->hist_lines, s->rows, s->cols, n,
+                  n > 0 ? starts[0] : 0, n > 1 ? starts[1] : 0, n > 2 ? starts[2] : 0,
+                  s->session_view);
     SBuf scr;
     memset(&scr, 0, sizeof(scr));
     int keep = b->len;
@@ -446,7 +508,14 @@ static void sess_write_pane(ScreenBuffer *s, SBuf *b) {
         if (used > 0 && code) sbuf_str(b, "\\e[m");       /* 收尾复位，颜色不许漏给下一行 */
         if (mark) continue;                                /* 一条都没写出去，无需回滚 */
         if (used > 0) { sbuf_str(b, "\n"); keep = b->len; }
-        else if (b->len > line_at) b->len = line_at;      /* 只写了 "D " 就被剪掉 ⇒ 回滚 */
+        else if (!cut) {
+            /* 起点落在「首条内容」与「末条内容」之间的逻辑空行就是用户按 Enter 留下的
+             * 空行。旧逻辑 r<=0 一律 continue、空行结束时又把空 D 行裁掉，所以 Ctrl+S
+             * 或正常退出后的快照会把段落间距全吃掉。sess_collect_starts 已经剪掉内容
+             * 之外的 leading/trailing 空白，这里遇到的空逻辑行都是真实内容，写成 `D \n`。 */
+            sbuf_str(b, "D \n");
+            keep = b->len;
+        } else if (b->len > line_at) b->len = line_at;  /* 只写了 "D " 就被剪掉 ⇒ 回滚 */
     }
     free(scr.p);
     if (keep < b->len) { b->len = keep; if (b->p) b->p[keep] = 0; }
@@ -586,6 +655,11 @@ static int sess_write_keep(void) {
         ok = (fwrite(b->p, 1, (size_t)b->len, f) == (size_t)b->len) ? 1 : 0;
         if (fclose(f) != 0) ok = 0;
     }
+    /* v2.3.9 诊断：写没写成功、落在哪个路径、多少字节 —— 「没有成功写入」这类反馈
+     * 以前全靠猜（exe 目录不可写会退到主目录，或者根本没触发落盘）。TERMUX_DUMP 下
+     * 记进 mouse_dump.log；不设变量时一次判断都没有。 */
+    dump_mark("[sess] write ok=%d bytes=%d path=%ls", ok, ok ? (int)b->len : 0,
+              path[0] ? path : L"(none)");
     free(g_sess_keep.p);                 /* 落盘后就地松开（别等进程退出，窗格多的时候这份东西不小） */
     g_sess_keep.p = NULL;
     g_sess_keep.len = g_sess_keep.cap = 0;
@@ -748,26 +822,25 @@ static int sess_index_lines(char *raw, SRec **out) {
  * 都成立（排在前面时，短历史仍整块留在视口里、照样被盖）。 */
 /* v2.3.5：宽限期的到期时刻（GetTickCount64 毫秒）。0 = 没有挂起块。 */
 static ULONGLONG g_sess_pump_by = 0;
+static ULONGLONG g_sess_pump_cap = 0;   /* v2.3.9：从 arm 起算的硬上限，见 session_note_output */
+/* v2.3.9：挂起块落地用「静默期 + 硬上限」，理由见 session_pump_due 上方的注释。 */
+#define SESS_PUMP_QUIET_MS 150
+#define SESS_PUMP_CAP_MS   1500
 
-static void sess_apply(Pane *p, const char *buf, int len) {
-    EnterCriticalSection(&g_mux.cs);
-    screen_process_output(&p->screen, buf, len);
-    LeaveCriticalSection(&g_mux.cs);
-}
+/* v2.3.9：挂起块改成 screen_prepend_history_text（只动历史、不动可见区），
+ * 原来「整段喂进屏里」的 sess_apply 已无调用者，删掉。 */
 
 static void sess_feed(Pane *p, SBuf *hist, int lines) {
     if (!p || !p->active || (lines <= 0 && hist->len <= 0)) return;
     SBuf f;
     memset(&f, 0, sizeof(f));
-    /* 先清掉残留样式（别把整段历史染色），再换行 —— 这个 \r\n 是必需的：不另起一行，说明行
-     * 会被接在 shell 提示符同一行后面（`$ ── 上次会话的历史…`），锚定到「快照首行」时它就
-     * 落在窗口上面那一格，屏上永远看不到（自查实测）。 */
-    sbuf_str(&f, "\x1b[m\r\n");
-    /* 说明行回到块首：视图现在锚到「快照的第一行」（见 session_pump_pending），它就落在
-     * 屏幕第一行，不会被顶出去（v2.3.3 挪到块尾是为了绕开顶出去，那一条由此接管）。
-     * 存盘侧剔说明行是逐行按前缀判的，位置不影响。 */
-    if (lines > 0) sbuf_fmt(&f, "%s%d%s\r\n", SESS_MARK_HEAD, lines, SESS_MARK_TAIL);
+    /* 先清掉残留样式（别把整段历史染色）。v2.3.9：这块文本不再往可见区写，而是整段
+     * 塞进【历史】（见 session_pump_pending / screen_prepend_history_text），所以不需要
+     * 起头的空行；说明行挪到【块尾】—— 往上滚一格就先看到它。存盘侧剔说明行是逐行按
+     * 前缀判的，位置不影响。 */
+    sbuf_str(&f, "\x1b[m");
     sbuf_add(&f, hist->p ? hist->p : "", hist->len);
+    if (lines > 0) sbuf_fmt(&f, "%s%d%s\r\n", SESS_MARK_HEAD, lines, SESS_MARK_TAIL);
     free(p->sess_pend);                            /* 理论上只该有一次；重复灌以后者为准 */
     p->sess_pend = NULL;
     p->sess_pend_len = 0;
@@ -776,7 +849,8 @@ static void sess_feed(Pane *p, SBuf *hist, int lines) {
         p->sess_pend = f.p;
         p->sess_pend_len = f.len;
         p->sess_pend_armed = 1;
-        g_sess_pump_by = GetTickCount64() + 400;   /* v2.3.5：宽限期兜底，见 session_pump_due */
+        g_sess_pump_by = GetTickCount64() + SESS_PUMP_CAP_MS;
+        g_sess_pump_cap = g_sess_pump_by;
     } else {
         free(f.p);
     }
@@ -796,33 +870,45 @@ void session_pump_pending(int pane_idx) {
     p->sess_pend_armed = 0;
     if (p->sess_pend_len <= 0 || !p->sess_pend) return;
     ScreenBuffer *sb = &p->screen;
-    int cols = sb->cols;
-    /* 首帧到达时窗格尺寸可能还没落地（cols/rows 未定 ⇒ reflow 高度量不出来，h0 会是 0，
-     * 锚就退化成「停在内容顶端」，说明行被顶上/顶下半行）；退一步用光标行当块首下标，
-     * 两者差不过一两行 ⇒ 判据钉的是「在第一屏前几行内」（<=3），不是咬死某一行。 */
-    int h0 = cols > 0 ? screen_reflow_height(sb, cols) : 0;
-    if (h0 <= 0) h0 = sb->cursor_y;
     int plen = p->sess_pend_len;
-    sess_apply(p, p->sess_pend, plen);
+    /* v2.3.9：挂起块【不再写进可见区】，整段当历史插到可见区之前。
+     * 理由是行号一致性：ConPTY 的光标是绝对行，shell 之后既可能只发一个字符（回声），
+     * 也可能发 `ESC[r;cH` 重新定位；恢复内容一旦占住可见区的行，回声会落在块尾、
+     * shell 的 `ESC[7;1H` 又会把提示符打进块中间（真机实测就是这种乱码）。历史放在
+     * 可见区之上以后，可见区与光标一个字节都不动，往上滚才看到历史。 */
+    int added = screen_prepend_history_text(sb, p->sess_pend, plen);
+    if (getenv("TERMUX_SESSDBG")) {
+        dump_mark("[sessdbg] pump added=%d hist=%d cursor=(%d,%d) rows=%d cols=%d",
+                  added, sb->hist_lines, sb->cursor_x, sb->cursor_y, sb->rows, sb->cols);
+        for (int r = -3; r < 3; r++) {
+            int pr = screen_phys_row(sb, r);
+            if (pr < 0 || pr >= sb->total_lines || !sb->lines[pr].cells) continue;
+            char t[96];
+            int n = 0;
+            for (int x = 0; x < sb->cols && n < 80; x++) {
+                WCHAR ch = sb->lines[pr].cells[x].Char.UnicodeChar;
+                if (!ch) continue;
+                t[n++] = (ch >= 32 && ch < 127) ? (char)ch : '#';
+            }
+            t[n] = 0;
+            dump_mark("[sessdbg] r%+d used=%d |%s|", r, sb->lines[pr].used, t);
+        }
+    }
     free(p->sess_pend);
     p->sess_pend = NULL;
     p->sess_pend_len = 0;
-    /* 记【绝对锚】而不是记死一个 scroll_offset：回看偏移在本引擎里是「从底部往上跳几行」，
-     * 之后 shell 每出一行都会把它顶偏一行（实测就是这样差一行，说明行被推出屏外）。
-     * Windows Terminal 用绝对行号所以天然稳定（_scrollOffset = realTop - viewTop，
-     * Terminal.cpp:1107；新输出到达时 _PreserveUserScrollOffset 按 viewportDelta 补偿，
-     * Terminal.cpp:1096）⇒ 这里同构地存锚，由 render 每帧换算。 */
-    /* 往上多留一行（锚 = h0-1）：说明行落在屏幕第 1 行而不是第 0 行。两个理由：
-     * 1) h0 在「首帧到达时窗格尺寸还没落地」那种场合只能拿光标行兜底，可能差一两行 ——
-     *    留一行余量，误差方向怎么偏说明行都还在屏上（判据按 0~1 行钉）；
-     * 2) 上面正好是 shell 那句提示符，看着比贴着标签栏更顺。 */
-    p->rf_anchor = h0 > 1 ? h0 - 1 : 0;
-    p->restore_view = 1;
-    int lim = screen_scroll_limit(sb);
-    p->scroll_offset = (lim - p->rf_anchor) > 0 ? lim - p->rf_anchor : 0;
+    /* 视图停在【实时底部】。v2.3.4~2.3.8 曾在这里把视图「摊开」到历史（vo=lim），但
+     * ConPTY 的光标是绝对行 ⇒ 新输出只能落在模型自己那几行上：用户一敲键，视图要么跳回
+     * 底部（用户看到的就是「一敲字符历史就没了」），要么把回声顶出屏幕。恢复出来的块
+     * 现在躺在滚动缓冲里，往上滚一格就能看到，敲字没有任何跳变。 */
+    p->rf_anchor = 0;
+    p->restore_view = 0;
+    p->session_view = added > 0;
+    sb->session_view = added > 0;
+    p->scroll_offset = 0;
     g_mux.needs_redraw = 1;
-    dump_mark("[sess] pump pane=%d len=%d anchor=%d lim=%d vo=%d hist=%d",
-              pane_idx, plen, p->rf_anchor, lim, p->scroll_offset, sb->hist_lines);
+    dump_mark("[sess] pump pane=%d len=%d added=%d lim=%d vo=%d hist=%d",
+              pane_idx, plen, added, screen_scroll_limit(sb), p->scroll_offset, sb->hist_lines);
 }
 
 void session_pump_pending_all(void) {
@@ -833,12 +919,33 @@ void session_pump_pending_all(void) {
  * 「历史能不能显示」押在一条特定的读取路径上 —— Windows 的 ConPTY 起 shell 时会连着来
  * 好几帧（首帧 + resize 后的整屏重打），任何一帧没经过那个调用点，快照就烂在挂起态里
  * 一辈子（用户看到的即「没有历史」）。所以主循环每轮问一次：武装着且过了宽限期（默认
- * 400ms，从最后一次 arm 算起）就在这里补上 —— 主循环持锁渲染，锁语义和读线程那条一致。 */
+ * 400ms，从最后一次 arm 算起）就在这里补上 —— 主循环持锁渲染，锁语义和读线程那条一致。
+ *
+ * v2.3.9：宽限期改成【静默期】。原来读线程一收到「第一帧」就落地，而 ConPTY 现在会先
+ * 单独来一小块纯模式序列（`ESC[?9001hESC[?1004h`，16 字节，Win32 输入模式开关）——
+ * 快照挂在它后面落地，紧跟着 cmd 那一记 `ESC[?25l ESC[2J ESC[H` 整屏重绘把整个可视区
+ * 清掉 ⇒ 恢复出来的历史一行不剩（用户报「每次历史都没有内容」）。现在每收到一块就把
+ * 落地时间往后顺延（静默 150ms 才落），另有一条从 arm 起算的硬上限（1.5s），
+ * 免得持续刷输出的窗格永远等不到静默。 */
 void session_pump_due(void) {
     if (!g_sess_pump_by) return;
     if (GetTickCount64() < g_sess_pump_by) return;
     g_sess_pump_by = 0;
+    g_sess_pump_cap = 0;
     session_pump_pending_all();
+}
+
+/* 这个窗格又来了输出 ⇒ 把「落地时刻」顺延到静默期之后（不超过硬上限）。
+ * 读线程在每块输出处理完之后调一次；真正落地仍由 session_pump_due 统一做。 */
+void session_note_output(int pane_idx) {
+    if (pane_idx < 0 || pane_idx >= MAX_PANES) return;
+    Pane *p = &g_mux.panes[pane_idx];
+    if (!p->active || !p->sess_pend_armed) return;
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG by = now + SESS_PUMP_QUIET_MS;
+    if (g_sess_pump_cap && by > g_sess_pump_cap) by = g_sess_pump_cap;
+    if (!g_sess_pump_cap) g_sess_pump_cap = now + SESS_PUMP_CAP_MS;
+    g_sess_pump_by = by;
 }
 
 /* 窗格要没了（或快照不再打算显示）⇒ 丢弃挂起块。 */

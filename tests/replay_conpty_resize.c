@@ -56,7 +56,7 @@ static void rowtext_view(ScreenBuffer *s, int vo, int row, char *out) {
     int hp = 0; out[0] = 0;
     RGlyph *view = malloc((size_t)s->rows * s->cols * sizeof(RGlyph));
     if (!view) return;
-    if (!screen_reflow_view(s, vo, s->rows, s->cols, view)) { free(view); return; }
+    if (!screen_reflow_view(s, vo, s->rows, s->cols, view, NULL)) { free(view); return; }
     for (int x = 0; x < s->cols && hp < 90; x++) {
         unsigned c = (unsigned)view[row * s->cols + x].ci.Char.UnicodeChar;
         if (c == 0 || c == L' ') { if (hp && out[hp - 1] != ' ') out[hp++] = ' '; }

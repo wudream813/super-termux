@@ -64,6 +64,9 @@ int session_flush_now(int for_exit_path);
 void session_pump_pending(int pane_idx);
 void session_pump_pending_all(void);
 void session_pump_due(void);             /* v2.3.5：主循环每轮问一次的宽限期兜底 */
+/* v2.3.9：窗格又来了输出 ⇒ 把挂起块的落地时刻顺延到静默期之后（读线程每块调一次）。
+ * 不立刻落地：ConPTY 会先单独来一小块纯模式序列，落地太早就被紧跟着的整屏重绘清掉。 */
+void session_note_output(int pane_idx);
 void session_drop_pending(int pane_idx);   /* 关窗格时丢弃未落地的挂起块 */
 
 /* 启动时调用（第一个窗格建好之后、首次渲染之前）。返回恢复出的标签页数；

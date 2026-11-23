@@ -67,6 +67,11 @@ typedef struct {
     CHAR_INFO *alt_buffer;
     int in_alt_screen, alt_scroll_top;
     int origin_mode, auto_wrap, wraparound_pending;
+    /* ConPTY 右缘「疑似填充空格」的待决标记：宽字符正好占满右缘时 conhost 会补一个
+     * 纯排版空格，但真实文本里也可能在同样的位置出现真空格（mdt 的界面就常这样）。
+     * 写入时先按普通空格处理，等下一个事件再定：紧跟可打印字符 = 真内容，保留；
+     * 紧跟换行/光标移动/擦除 = 排版填充，撤回（见 vt.c 的 vt_pad_space_*）。 */
+    int pad_pend, pad_x, pad_y;
     int scroll_region_top, scroll_region_bottom;
     int app_cursor_keys, app_keypad;
     int mouse_tracking, mouse_sgr, bracketed_paste, win32_input_mode;
@@ -83,6 +88,7 @@ typedef struct {
     WORD *alt_fg_rgb, *alt_bg_rgb;
     unsigned char *alt_rgb_valid;
     int hist_lines;
+    int session_view;     /* v2.4.0：把恢复历史与实时 pane 合成底部锚定的连续视图 */
     int alt_hist_lines;
     int cr_pending;   /* 上一个逻辑文本控制是否为 CR；OSC 标题不打断 CRLF */
     /* ConPTY 在【屏幕最后一行的末列】上的定位标记，-1 表示没有。
@@ -168,6 +174,11 @@ typedef struct {
     int scroll_offset;
     int gfx_paint_row, gfx_paint_col, gfx_paint_rows, gfx_paint_ok;   /* v2.3.6：本帧这块窗格
                                                                           * 画在宿主的哪个矩形 */
+    int visible_now;        /* v2.3.7：上一帧渲染有没有把这块窗格画到宿主上（每帧由
+                             * render 重记：分屏里所有可见窗格 = 1，缩放到别的窗格、
+                             * 在别的标签页、或整屏路径只画活动窗格时为 0）。
+                             * 读线程据此决定「这块窗格来了输出要不要点重绘」——
+                             * 以前只认 active_pane，分屏里非活动窗格的输出根本不重绘。 */
     int restore_view;       /* v2.3.4：启动视图停在「快照第一行」（= WT 的 UserScrollViewport
                              * 绝对行 + TrySnapOnInput）；用户按键或滚轮就交还控制权 */
     int rf_anchor;          /* v2.3.4：restore_view 期间，希望落在屏幕首行的 reflow 显示行下标
@@ -175,6 +186,9 @@ typedef struct {
     char *sess_pend;        /* v2.3.4：待灌入的快照文本（排在窗格第一帧输出之后，见 pane.c） */
     int sess_pend_len;
     int sess_pend_armed;
+    int session_view;       /* v2.4.0：恢复历史+当前活屏组成连续视图 */
+    int session_cursor_row; /* v2.4.1：会话视图里 shell 光标落在视口第几行（0 基，-1=未知）。
+                             * 内容不足一屏时视图贴顶，光标不再钉在最底行 */
     int color;
     int is_settings;
     int is_about;
@@ -332,6 +346,7 @@ extern int g_search_dirty;
 void dump_pane_bytes(int pane_idx, const char *data, int len);
 void dump_render_output(const char *out, int len, int pcols, int prows, int hcols, int hrows);
 void dump_delta_output(const char *data, int delta_len, int full_len);
+void dump_host_write(int seq, const char *data, int len);
 void log_mouse_event(const char *tag, const MOUSE_EVENT_RECORD *me);
 void host_write(const char *data, int len);
 

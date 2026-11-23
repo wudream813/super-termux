@@ -23,6 +23,11 @@
   9. 内容正好铺满窗格（hist==0）时，重绘不得吃掉顶部内容 —— 真机 height 4 -> 1、
      banner 两行直接消失（用户报的「历史被直接吃了」）。
 
+  10（组 13）. resize 之后 cursor_y / cursor_x 必须按新宽度重算：旧实现算 cursor_y 时
+     读的是 log 里还没并进来的尾巴（realloc 未清零），软换行续行上的光标会落错行；
+     cursor_x 只做 >= nc 夹取，于是总画在行尾。
+  11（组 14）. 宽字符参与时列号按【显示宽度】算（汉字 2 列），不是按格数。
+
 第 7、8、9 组直接调用 screen_repaint_align()（与 src/pane.c:96,104 的顺序一致），所以
 「历史重复」与「重绘比窗格高时吞行」这两条都在这里钉住。
 """
@@ -39,11 +44,13 @@ def main():
            "-Itests/stub", "-Iinclude",
            "tests/resize_history_repro.c", "src/screen.c", "src/vt.c", "src/utf8.c",
            "-o", binp]
-    r = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True)
+    r = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
     if r.returncode != 0:
         print("Compilation error:", r.stderr)
         return 1
-    r = subprocess.run([binp], capture_output=True, text=True)
+    r = subprocess.run([binp], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
     print(r.stdout, end="")
     try:
         os.remove(binp)

@@ -1637,6 +1637,11 @@ static int anim_slide_fill(char *out, int end, int total, int host_rows, int hos
                 if (nc != c) {
                     SLIDE_PUTF("\x1b[%d;%dH", r, nc);
                     done = 1;
+                    /* 原来的那条 CUP 已经被换掉了，必须整个跳过 —— 只 continue 的话
+                     * 循环的 j++ 只前进一个字节，原序列剩下的 `[27;60H` 会被当正文
+                     * 再抄一遍，宿主就把它原样打出来（用户看到「新建 pane 时闪一下
+                     * ANSI 代码」；因为正文段那条路径是 `i += L`，所以只有光标段中招）。 */
+                    j += step - 1;
                     continue;
                 }
             }
@@ -5344,8 +5349,9 @@ static char *render_buffer_acquire(int needed) {
 /* v2.1.6：g_sb_grad / sb_custom_thumb / sb_custom_track 整体上移到「设置页滚动条」一节之前
  * （sb_paint_cell 要用，设置页与终端必须共用同一份取色表）。 */
 
-static int terminal_cursor_position(const ScreenBuffer *s, int scroll_offset,
-                                     int host_rows, int host_cols, int *out_row, int *out_col) {
+static int terminal_cursor_position(const ScreenBuffer *s, int scroll_offset, int session_view,
+                                     int session_cursor_row, int host_rows, int host_cols,
+                                     int *out_row, int *out_col) {
     if (!s || scroll_offset != 0 || !s->cursor_visible || host_rows < 1 || host_cols < 1)
         return 0;
 
@@ -5363,6 +5369,13 @@ static int terminal_cursor_position(const ScreenBuffer *s, int scroll_offset,
     if (cx < 0) cx = 0;
     if (cy < 0) cy = 0;
     if (cy >= rr) cy = rr - 1;
+    /* 会话视图把「历史 + 活屏内容」按逻辑行合成；内容不足一屏时贴顶，光标由
+     * screen_reflow_view 算出的 session_cursor_row 决定（以前一律钉在最底行，
+     * 用户看到的正是「历史在上面、提示符却跑到屏幕最下面」）。模型里的 cursor_y
+     * 仍保持 ConPTY 的绝对行，不改模型。 */
+    if (session_view) {
+        cy = (session_cursor_row >= 0 && session_cursor_row < rr) ? session_cursor_row : rr - 1;
+    }
 
     if (out_row) *out_row = cy + 2;
     if (out_col) *out_col = cx + 1;
@@ -5611,6 +5624,12 @@ static void render_split_cell(char *out, int bs, int *posp, ScreenBuffer *s,
         if (wc == 0) { *posp = pos; return; }
         cell_truecolor(s, y, x, ar, &frgb, &brgb, &fgv, &bgv);
     }
+    /* v2.3.7：emoji（U+10000+）在模型里是【高低代理两格】，显示端由主格那 4 个
+     * 字节一次画出两列。分屏路径逐格定位，轮到低代理那一格时若走下面的
+     * 「代理 → 空格」兜底，就会在 emoji 的第二列盖一个空格，把每个 emoji 的右半
+     * 擦掉（整屏路径早就用 x++ 跳过次格，只有分屏/zoom 有这条）。低代理一律不写，
+     * 和 BMP 宽字符的次格（wc==0）同一口径。 */
+    if (wc >= 0xDC00 && wc <= 0xDFFF) { *posp = pos; return; }
     int active = (leaf == g_mux.active_pane);
     (void)active;
 
@@ -5706,15 +5725,23 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
     pane->gfx_paint_row = rc->r0; pane->gfx_paint_col = rc->c0;
     pane->gfx_paint_rows = rc->rows < s->rows ? rc->rows : s->rows;
     pane->gfx_paint_ok = 1;
-    /* v2.3.4：快照摊开视图（绝对锚）。每帧用【当前】内容高度换算 vo，新输出到达不会把
-     * 视图顶偏；锚到不了的地方（内容不足一屏）自然退化成 vo=0，画面仍是正常底部对齐。 */
+    pane->visible_now = 1;   /* v2.3.7：可见 ⇒ 它的输出值得点一次重绘 */
+    /* v2.3.9：会话恢复不再改动视图（历史躺在滚动缓冲里，往上滚就能看到 —— 原来那套
+     * 「开屏摊开历史 + 按任意键让位」会让屏幕在第一次敲键时整屏跳一下，用户读作
+     * 「一敲字符历史就没了」）。这里只保留「恢复视图」的锚定能力给将来的调用方。 */
     if (pane->restore_view) {
         int rw_a = rc->cols < s->cols ? rc->cols : s->cols;
         int h_a = screen_reflow_height(s, rw_a);
         int vo_a = h_a - s->rows - pane->rf_anchor;
         int lim_a = screen_scroll_limit(s);
-        if (vo_a < 0) vo_a = 0;
-        if (lim_a > 0 && vo_a > lim_a) vo_a = lim_a;
+        if (vo_a < 0) {
+            /* v2.3.9：当前会话的内容还没铺满一屏（h_a < rows），但历史里可能整段躺着
+             * 上一轮的快照（会话恢复把它当历史塞进去的）。这时按「滚到最老那一行」摊开，
+             * 否则 vo 会被算成 0、恢复出来的历史一行都看不见（用户报「每次历史都没有
+             * 内容」）。按任意键仍会交还实时底部（write_to_pane_internal）。 */
+            vo_a = s->hist_lines > 0 ? s->hist_lines : 0;
+        }
+        if (vo_a > lim_a) vo_a = lim_a;
         pane->scroll_offset = vo_a;
     }
     if (pane->scroll_offset > 0) {
@@ -5733,12 +5760,14 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
          * scroll_offset 永久夹小（症状：「左右拖动分屏导致历史直接消失」）。现在拖动中
          * 布局/模型/ConPTY 同帧一起改（节流挪到 split_set_frac_node 那一侧），两边宽度恒等
          * ⇒ 按常规算 limit 就是对的，窄窗格里拖窄后多余的历史偏移该收就收。 */
-        int lim_sc;
+        int lim_sc = screen_scroll_limit(s);
         {
             int rw = rc->cols < s->cols ? rc->cols : s->cols;
-            int h = screen_reflow_height(s, rw);
-            lim_sc = h - s->rows;
-            if (lim_sc < 0) lim_sc = 0;
+            if (rw < s->cols) {
+                /* 窄窗走重排网格（见上面 use_rf）：可达高度按重排后的显示行数算。 */
+                int h = screen_reflow_height(s, rw);
+                if (h - s->rows > lim_sc) lim_sc = h - s->rows;
+            }
         }
         if (pane->scroll_offset > lim_sc) pane->scroll_offset = lim_sc;
     }
@@ -5825,7 +5854,12 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
      *
      * 回看路径不受影响：scroll_offset>0 时两版行为逐帧一致（已用 hist=500/2000
      * 验证），因为那条路径本来就该按当前宽度重排历史。 */
-    int use_rf = (pane->scroll_offset > 0 &&
+    /* v2.4.0：回看（scroll_offset>0）默认也走【物理行】：视口 = ring 上从 rel=-vo
+     * 起的窗口，与实时视图同一套坐标 ⇒ 滚一格内容只挪一行，不会整屏跳。
+     * 只有渲染宽度窄于模型宽度（拖动分屏边框、模型被冻结）时才退回重排网格 ——
+     * 那种场合必须按新宽折行，否则右侧内容直接消失。 */
+    int use_rf = ((pane->scroll_offset > 0 || pane->session_view || s->session_view) &&
+                  (cols < s->cols || pane->session_view || s->session_view) &&
                   !s->in_alt_screen && s->line_wrap != NULL);
     if (use_rf) {
         RGlyph *grid = (RGlyph *)pane->rf_grid;
@@ -5870,7 +5904,7 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
          * 光标所在区域始终可见；cols 每帧变化时只有上方内容被挤掉，下方稳定。
          * 用户往上翻历史时 vo = scroll_offset 本身就是他的显式意图，同样适用。 */
         if (rf_ready && grid &&
-            screen_reflow_view(s, pane->scroll_offset, rows, cols, grid)) {
+            screen_reflow_view(s, pane->scroll_offset, rows, cols, grid, NULL)) {
             /* 整窗 reflow 成功（返回 1 表示已填满整个视口）才发布这块网格。 */
             pane->rf_grid = grid;
             pane->rf_rows = rows;
@@ -6103,7 +6137,12 @@ static void gfx_collect_locked(void) {
     }
 }
 
-static void gfx_emit_outbox(void) {
+/* 把本帧攒下的图形序列原样写给宿主，返回实际发出的条数（0 = 这一帧没有图片）。
+ * 调用方拿这个返回值决定「要不要把光标段再补发一次」：这里每条都是【绝对 CUP +
+ * 原样载荷】，发完宿主光标必然被挪到图片锚点（sixel 还会被带到图片末尾），而帧尾
+ * 那段光标才是权威状态 —— 见 render_screen 末尾。 */
+static int gfx_emit_outbox(void) {
+    int sent = 0;
     for (int k = 0; k < g_gfx_outn; k++) {
         char cup[32];
         int n = snprintf(cup, sizeof(cup), "\x1b[%d;%dH",
@@ -6113,8 +6152,25 @@ static void gfx_emit_outbox(void) {
             host_write(g_gfx_out[k].p, g_gfx_out[k].len);
         free(g_gfx_out[k].p);
         g_gfx_out[k].p = NULL; g_gfx_out[k].len = 0;
+        sent++;
     }
     g_gfx_outn = 0;
+    return sent;
+}
+
+/* v2.3.7：这个窗格来了输出，值不值得点一次重绘？
+ * 窗格读线程在【锁内】调它（与 render_screen 写 visible_now 同一把 g_mux.cs），
+ * 所以这里只读那几个字段，不去遍历分屏树 —— 树是主线程改的，读线程去走会撞车。
+ * 判据：
+ *   · 活动窗格永远算数（整屏路径、设置页、关于页都靠它）；
+ *   · 非活动窗格只有「上一帧确实画在宿主上」才算数（分屏里的其它可见窗格）。
+ *     以前只看 active_pane，于是分屏里后台窗格的输出永远不重绘，画面停到下一次
+ *     敲键/动鼠标为止（用户报「一边编译一边看另一格，那一格不动」）。 */
+int render_pane_should_wake(int pane) {
+    if (pane < 0 || pane >= g_mux.pane_count) return 0;
+    if (!g_mux.panes[pane].active) return 0;
+    if (pane == g_mux.active_pane) return 1;
+    return g_mux.panes[pane].visible_now != 0;
 }
 
 void render_screen(void) {
@@ -6140,6 +6196,10 @@ void render_screen(void) {
     for (int i = 0; i < MAX_PANES; i++) {
         g_cd_pane[i].valid = 0;
         g_mux.panes[i].gfx_paint_ok = 0;
+        /* v2.3.7：本帧「画没画这块窗格」逐帧重记，供读线程判断要不要点重绘
+         * （见 render_pane_should_wake）。不清的话上一帧的可见窗格会一直是 1，
+         * 切到别的标签页后后台窗格的输出仍会白白点重绘。 */
+        g_mux.panes[i].visible_now = 0;
     }
     if (g_mux.host_cols < 1 || g_mux.host_rows < 1 || g_mux.total_host_rows < 1) { LeaveCriticalSection(&g_mux.cs); return; }
     update_host_title();
@@ -6185,18 +6245,24 @@ void render_screen(void) {
             ScreenBuffer *s = &pane->screen;
             WORD la_attr = 0xFFFF, la_fr = 0, la_br = 0; int la_fv = -1, la_bv = -1;
             if (pane->scroll_offset < 0) pane->scroll_offset = 0;
+            /* v2.3.9：整屏路径也要摊开「会话恢复」的视图（分屏那条在 render_split_pane）。
+             * 恢复出来的历史现在是【历史行】而不是可见区的行，当前会话内容又常常不足一屏
+             * ⇒ h - rows 会是 0，不这样兜底的话 vo 被算成 0、历史一行都看不到。 */
+            if (pane->restore_view) {
+                int rw_a = g_mux.host_cols < s->cols ? g_mux.host_cols : s->cols;
+                int h_a = screen_reflow_height(s, rw_a);
+                int vo_a = h_a - s->rows - pane->rf_anchor;
+                if (vo_a < 0) vo_a = s->hist_lines > 0 ? s->hist_lines : 0;
+                int lim_a = screen_scroll_limit(s);
+                if (vo_a > lim_a) vo_a = lim_a;
+                pane->scroll_offset = vo_a;
+            }
             if (pane->scroll_offset > 0) {
                 /* 同 render_split_pane：v2.2.0 起这里不再有「拖动分屏期间不夹取」的特例 ——
                  * 那条特例是为了躲「模型宽度被冻结、limit 却按新宽度算」把用户翻上去的
                  * scroll_offset 永久夹小（症状「拖动分屏后历史翻不上去」）。现在节流挪到
                  * 布局那一侧，拖动中两侧同帧变化，limit 与显示宽度本来就是一致的。 */
-                int lim_sc = pane->scroll_offset;
-                {
-                    int rw = g_mux.host_cols < s->cols ? g_mux.host_cols : s->cols;
-                    int h = screen_reflow_height(s, rw);
-                    lim_sc = h - s->rows;
-                    if (lim_sc < 0) lim_sc = 0;
-                }
+                int lim_sc = screen_scroll_limit(s);
                 if (pane->scroll_offset > lim_sc) pane->scroll_offset = lim_sc;
             }
             int vo = pane->scroll_offset, rr = s->rows < g_mux.host_rows ? s->rows : g_mux.host_rows, rc = s->cols < g_mux.host_cols ? s->cols : g_mux.host_cols;
@@ -6207,6 +6273,7 @@ void render_screen(void) {
              * 整屏内容从宿主第 1 行（0 基）起、共 rr 行，见下面 CUP 用的 y + 2。 */
             pane->gfx_paint_row = 1; pane->gfx_paint_col = 0;
             pane->gfx_paint_rows = rr; pane->gfx_paint_ok = 1;
+            pane->visible_now = 1;   /* v2.3.7：整屏路径画的就是它 */
             int show_sb = render_sb_cols_ok(g_mux.host_cols, s->in_alt_screen);
             /* 与分屏路径同理：光标压在右缘列时，那一行不画滚动条轨道，
              * 否则刚敲的字被盖掉、看着像光标卡住。 */
@@ -6214,8 +6281,10 @@ void render_screen(void) {
                          ? render_sb_spare_row(s->cursor_visible, s->cursor_x, s->cursor_y, rc)
                          : -1;
             int sb_top = 0, sb_bot = 0;
+            int sb_hist = 0;   /* v2.3.7：有没有可回看的行；没有就不画滚动条 */
             if (show_sb) {
                 int hist = screen_scroll_limit(s);   /* 滚动条跨度 = 可回看的显示行数 */
+                sb_hist = hist > 0;
                 if (hist <= 0) {
                     sb_top = 0;
                     sb_bot = rr;
@@ -6236,6 +6305,7 @@ void render_screen(void) {
             }
             int text_rc = rc;
             int use_rf_ws = 0;
+            pane->session_cursor_row = -1;   /* 本帧网格重建时再填，防止留上一帧的值 */
             /* v1.8.52+：整屏（单窗格非分屏）回看历史原来直接按物理行取（y-vo），
              * 而 vo / 滚动上限 / 滚动条都按 reflow「非空显示行」计（screen_reflow_height
              * 空逻辑行不占位）。历史里夹着 CRLF 纯空白行时，两种口径不一致：物理口径
@@ -6243,18 +6313,28 @@ void render_screen(void) {
              * banner 永远上不来），画面钉在中途——分屏回看却没这个问题。这里与分屏
              * 一致：vo>0 回看整窗走 reflow 网格（同一坐标系、内容完整到底）。选区 /
              * 搜索高亮目前仍按物理坐标算，这些模态激活时退回物理渲染（与现状一致）。 */
-            if (vo > 0 && !s->in_alt_screen && s->line_wrap != NULL &&
+            if ((vo > 0 || pane->session_view || s->session_view) &&
+                (text_rc < s->cols || pane->session_view || s->session_view) &&
+                !s->in_alt_screen && s->line_wrap != NULL &&
                 !g_copy_mode && !g_mouse_selecting && !g_search_active) {
                 RGlyph *grid = (RGlyph *)pane->rf_grid;
+                /* v2.3.7：尺寸记账只能在【扩容真的成功】之后做。旧写法 realloc 失败
+                 * 仍把 rf_rows/rf_cols 改成新尺寸并调 screen_reflow_view —— 那是按新
+                 * 尺寸往旧（更小）的块里写，OOM 一步就从越界写变成花屏/崩溃。
+                 * 分屏那一支早就这么改了（见 render_split_pane 同段注释）。 */
                 if (pane->rf_rows != rr || pane->rf_cols != text_rc || !grid) {
                     RGlyph *ng = (RGlyph *)realloc(grid, (size_t)rr * (size_t)text_rc * sizeof(RGlyph));
-                    if (ng) grid = ng;
+                    if (ng) {
+                        grid = ng;
+                        pane->rf_grid = grid;
+                        pane->rf_rows = rr;
+                        pane->rf_cols = text_rc;
+                    } else {
+                        grid = NULL;      /* 这一帧退回物理行渲染，不动旧网格 */
+                    }
                 }
-                if (grid) {
-                    pane->rf_grid = grid;
-                    pane->rf_rows = rr;
-                    pane->rf_cols = text_rc;
-                    screen_reflow_view(s, vo, rr, text_rc, grid);
+                if (grid && pane->rf_rows == rr && pane->rf_cols == text_rc &&
+                    screen_reflow_view(s, vo, rr, text_rc, grid, &pane->session_cursor_row)) {
                     use_rf_ws = 1;
                 }
             }
@@ -6465,7 +6545,7 @@ void render_screen(void) {
                     pos += snprintf(out + pos, bs - pos, "\x1b[0m\x1b[K");
                 else
                     pos += snprintf(out + pos, bs - pos, "\x1b[0m");
-                if (show_sb && dist <= 10 && y != sb_spare) {
+                if (show_sb && sb_hist && dist <= 10 && y != sb_spare) {
                     /* 滚动条轨道画在最右列：先清行尾（上面已发 \x1b[K），再回到
                      * 最右列画 thumb / track。 */
                     pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH", y + 2, g_mux.host_cols);
@@ -6741,7 +6821,10 @@ void render_screen(void) {
         ScreenBuffer *s = &pane->screen;
         int vo = pane->scroll_offset;
         int cursor_row = 0, cursor_col = 0;
-        if (terminal_cursor_position(s, vo, g_mux.host_rows, g_mux.host_cols,
+        if (terminal_cursor_position(s, vo,
+                                     (pane->session_view || s->session_view) && !pane->is_split_child,
+                                     pane->session_cursor_row,
+                                     g_mux.host_rows, g_mux.host_cols,
                                      &cursor_row, &cursor_col)) {
             pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[?25h", cursor_row, cursor_col);
         } else {
@@ -6850,7 +6933,13 @@ void render_screen(void) {
         dump_delta_output(out, pos, (int)pos);
         host_write(out, pos);
     }
-    gfx_emit_outbox();   /* v2.3.6：本帧的图片序列跟在差分后面原样发给宿主 */
+    /* v2.3.7：图形序列必须是「帧体 → 图片 → 光标」这个顺序。
+     * 图片用绝对 CUP 定位、发完不归位（sixel 还会把光标带到图片末尾），而帧尾那段
+     * 光标是权威状态；先发图片再发光标，宿主的光标才会落在 shell 真正的位置上。
+     * 以前 gfx_emit_outbox() 放在最后且不补光标，于是每一帧图片之后光标都停在图片
+     * 锚点，要等下一次重绘才回来（分屏时甚至落进非活动窗格）。 */
+    if (gfx_emit_outbox() > 0 && cursor_len > 0)
+        host_write(out + cursor_pos, (int)cursor_len);
 }
 
 void render_cleanup(void) {

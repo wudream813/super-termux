@@ -114,6 +114,32 @@ void dump_render_output(const char *data, int len, int mcols, int mrows, int hco
     fclose(f);
 }
 
+/* v2.3.8 诊断：把【真正写给宿主控制台的每一个字节】按调用顺序记下来
+ * （TERMUX_HOSTTRACE=1）。render_dump.log 只记帧体，窗口标题那段 OSC
+ * （update_host_title）和图形直通（gfx_emit_outbox）都不在里面 —— 排查
+ * 「屏幕上闪出 ANSI 代码」时缺的正是这两处，以及「两个写者是否交错」。
+ * 每行一个 [w 序号 长度]，后面跟原始字节（转义写成 \\e 便于肉眼读）。
+ * 默认关闭：不设环境变量时一次判断就返回。 */
+void dump_host_write(int seq, const char *data, int len) {
+    static int on = -1;
+    if (on < 0) on = getenv("TERMUX_HOSTTRACE") ? 1 : 0;
+    if (!on || len <= 0) return;
+    FILE *f = fopen("hostwrite.log", "ab");
+    if (!f) return;
+    fprintf(f, "[w %d len %d] ", seq, len);
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)data[i];
+        if (c == 0x1B) fputs("\\e", f);
+        else if (c == '\\') fputs("\\\\", f);
+        else if (c == '\r') fputs("\\r", f);
+        else if (c == '\n') fputs("\\n", f);
+        else if (c < 0x20) fprintf(f, "\\x%02x", c);
+        else fputc((int)c, f);
+    }
+    fputc('\n', f);
+    fclose(f);
+}
+
 /* v1.8.15 诊断：实际通过帧差分发给宿主终端的增量字节（整帧 vs 增量对照）。
  * 仅在 TERMUX_DUMP 环境变量存在时写 render_delta.log，用于排查脏区渲染问题。 */
 void dump_delta_output(const char *data, int delta_len, int full_len) {

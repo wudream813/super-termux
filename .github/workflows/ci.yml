@@ -88,6 +88,18 @@ jobs:
         #   以及 resize 之后历史还在 —— 后者正是最初那个丢历史 bug 的老家。
         run: python tests/win_smoke.py
 
+      - name: Windows 真控制台冒烟测试（读屏 / 敲键）
+        # ★ conpty_drive 在没有交互控制台的 runner 上会让子 shell 绑到宿主控制台
+        #   （上面那一步里有一半断言只能 SKIP）。这一步换一条路：给 termux.exe
+        #   一个自己的真控制台（CreateProcess(CREATE_NO_WINDOW) + AttachConsole +
+        #   ReadConsoleOutputW / WriteConsoleInputW），走的正是用户双击 exe 的路径，
+        #   CI 上能跑成硬断言：
+        #     · 图片转发之后宿主光标停在提示符末尾（v2.3.7 修的渲染缺陷）
+        #     · 分屏里非活动窗格的后台输出在无输入时继续刷新（v2.3.7 修的另一条）
+        #     · 帮助页 / 搜索框 / 命令面板 -> 关于页 / 设置页
+        #   拿不到控制台的环境会显式 SKIP 并打印原因（不会静默通过）。
+        run: python tests/win_console_smoke.py
+
       - uses: actions/upload-artifact@v4
         with:
           name: termux-windows
