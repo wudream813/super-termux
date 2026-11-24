@@ -2730,27 +2730,31 @@ int main(int argc, char **argv) {
             shutil.rmtree(td_fz, ignore_errors=True)
 
         # v2.4.1：恢复时按档里【记的命令】重建窗格（以前一律用默认 shell ⇒ PowerShell 一恢复
-        # 就变 cmd.exe）。造一份两格不同 shell 的档，看它起得对不对、再存回去会不会丢。
+        # 就变 cmd.exe）。造一份左右两格不同 shell 的档，两格都在屏上，各自 echo $0 打出来。
+        # 用分屏而不用两个 tab：切 tab 会把前一格的输出从屏上换掉，就量不到两格了。
         td_sh = sess_mkdir(SESS_INI_ON)
         try:
             with open(os.path.join(td_sh, "termux.session"), "w", encoding="utf-8") as f:
                 f.write("s 2\nu 1795490000\n"
-                        "T 0 p\nP 1 /bin/bash\nD BASHSEED61\n"
-                        "T 0 p\nP 0 /bin/sh\nD SHSEED62\n")
-            d3, ex3 = sess_run(td_sh, ROWS_C, COLS_C, [b"echo SHELLMARK63 $0\r"])
+                        "T 0 v50pp\nP 1 /bin/bash\nD BASHSEED61\n"
+                        "P 0 /bin/sh\nD SHSEED62\n")
+            d3, ex3 = sess_run(td_sh, ROWS_C, COLS_C,
+                               [b"echo SHELLMARK63 $0\r", b"\x02\t",
+                                b"echo SHELLMARK64 $0\r"])
             scr3 = vt_text(ROWS_C, COLS_C, d3) or []
             blob3 = "\n".join(scr3)
-            # 第二个 tab 不在屏上（只画活动 tab）⇒ 它的内容到 T2f2 里从档上验。
-            ck("T2f v2.4.1：档里记了哪条命令，恢复就起哪条 —— 标题栏两格分别是 bash / sh，"
-               "聚焦那格（P 1）里 echo $0 打出 /bin/bash",
-               ex3 and "BASHSEED61" in blob3
-               and "[bash" in blob3 and "[sh" in blob3 and "/bin/bash" in blob3,
-               "屏=%r" % (scr3[:5],))
+            # rA_ck：屏幕级判据在没有 libvterm 的机器上（CI 的 macOS runner）降级成 SKIP。
+            rA_ck("T2f v2.4.1：档里记了哪条命令，恢复就起哪条 —— 左格是 /bin/bash、右格是 /bin/sh，"
+               "两格里 echo $0 各打各的（旧代码两格都会是默认 shell）",
+               ex3 and "SHELLMARK63 /bin/bash" in blob3 and "SHELLMARK64 /bin/sh" in blob3
+               and "BASHSEED61" in blob3 and "SHSEED62" in blob3,
+               "屏=%r" % (scr3[:8],))
             sh2 = sess_read(td_sh) or ""
-            ck("T2f2 v2.4.1：命令行在往返里不丢 —— 再存一次仍是 `1 /bin/bash` 与 `0 /bin/sh`，"
+            psh = [x[2:].split(" ", 1)[1] if " " in x[2:] else ""
+                   for x in sh2.splitlines() if x.startswith("P ")]
+            ck("T2f2 v2.4.1：命令行在往返里不丢 —— 再存一次两格仍是 /bin/bash 与 /bin/sh，"
                "两格的历史也都还在",
-               [x[2:] for x in sh2.splitlines() if x.startswith("P ")]
-               == ["1 /bin/bash", "0 /bin/sh"]
+               psh == ["/bin/bash", "/bin/sh"]
                and "D BASHSEED61" in sh2 and "D SHSEED62" in sh2,
                "P 行=%r" % ([x for x in sh2.splitlines() if x.startswith("P ")],))
         finally:
