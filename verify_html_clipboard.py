@@ -63,8 +63,8 @@ static void test_offsets(void) {
     long sf = hdr_field(b.data, "StartFragment:");
     long ef = hdr_field(b.data, "EndFragment:");
     CHECK(sh >= 0 && eh > sh && sf >= sh && ef > sf && (size_t)eh == b.len,
-          "offsets out of range: sh=%ld eh=%ld sf=%ld ef=%ld len=%zu",
-          sh, eh, sf, ef, b.len);
+          "offsets out of range: sh=%ld eh=%ld sf=%ld ef=%ld len=%llu",
+          sh, eh, sf, ef, (unsigned long long)b.len);
     CHECK(strncmp(b.data + sf, "<!--StartFragment-->", 20) == 0,
           "StartFragment does not point at fragment marker");
     CHECK(strncmp(b.data + ef, "<!--EndFragment-->", 18) == 0,

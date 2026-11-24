@@ -472,7 +472,8 @@ int screen_prepend_history_text(ScreenBuffer *s, const char *data, int len) {
         int sp = screen_phys_row(&t, src_row);
         if (sp >= 0 && sp < t.total_lines && t.lines[sp].cells)
             line_copy(&s->lines[pr], &t.lines[sp], cols);
-        if (s->line_wrap) s->line_wrap[pr] = 0;   /* 历史行不是续行 */
+        /* 快照按逻辑行保存；恢复时窄窗折出的续行也必须保留其标记。 */
+        if (s->line_wrap) s->line_wrap[pr] = (k > 0 && t.line_wrap) ? t.line_wrap[sp] : 0;
         added++;
     }
     s->hist_lines += added;

@@ -966,10 +966,7 @@ static void sess_notice(const char *msg) {
     if (ai < 0 || ai >= g_mux.pane_count) return;
     SBuf b;
     memset(&b, 0, sizeof(b));
-    /* 两头都要换行：此刻游标正停在 shell 已经打出来的那行提示符后面，贴着它写 ⇒ 这行
-     * 从第二列才开始，存盘时「按前缀剔掉说明行」那条判据就抓不到它（实测会被当历史
-     * 存下去，于是下一轮又多一行）。先 \r\n 起新行、写完再 \r\n 让提示符回到新行。 */
-    sbuf_str(&b, "\r\n");
+    /* 独立的历史块从列首开始，不要在提示前插入空行。 */
     sbuf_str(&b, msg);
     sbuf_str(&b, "\r\n");
     sess_feed(&g_mux.panes[ai], &b, 0);

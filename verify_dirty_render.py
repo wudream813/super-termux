@@ -95,7 +95,7 @@ static void test_basic(void) {
     { size_t _n = framediff_emit(&fd, out, sizeof(out)); out[_n] = 0; }
     CHECK(strstr(out, osc) != NULL, "OSC must still emit on unchanged frame");
     CHECK(strstr(out, "hello") == NULL,
-          "unchanged rows must NOT be emitted, but found row text (n2=%zu)", n2);
+          "unchanged rows must NOT be emitted, but found row text (n2=%llu)", (unsigned long long)n2);
 
     /* 帧 3：只改第 2 行。 */
     char f3[1024];
