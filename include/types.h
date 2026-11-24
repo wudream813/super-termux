@@ -171,6 +171,9 @@ typedef struct {
     ScreenBuffer screen;
     char title[64];
     char full_title[256];
+    WCHAR shell_cmd[256];    /* v2.4.1：这块窗格是用【哪条命令】起来的。存盘时写进 P 记录、
+                              * 恢复时按它重建 —— 以前一律用默认 shell（Windows = cmd.exe），
+                              * 用户在 PowerShell 里分屏、退出再进来就全变回 cmd。 */
     int scroll_offset;
     int gfx_paint_row, gfx_paint_col, gfx_paint_rows, gfx_paint_ok;   /* v2.3.6：本帧这块窗格
                                                                           * 画在宿主的哪个矩形 */

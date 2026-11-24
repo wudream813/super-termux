@@ -2691,16 +2691,70 @@ int main(int argc, char **argv) {
            and sum(1 for x in left1 if x.endswith("中文测试甲")) == 2
            and not any("中 文" in x or "文 测" in x or "试 甲" in x for x in dlines),
            "左格=%r" % (left1,))
+        # v2.4.1：P 记录尾巴上多了「这片窗格当时用哪条命令起来的」⇒ 这里只比 focus 那一位
+        plines = [x for x in r1 if x.startswith("P ")]
+        pflag = [x[2:].split(" ")[0] for x in plines]
+        pshell = [x[2:].split(" ", 1)[1] if " " in x[2:] else "" for x in plines]
         ck("T2c 焦点跟着走：保存时聚焦的是分屏后【新建的那个】（右）窗格；两个 needle 各在各的"
            "窗格里、没有互相漏进去",
-           [x[2:] for x in r1 if x.startswith("P ")] == ["0", "1"]
+           pflag == ["0", "1"]
            and "LEFTSEED41" not in " ".join(right1) and "RIGHTSEED42" not in " ".join(left1),
-           "P 行=%r 左=%r 右=%r" % ([x for x in r1 if x.startswith("P ")], left1, right1))
+           "P 行=%r 左=%r 右=%r" % (plines, left1, right1))
+        ck("T2c2 v2.4.1（用户报「没有保存运行的程序，PowerShell 变成 cmd」）：P 记录里带着"
+           "「这片窗格用哪条命令起的」—— 这两格都是这次会话的 $SHELL（分屏继承当前窗格的命令），"
+           "既不是空、也不是写死的 cmd.exe",
+           pshell == ["/bin/sh", "/bin/sh"],
+           "P 行=%r" % (plines,))
         ck("T2d 单条逻辑行不越 8000 字节、文件不越 6MB（越界就是静默截断，截断必须看得穿）",
            all(len(x.encode("utf-8")) <= 8000 for x in dlines)
            and len(txt.encode("utf-8")) < 6 * 1024 * 1024,
            "最长行=%d 文件=%d" % (max([len(x.encode("utf-8")) for x in dlines] or [0]),
                                   len(txt.encode("utf-8"))))
+
+        # v2.4.1（用户报「分屏没保存」）：先关掉一个标签页、再在剩下那个上分屏。
+        # 旧代码的「只留更富的一份」在【正常运行】时也生效 —— 关 tab 那一刻采的那份 tab 更多，
+        # 之后的分屏永远被判成「更穷」而不替换，退出写下去的仍是分屏前那一版。
+        td_fz = sess_mkdir(SESS_INI_ON)
+        try:
+            sess_run(td_fz, ROWS_C, COLS_C,
+                     [b"echo FREEZE51\r", b"\x02c", b"echo FREEZE52\r",
+                      b"\x02x", b"\x02-", b"echo FREEZE53\r"])
+            fz = sess_read(td_fz) or ""
+            trecs = [x[2:] for x in fz.splitlines() if x.startswith("T ")]
+            ck("T2e v2.4.1：关掉一个标签页之后再分屏 ⇒ 退出写下去的必须是【带分屏的那一版】"
+               "（1 个 tab、树 v50pp、2 片叶子；旧代码写的是关 tab 前那两个单窗格 tab）",
+               len(trecs) == 1 and trecs[0].endswith(" v50pp")
+               and len([x for x in fz.splitlines() if x.startswith("P ")]) == 2,
+               "T 记录=%r" % (trecs,))
+        finally:
+            shutil.rmtree(td_fz, ignore_errors=True)
+
+        # v2.4.1：恢复时按档里【记的命令】重建窗格（以前一律用默认 shell ⇒ PowerShell 一恢复
+        # 就变 cmd.exe）。造一份两格不同 shell 的档，看它起得对不对、再存回去会不会丢。
+        td_sh = sess_mkdir(SESS_INI_ON)
+        try:
+            with open(os.path.join(td_sh, "termux.session"), "w", encoding="utf-8") as f:
+                f.write("s 2\nu 1795490000\n"
+                        "T 0 p\nP 1 /bin/bash\nD BASHSEED61\n"
+                        "T 0 p\nP 0 /bin/sh\nD SHSEED62\n")
+            d3, ex3 = sess_run(td_sh, ROWS_C, COLS_C, [b"echo SHELLMARK63 $0\r"])
+            scr3 = vt_text(ROWS_C, COLS_C, d3) or []
+            blob3 = "\n".join(scr3)
+            # 第二个 tab 不在屏上（只画活动 tab）⇒ 它的内容到 T2f2 里从档上验。
+            ck("T2f v2.4.1：档里记了哪条命令，恢复就起哪条 —— 标题栏两格分别是 bash / sh，"
+               "聚焦那格（P 1）里 echo $0 打出 /bin/bash",
+               ex3 and "BASHSEED61" in blob3
+               and "[bash" in blob3 and "[sh" in blob3 and "/bin/bash" in blob3,
+               "屏=%r" % (scr3[:5],))
+            sh2 = sess_read(td_sh) or ""
+            ck("T2f2 v2.4.1：命令行在往返里不丢 —— 再存一次仍是 `1 /bin/bash` 与 `0 /bin/sh`，"
+               "两格的历史也都还在",
+               [x[2:] for x in sh2.splitlines() if x.startswith("P ")]
+               == ["1 /bin/bash", "0 /bin/sh"]
+               and "D BASHSEED61" in sh2 and "D SHSEED62" in sh2,
+               "P 行=%r" % ([x for x in sh2.splitlines() if x.startswith("P ")],))
+        finally:
+            shutil.rmtree(td_sh, ignore_errors=True)
 
         d2, ex2 = sess_run(td, ROWS_C, COLS_C, [b"echo AFTERFOCUS\r"])
         scr2 = vt_text(ROWS_C, COLS_C, d2) or []

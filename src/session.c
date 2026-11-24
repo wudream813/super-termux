@@ -568,7 +568,23 @@ static int sess_render(SBuf *b, int *leaves) {   /* b 必须是调用方新清�
         sbuf_str(b, "\n");
         for (int k = 0; k < nl; k++) {
             sbuf_str(b, "P ");
-            sbuf_fmt(b, "%d\n", (k == focus) ? 1 : 0);
+            sbuf_fmt(b, "%d", (k == focus) ? 1 : 0);
+            /* v2.4.1：P 记录尾巴上带这一格【是用哪条命令起来的】。旧档只有 focus 一位，
+             * 老代码读新档也只看第一位 ⇒ 两边都不破。命令行里不许有控制字符（记录是
+             * 一行一条，\n 会把格式拆了），写成空格。 */
+            if (lvs[k] >= 0 && lvs[k] < g_mux.pane_count &&
+                g_mux.panes[lvs[k]].shell_cmd[0]) {
+                char sh8[512];
+                int sn = WideCharToMultiByte(CP_UTF8, 0, g_mux.panes[lvs[k]].shell_cmd, -1,
+                                             sh8, (int)sizeof(sh8) - 1, NULL, NULL);
+                if (sn > 1) {
+                    for (int q = 0; q < sn - 1; q++)
+                        if ((unsigned char)sh8[q] < 0x20) sh8[q] = ' ';
+                    sbuf_str(b, " ");
+                    sbuf_str(b, sh8);
+                }
+            }
+            sbuf_str(b, "\n");
             if (lvs[k] >= 0 && lvs[k] < g_mux.pane_count)
                 sess_write_pane(&g_mux.panes[lvs[k]].screen, b);
         }
@@ -587,6 +603,7 @@ static int g_sess_keep_leaves;
 static int g_sess_suppress;        /* 恢复期间别顺手把半成品记进 keep */
 static int g_sess_exit_flush;      /* 退出路径上已经存过 ⇒ 钩子那一次不再写盘 */
 static int g_sess_flushing;        /* 落盘正在进行 ⇒ 不许重入（信号打在落盘中间） */
+static int g_sess_teardown;        /* v2.4.1：退出快照已经采过 ⇒ 之后只留「更富」的那份 */
 
 /* 先数一遍「现在有几个 tab、几个窗格」（只看结构，不碰文本），便宜到可以每次调用都做。
  * 作用是给下面的采集把关：主循环退出时是【一个窗格一个窗格关过来】的，每次都全量
@@ -609,9 +626,18 @@ static void sess_count_live(int *tabs, int *leaves) {
     }
 }
 
-void session_note_now(void) {
+static void sess_note(int from_flush) {
     if (!g_session_persist || g_sess_suppress) return;
-    if (g_sess_keep.p) {
+    /* 退出落盘正在进行：别的线程（ConPTY 读线程收到 EOF 就会走 pane_mark_dead → 这里）
+     * 别再来抢 g_mux.cs —— 它们采到的也是同一份东西，抢起来只会把「等锁」那点时间耗光，
+     * 于是退出路径两手空空（v2.4.1，见 session_flush_now 里那段注释）。 */
+    if (g_sess_flushing && !from_flush) return;
+    /* v2.4.1：「只留更富的一份」这条只在【退出流程】里成立 —— 主循环退出时窗格是一个
+     * 一个关掉的，后一次采集只会更少。以前它一直生效：用户先关掉一个标签页（那份快照
+     * tab 更多）、再分屏，之后无论怎么分屏都被判成「更穷」而不替换，退出写下去的仍是
+     * 分屏前那一版（用户报「分屏没保存」）。正常运行时每次都采当下这一份。 */
+    int tearing = g_sess_teardown;
+    if (tearing && g_sess_keep.p) {
         int tabs, leaves;
         EnterCriticalSection(&g_mux.cs);
         sess_count_live(&tabs, &leaves);
@@ -624,13 +650,15 @@ void session_note_now(void) {
     int tabs = sess_render(&b, &nl);
     if (tabs < 1 || b.len <= 0 || !b.p) { free(b.p); return; }
     /* 「更富」= tab 数不少、字节数不少（同分时新的一份赢：还活着的窗格可能又多打了几百行）。 */
-    if (g_sess_keep.p &&
+    if (tearing && g_sess_keep.p &&
         (tabs < g_sess_keep_tabs || b.len < g_sess_keep.len)) { free(b.p); return; }
     free(g_sess_keep.p);
     g_sess_keep = b;
     g_sess_keep_tabs = tabs;
     g_sess_keep_leaves = nl;
 }
+
+void session_note_now(void) { sess_note(0); }
 
 /* 把内存里那份快照写出去（一次 f*open + 一次 fwrite ⇒ 「退出只写一次盘」这条口径
  * 就看这一支被调用几次）。落盘后 free 掉，所以第二次调用没有东西可写。 */
@@ -672,7 +700,11 @@ int session_save(void) {
     session_pump_pending_all();   /* v2.3.4：挂着的快照先落地再采集，否则「恢复了但没来得及
                                      * 显示」的那一段会在这一轮存盘时凭空消失 */
     session_note_now();      /* 窗格还活着的话此刻再采一次（多半已是同一份） */
-    return sess_write_keep();
+    int ok = sess_write_keep();
+    /* v2.4.1：这次退出已经采过一份了 —— 接下来 main 里那句 for(...) close_pane(i) 会一个
+     * 一个窗格地触发采集，那时只保留「更富」的那份（见 sess_note）。 */
+    g_sess_teardown = 1;
+    return ok;
 }
 
 /* v2.3.1：给「进程马上就没了」的场合用 —— Windows 的控制台关闭事件、POSIX 的
@@ -692,7 +724,14 @@ int session_flush_now(int for_exit_path) {
     if (!g_session_persist || g_sess_flushing) return 0;
     g_sess_flushing = 1;
     int locked = 0;
-    for (int t = 0; t < 200 && !locked; t++) {
+    /* v2.4.1：退出路径给到 ~2 秒（1000 × 2ms）。CTRL_CLOSE_EVENT 系统一共只给 5 秒，
+     * 死等 = 一次盘都不落；可 400ms 又常常不够 —— 关窗口那一刻 ConPTY 的读线程正在
+     * 收尾（EOF → pane_mark_dead → 采集，全都要这把锁），等不到就用「上一次采集的那份」
+     * 落盘，而正常运行时那份多半还是 NULL ⇒ 一个字节都没写下去，盘上留着的是上一轮的
+     * 旧档（用户看到的就是「分屏没保存」「程序也没保存」）。现在：等锁期间别的线程不再
+     * 抢（sess_note 里那句 g_sess_flushing），等得也久一点。 */
+    int tries = for_exit_path ? 1000 : 200;
+    for (int t = 0; t < tries && !locked; t++) {
         if (TryEnterCriticalSection(&g_mux.cs)) locked = 1;
         else Sleep(2);
     }
@@ -705,10 +744,13 @@ int session_flush_now(int for_exit_path) {
          * 违反了这条。拿不到锁就照旧用上一次采集的那份落盘（宁少不错）。 */
         session_pump_pending_all();      /* 持锁调用：里面的 sess_apply 重入同一把锁，安全 */
         LeaveCriticalSection(&g_mux.cs);
-        session_note_now();              /* 它自己会拿锁（可重入），这里先明着放掉 */
+        sess_note(1);                    /* 它自己会拿锁（可重入），这里先明着放掉 */
     }
     int ok = sess_write_keep();
-    if (ok && for_exit_path) g_sess_exit_flush = 1;
+    if (ok && for_exit_path) {
+        g_sess_exit_flush = 1;
+        g_sess_teardown = 1;             /* 之后若还有窗格被关掉，只留更富的那份 */
+    }
     g_sess_flushing = 0;
     return ok;
 }
@@ -749,9 +791,23 @@ static int sess_tree_count(const char **pp, int depth, int budget) {
     return a + b;
 }
 
-/* 按树把 node（当前持有 cur_pane 的叶子）展开；新建出来的窗格依次记进 leaves[]。 */
+/* 按树把 node（当前持有 cur_pane 的叶子）展开；新建出来的窗格依次记进 leaves[]。
+ * v2.4.1：shells[] 是这一 tab 各叶子在档里记下的命令行（按 P 记录顺序），第 li 片
+ * 新建的窗格就用 shells[li] 起进程 —— 以前这里一律 sess_default_shell()，
+ * 于是 PowerShell 的窗格一恢复就变回 cmd.exe（用户报「没有保存运行的程序」）。 */
+static int sess_leaf_shell(WCHAR *out, int cells, WCHAR (*shells)[256], int nshells, int idx) {
+    out[0] = 0;
+    if (shells && idx >= 0 && idx < nshells && shells[idx][0]) {
+        int i = 0;
+        while (shells[idx][i] && i < cells - 1) { out[i] = shells[idx][i]; i++; }
+        out[i] = 0;
+        return 1;
+    }
+    return sess_default_shell(out, cells);
+}
+
 static int sess_expand(int node, int cur_pane, const char **pp, int *leaves, int *nl,
-                       SplitNode *nd) {
+                       SplitNode *nd, WCHAR (*shells)[256], int nshells) {
     char c = **pp;
     if (c == 'p') {
         (*pp)++;
@@ -765,16 +821,22 @@ static int sess_expand(int node, int cur_pane, const char **pp, int *leaves, int
     while (**pp >= '0' && **pp <= '9') { pct = pct * 10 + (**pp - '0'); (*pp)++; any = 1; }
     if (!any || pct < 5 || pct > 95) return 0;
     if (g_mux.pane_count >= MAX_PANES) return 0;
+    /* 新窗格是右子树那一片：左子树先占 leaves[] 的前 na 个位置 ⇒ 它是第 *nl+na 片。
+     * 得先数出来（纯解析、不建窗格），不然建进程时还不知道该用哪条命令。 */
+    const char *chk = *pp;
+    int na = sess_tree_count(&chk, 0, MAX_PANES);
+    if (na <= 0) return 0;
     WCHAR sh[256];
     memset(sh, 0, sizeof(sh));
-    if (!sess_default_shell(sh, (int)(sizeof(sh) / sizeof(sh[0])))) return 0;
+    if (!sess_leaf_shell(sh, (int)(sizeof(sh) / sizeof(sh[0])), shells, nshells, *nl + na))
+        return 0;
     int np = create_pane_shell(sh);
     if (np < 0) return 0;
     if (split_do(node, (c == 'v') ? SPLIT_V : SPLIT_H, np) < 0) { close_pane(np); return 0; }
     g_mux.panes[np].is_split_child = 1;
     nd[node].frac_pct = pct;
-    if (!sess_expand(nd[node].a, cur_pane, pp, leaves, nl, nd)) return 0;
-    if (!sess_expand(nd[node].b, np, pp, leaves, nl, nd)) return 0;
+    if (!sess_expand(nd[node].a, cur_pane, pp, leaves, nl, nd, shells, nshells)) return 0;
+    if (!sess_expand(nd[node].b, np, pp, leaves, nl, nd, shells, nshells)) return 0;
     return 1;
 }
 
@@ -973,29 +1035,100 @@ static void sess_notice(const char *msg) {
     free(b.p);
 }
 
-int session_restore(void) {
-    if (!g_session_persist) return 0;
+/* P 记录：`P <focus>[ <命令行 UTF-8>]`。focus 只占 0/1 一位；v2.4.1 起后面可以跟「这片
+ * 窗格当时是用哪条命令起来的」（旧档没有这一段 ⇒ 返回 0，调用方退回默认 shell；
+ * 老代码读新档也只看第一位 ⇒ 两边都不破）。 */
+static int sess_p_shell(const char *body, WCHAR *out, int cells) {
+    out[0] = 0;
+    if (!body) return 0;
+    const char *s = body;
+    if (*s == '0' || *s == '1') s++;
+    if (*s == ' ') s++;
+    if (!*s) return 0;
+    if (!MultiByteToWideChar(CP_UTF8, 0, s, -1, out, cells - 1)) { out[0] = 0; return 0; }
+    return 1;
+}
 
+/* 把某个 tab 的 T 记录之后、下一 tab 之前的 P 记录按顺序收进 shells[]（每片叶子一条）。
+ * 只走记录、不建窗格：建窗格必须等树校验通过之后（老规矩：先验再动手）。 */
+static int sess_scan_shells(SRec *recs, int nrec, int from, WCHAR shells[][256], int maxn) {
+    int n = 0, i = from;
+    while (i < nrec && n < maxn) {
+        if (recs[i].type != 'P') break;
+        sess_p_shell(recs[i].body, shells[n], 256);
+        n++;
+        i++;
+        while (i < nrec && recs[i].type == 'D') i++;
+    }
+    return n;
+}
+
+/* 打开「最新那份」快照并切成记录。返回 1 = 读到了（*raw / *recs 归调用方释放）；
+ * why 回填 1 = 一份快照都没有、2 = 有但读不认（session_restore 拿它决定提示语）。 */
+static int sess_open_latest(SRec **recs, int *nrec, char **raw, int *why) {
+    *recs = NULL; *raw = NULL; *nrec = 0;
     WCHAR path[MAX_PATH] = { 0 };
     /* v2.3.2：不再只认 exe 旁那个固定名字 —— 目录里所有 *.session 与主目录那份一起
      * 比时间，取最新的（换了 exe 文件名就等于换了快照目录，上一版栽在这上面）。 */
     int have = sess_pick_newest(path, MAX_PATH);
+    if (why) *why = have ? 2 : 1;                 /* 1 = 一份快照都没有；2 = 有但读不认 */
     FILE *f = have ? _wfopen(path, L"rb") : NULL;
-    int why = have ? 2 : 1;                       /* 1 = 一份快照都没有；2 = 有但读不认 */
-    if (!f) {
-        sess_notice(why == 1 ? SESS_NOTE_NONE : SESS_NOTE_BAD);
-        return 0;
-    }
+    if (!f) return 0;
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > SESS_MAX_BYTES) { fclose(f); sess_notice(SESS_NOTE_BAD); return 0; }
-    char *raw = (char *)malloc((size_t)sz + 1);
-    if (!raw) { fclose(f); sess_notice(SESS_NOTE_BAD); return 0; }
-    size_t rd = fread(raw, 1, (size_t)sz, f);
+    if (sz <= 0 || sz > SESS_MAX_BYTES) { fclose(f); return 0; }
+    char *r = (char *)malloc((size_t)sz + 1);
+    if (!r) { fclose(f); return 0; }
+    size_t rd = fread(r, 1, (size_t)sz, f);
     fclose(f);
-    raw[rd] = 0;
-    if (rd == 0) { free(raw); sess_notice(SESS_NOTE_BAD); return 0; }
+    r[rd] = 0;
+    if (rd == 0) { free(r); return 0; }
+    SRec *rr = NULL;
+    int n = sess_index_lines(r, &rr);
+    if (n < 1 || !rr) { free(rr); free(r); return 0; }
+    *raw = r; *recs = rr; *nrec = n;
+    return 1;
+}
+
+/* v2.4.1：启动时主程序先建好第一块窗格再 session_restore()，可 tab 0 的第一片叶子
+ * 该用哪条命令只有档里知道。这一支只读不建：把「第一块窗格该用的命令」问出来，
+ * 好让 main 那一句 create_pane() 直接起对 shell（否则 PowerShell 一恢复就变 cmd.exe，
+ * 用户报的就是这个）。没有档 / 档读不认 / 档里没记命令 ⇒ 返回 0，调用方用默认 shell。 */
+int session_probe_first_shell(WCHAR *out, int cells) {
+    out[0] = 0;
+    if (!g_session_persist) return 0;
+    SRec *recs = NULL;
+    char *raw = NULL;
+    int nrec = 0, why = 0, got = 0;
+    if (!sess_open_latest(&recs, &nrec, &raw, &why)) return 0;
+    for (int i = 0; i < nrec && !got; i++) {
+        if (recs[i].type != 'T') continue;
+        const char *tk = recs[i].body;
+        while (*tk >= '0' && *tk <= '9') tk++;
+        while (*tk == ' ') tk++;
+        const char *chk = tk;
+        if (sess_tree_count(&chk, 0, MAX_PANES) < 1 || *chk) continue;  /* 坏树：restore 也不要它 */
+        for (int j = i + 1; j < nrec; j++) {
+            if (recs[j].type == 'T') break;
+            if (recs[j].type == 'P') { got = sess_p_shell(recs[j].body, out, cells); break; }
+        }
+    }
+    free(recs);
+    free(raw);
+    return got;
+}
+
+int session_restore(void) {
+    if (!g_session_persist) return 0;
+
+    char *raw = NULL;
+    SRec *recs = NULL;
+    int nrec = 0, why = 0;
+    if (!sess_open_latest(&recs, &nrec, &raw, &why)) {
+        sess_notice(why == 1 ? SESS_NOTE_NONE : SESS_NOTE_BAD);
+        return 0;
+    }
 
     /* 从现在起会动窗格（建 tab / 失败回滚都走 close_pane）⇒ 这段时间不许采集，
      * 免得把「恢复到一半」当成一份快照存下去。suppress 必须和这里的每一条 return
@@ -1003,10 +1136,11 @@ int session_restore(void) {
      * 结果「本次没有快照」就把标志永久卡住，退出时的采集全被吞掉（实测存不出文件）。 */
     g_sess_suppress = 1;
     /* 声明必须全部排在第一条 goto 之前：跳进作用域会绕过初始化（gcc 的
-     * -Wmaybe-uninitialized 就是抓这个的），done: 里读到的是栈垃圾。 */
-    SRec *recs = NULL;
-    int nrec = 0, ri = 0, tabs = 0, focus_pane = -1, ver_esc = 0;
-    nrec = sess_index_lines(raw, &recs);
+     * -Wmaybe-uninitialized 就是抓这个的），done: 里读到的是栈垃圾。
+     * raw / recs / nrec 由上面 sess_open_latest() 交过来，这里不能再声明一遍。 */
+    int ri = 0, tabs = 0, focus_pane = -1, ver_esc = 0;
+    WCHAR shbuf[MAX_PANES][256];      /* v2.4.1：这个 tab 各叶子在档里记下的命令行 */
+    int nsh = 0;
     if (nrec < 1 || !recs) goto done;
     /* 版本：只认 1（纯文本）与 2（带 ANSI 转义）。老档照样恢复，只是没有颜色、
      * 而且正文里的反斜杠不能当转义引导符看。认不出的版本 ⇒ 整档不认。 */
@@ -1024,6 +1158,9 @@ int session_restore(void) {
         const char *chk = tk;
         if (sess_tree_count(&chk, 0, MAX_PANES) < 1 || *chk) { ri++; continue; }  /* 树坏了：这个 tab 不要 */
         ri++;
+        /* v2.4.1：树验过了才看 P 记录 —— 按叶子顺序把每片「当时用哪条命令」收好，
+         * 下面建窗格时逐片对上号。坏树直接 continue，P 记录跟着一起跳过。 */
+        nsh = sess_scan_shells(recs, nrec, ri, shbuf, MAX_PANES);
 
         int anchor;
         if (tabs == 0) {
@@ -1036,7 +1173,7 @@ int session_restore(void) {
             if (g_mux.pane_count >= MAX_PANES) goto done;
             WCHAR sh[256];
             memset(sh, 0, sizeof(sh));
-            if (!sess_default_shell(sh, (int)(sizeof(sh) / sizeof(sh[0])))) goto done;
+            if (!sess_leaf_shell(sh, (int)(sizeof(sh) / sizeof(sh[0])), shbuf, nsh, 0)) goto done;
             anchor = create_pane_shell(sh);
             if (anchor < 0) goto done;
             split_init_tab(anchor);
@@ -1048,7 +1185,7 @@ int session_restore(void) {
         int leaves[MAX_PANES];
         int nl = 0;
         const char *tc = tk;
-        if (!sess_expand(root, anchor, &tc, leaves, &nl, split_nodes()) || nl < 1) goto done;
+        if (!sess_expand(root, anchor, &tc, leaves, &nl, split_nodes(), shbuf, nsh) || nl < 1) goto done;
 
         for (int k = 0; k < nl && ri < nrec; k++) {
             int flag = 0;

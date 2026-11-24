@@ -3415,13 +3415,28 @@ void action_execute(int action, int arg, DWORD ctrl) {
             Pane *cur = &g_mux.panes[g_mux.active_pane];
             WCHAR wdir[256] = {0};
             (void)cur;
+            /* v2.4.1：新窗格【继承当前窗格的命令行】。以前这里一律用默认 shell
+             * （Windows = cmd.exe）⇒ 在 PowerShell 里一分屏，右边就是 cmd，退出再进来
+             * 两边都变 cmd（用户报「没有保存运行的程序」）。当前窗格没记命令（老进程、
+             * 设置页之类）才退回默认 shell。 */
+            WCHAR wsh[256] = {0};
+            if (cur->shell_cmd[0]) {
+                int qi = 0;
+                while (cur->shell_cmd[qi] && qi < 255) { wsh[qi] = cur->shell_cmd[qi]; qi++; }
+                wsh[qi] = 0;
+            }
+            int np;
+            if (wsh[0]) {
+                np = create_pane_shell_with_dir(wsh, wdir[0] ? wdir : NULL);
+            } else {
 #ifdef _WIN32
-            int np = create_pane_shell_with_dir(TERMUX_DEFAULT_SHELL_W, wdir[0] ? wdir : NULL);
+                np = create_pane_shell_with_dir(TERMUX_DEFAULT_SHELL_W, wdir[0] ? wdir : NULL);
 #else
-            /* POSIX：分屏出来的新窗格跟第一个窗格一样用 $SHELL，而不是写死
-             * /bin/sh —— 否则用户配了 zsh，一分屏就掉回 sh。 */
-            int np = create_pane_shell_with_dir(plat_default_shell(), wdir[0] ? wdir : NULL);
+                /* POSIX：分屏出来的新窗格跟第一个窗格一样用 $SHELL，而不是写死
+                 * /bin/sh —— 否则用户配了 zsh，一分屏就掉回 sh。 */
+                np = create_pane_shell_with_dir(plat_default_shell(), wdir[0] ? wdir : NULL);
 #endif
+            }
             if (np < 0) break;
             int dir = (action == ACT_SPLIT_HORIZONTAL) ? SPLIT_H : SPLIT_V;
             if (!split_split_active(dir, np)) {

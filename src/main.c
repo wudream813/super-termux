@@ -307,7 +307,14 @@ int main(void) {
         host_printf("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l");
     g_mux.running = 1;
     split_reset();
-    int first = create_pane();
+    /* v2.4.1：session = on 时先问一句「上次第一块窗格用的是哪条命令」——tab 0 的第一片
+     * 叶子就是这里建的这一块，等 session_restore() 再想换 shell 已经来不及（进程早起了）。
+     * 问不到、或那条命令起不来 ⇒ 照旧走 create_pane()。 */
+    WCHAR first_shell[256] = { 0 };
+    int first = -1;
+    if (session_probe_first_shell(first_shell, (int)(sizeof(first_shell) / sizeof(first_shell[0]))))
+        first = create_pane_shell(first_shell);
+    if (first < 0) first = create_pane();
     if (first < 0) {
         host_printf("\x1b[31mFailed! Need Win10 1809+ and enough memory\x1b[0m\r\n");
         Sleep(3000);

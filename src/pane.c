@@ -277,6 +277,13 @@ int create_pane_shell_with_dir(const WCHAR *shell, const WCHAR *workdir) {
     if (idx < 0) return -1;
 
     Pane *pane = &g_mux.panes[idx]; memset(pane, 0, sizeof(*pane));
+    /* v2.4.1：把这条命令行记在窗格上（存盘写进 P 记录，恢复时原样重建）。手抄一遍
+     * 而不是 wcsncpy：MSVC 把它标了 C4996，本仓库的构建是 -Werror。 */
+    if (shell) {
+        int si = 0, scap = (int)(sizeof(pane->shell_cmd) / sizeof(pane->shell_cmd[0]));
+        while (shell[si] && si < scap - 1) { pane->shell_cmd[si] = shell[si]; si++; }
+        pane->shell_cmd[si] = 0;
+    }
     int pane_cols = g_mux.host_cols;
     if (!screen_init(&pane->screen, pane_cols, g_mux.host_rows)) return -1;
     pane->screen.pane_index = idx;
