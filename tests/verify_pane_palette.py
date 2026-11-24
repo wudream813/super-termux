@@ -2994,14 +2994,22 @@ int main(int argc, char **argv) {
             rows_mark0 = [i for i, l in enumerate(sl) if "上次会话的历史" in l]
             first_line = re.compile(r"LONGHIST1\s*$")
             older = [i for i, l in enumerate(sl) if first_line.search(l)]
+            newest = [i for i, l in enumerate(sl) if re.search(r"LONGHIST40\s*$", l)]
             rows_mark = rows_mark0
             nvis = sum(1 for l in sl if "LONGHIST" in l)
-            rA_ck("T16 v2.3.4 口径：长历史恢复后视图【锚在快照的第一行】⇒ 说明行落在第一屏第"
-                  " 0~3 行（上面还留着 shell 那句提示符），且最早那行 LONGHIST1 当场可见（v2.3.2 把说明行放块首 ⇒ 被顶出屏；"
-                  "v2.3.3 挪到块尾 ⇒ 只能看到最新几行，用户两次都报「要能滚动才看得到」）",
-                  el and len(rows_mark) == 1 and rows_mark[0] <= 3 and nvis >= 10 and older,
-                  "说明行行号=%r（屏共 %d 行）LONGHIST 可见=%d 最早那行=%r"
-                  % (rows_mark, ROWS_C, nvis, older[:1]))
+            # v2.4.0 口径（README #13/#15/#17）：视图停在【实时底部】，恢复块整段躺在滚动
+            # 缓冲里 —— 不再像 v2.3.4 那样开屏把视图「摊开」到快照第一行（那会让第一次
+            # 敲键整屏跳一下，用户读作「一敲字符历史就没了」）。所以最早那行不在第一屏，
+            # 但说明行是恢复块的最后一行、紧贴实时区上方，应当可见且只出现一次；最新一行
+            # 也在屏上。老行没丢这件事由下面的 T16b（PgUp 回看）单独量。
+            rA_ck("T16 v2.4.0 口径：长历史恢复后视图【停在实时底部】⇒ 说明行紧贴实时区、只出现"
+                  "一次，最新一行 LONGHIST40 可见；最早那行 LONGHIST1 不在第一屏（它在滚动缓冲"
+                  "里，T16b 量得到）。v2.3.4 的「摊开到快照第一行」已被否掉：那是第一次敲键"
+                  "整屏跳变的来源",
+                  el and len(rows_mark) == 1 and rows_mark[0] >= ROWS_C - 4
+                  and newest and not older and nvis >= 10,
+                  "说明行行号=%r（屏共 %d 行）LONGHIST 可见=%d 最新那行=%r 最早那行=%r"
+                  % (rows_mark, ROWS_C, nvis, newest[:1], older[:1]))
             # T16c：把 Windows 上那一帧的形状搬到 Linux 上复现 —— 让 shell 在起完提示符之后
             # 自己输出「全视口逐行重绘 + ED(2)」（$ENV 是 dash 交互 shell 的启动脚本，纯输出
             # 侧、不经按键 ⇒ 不会触发 snap-on-input）。v2.3.0~v2.3.3 的历史正是被这一记盖掉的，
@@ -3013,23 +3021,33 @@ int main(int argc, char **argv) {
             paint.append("printf '\\033[%d;1H'" % ROWS_C)
             with open(rc, "w", encoding="utf-8") as _f:
                 _f.write("\n".join(paint) + "\n")
+            # v2.4.0：恢复历史现在整段在滚动缓冲里，ED(2) 只清可见区并撤销 session_view，
+            # 所以重绘之后屏上是 PAINT（不是历史）；但历史不许被这一记抹掉 —— 往上翻
+            # 必须还找得到说明行与最早那行。v2.3.0~v2.3.3 的历史正是被这一帧整屏盖掉的。
             dr, er = sess_run(td_mk, ROWS_C, COLS_C, [], env_extra={"ENV": rc})
             sr = vt_text(ROWS_C, COLS_C, dr) or []
-            rA_ck("T16c shell 吐完整视口重绘那一帧之后，恢复出来的说明行与最早那行仍在屏上"
-                  "（快照排在首帧之后落地 + 视图按绝对行锚定，等价于 WT 的「先恢复 buffer 再"
-                  " Start()」与 UserScrollViewport 绝对行）；拿 v2.3.3 的发布档反向对照过，"
-                  "它在这一条上是红的",
-                  er and any("上次会话的历史" in l for l in sr)
-                  and any(first_line.search(l) for l in sr),
-                  "屏里说明行/最早行=%r" % [l for l in sr if "上次会话的历史" in l or "LONGHIST1" in l][:2])
-            # T16d：按任意键 ⇒ 摊开的视图交还实时底部（WT Terminal::TrySnapOnInput），
-            # 但键本身必须照常进 shell —— 一个字节都不许吞。
+            dr2, er2 = sess_run(td_mk, ROWS_C, COLS_C, [b"\x1b[5~"],
+                                  env_extra={"ENV": rc})
+            sr2 = vt_text(ROWS_C, COLS_C, dr2) or []
+            rA_ck("T16c shell 吐完整视口重绘（ED(2)）之后：重绘帧落在屏上（PAINT 行），而"
+                  "恢复出来的历史仍在滚动缓冲里 —— 往上翻一页就找得到说明行（最早那行由 "
+                  "T16b 在干净目录里单独量）",
+                  er and er2 and any("PAINT" in l for l in sr)
+                  and any("上次会话的历史" in l for l in sr2),
+                  "重绘帧=%r 回看=%r"
+                  % ([l for l in sr if "PAINT" in l][:1],
+                     [l for l in sr2 if "上次会话的历史" in l][:2]))
+            # T16d：敲键之后视图【不跳变】（v2.3.4 的「摊开→按键让位」已否掉：那正是
+            # 「一敲字符历史就没了」的来源），说明行仍留在实时区上方；键本身必须照常进
+            # shell —— 一个字节都不许吞。
             dk, ek = sess_run(td_mk, ROWS_C, COLS_C, [b"echo SNAPKEY56\r"])
             sk = vt_text(ROWS_C, COLS_C, dk) or []
-            rA_ck("T16d 按键之后摊开视图让位（说明行不再占屏）且该键照常送进 shell："
-                  "SNAPKEY56 出现在屏上",
-                  ek and any("SNAPKEY56" in l for l in sk) and not any("上次会话的历史" in l for l in sk),
-                  "屏=%r" % [l for l in sk if "SNAPKEY56" in l][:1])
+            rows_mark_k = [i for i, l in enumerate(sk) if "上次会话的历史" in l]
+            rA_ck("T16d 按键之后视图不跳变：说明行仍在实时区上方（不再「让位」消失），且该键"
+                  "照常送进 shell：SNAPKEY56 出现在屏上",
+                  ek and any("SNAPKEY56" in l for l in sk)
+                  and len(rows_mark_k) == 1 and rows_mark_k[0] >= ROWS_C - 4,
+                  "说明行行号=%r 屏=%r" % (rows_mark_k, [l for l in sk if "SNAPKEY56" in l][:1]))
             # T16b 自己开一份干净的目录：前面几条（T16c 的重绘帧、T16d 的按键）都往同一个 td 里
             # 追加过过程，滚到顶时看到的是「被这些过程改写过的屏」，量不出「老行没丢」这条本身。
             td_up = sess_mkdir(SESS_INI_ON)

@@ -1211,6 +1211,16 @@ int screen_scroll_limit(ScreenBuffer *s) {
 int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out,
                        int *cursor_row) {
     if (!s || !s->line_wrap || s->in_alt_screen || rows <= 0 || width <= 0 || !out) return 0;
+    /* v2.4.0：输出网格先整块铺成空白。内容不足一屏时下面只把 filled 行从临时 grid
+     * 拷进 out，其余行若留着不写，就是上一帧（或 realloc 复用的别的窗格网格）的残字
+     * —— Linux 真机上表现为分屏右窗格的下半屏冒出左窗格的历史。 */
+    for (int i = 0; i < rows * width; i++) {
+        out[i].ci.Char.UnicodeChar = L' ';
+        out[i].ci.Attributes = 0x07;
+        out[i].fg = RGB565_WHITE;
+        out[i].bg = RGB565_BLACK;
+        out[i].v = 0;
+    }
     if (vo < 0) vo = 0;
     /* vo 自限：滚过内容末尾就不该再出现顶部空白（v1.8.52）。 */
     {

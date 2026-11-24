@@ -153,6 +153,13 @@ static void handle_input(void) {
         }
 
         reap_dead_panes();
+        /* v2.4.0：与 Windows 侧（main.c）对齐 —— 挂起的会话快照在「输出静默 150ms」
+         * 之后由主循环统一落地。POSIX 这边原来漏了这一句：session_restore() 只把块
+         * 挂到 sess_pend 上就返回，没有任何调用点再碰它，于是 Linux/macOS 上恢复的
+         * 历史永远不落屏（Windows 上 main.c 每轮都问 session_pump_due，所以只有
+         * POSIX 栽）。macOS CI 之前是绿的，只因 runner 没装 libvterm-dev、T 组判据
+         * 全被 SKIP；装上就会红。 */
+        session_pump_due();
         if (g_mux.active_pane < 0 || !g_mux.panes[g_mux.active_pane].active) {
             int f = -1;
             for (int i = 0; i < g_mux.pane_count; i++) if (g_mux.panes[i].active) { f = i; break; }
