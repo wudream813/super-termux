@@ -2823,7 +2823,7 @@ int main(int argc, char **argv) {
                             "P %d /bin/bash --noprofile --norc\nD CURSORRIGHT\n"
                             % (focus, 1 - focus))
                 dc, exc = sess_run(td_cur, ROWS_C, COLS_C,
-                                   [b"#XYZ" + b"a" * 55, b"\x1b[D" * 55])
+                                   [b"#XYZ" + b"a" * 55, b"\x01", b"\x1b[C" * 4])
                 result = vt_cursor_check(ROWS_C, COLS_C, dc, "#XYZ")
                 rA_ck("T2g%d v2.4.2：长输入软换行后左移，光标回到对应的前一段"
                       % (8 if focus else 9), exc and result == "ok",
