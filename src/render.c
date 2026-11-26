@@ -5858,6 +5858,9 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
      * 起的窗口，与实时视图同一套坐标 ⇒ 滚一格内容只挪一行，不会整屏跳。
      * 只有渲染宽度窄于模型宽度（拖动分屏边框、模型被冻结）时才退回重排网格 ——
      * 那种场合必须按新宽折行，否则右侧内容直接消失。 */
+    /* v2.4.2：用户报「有分屏保存的历史时，恢复后光标错位」。分屏正文与光标
+     * 必须共用本帧网格的行号；先清掉旧值，分配/重排失败退回物理行时不能复用。 */
+    pane->session_cursor_row = -1;
     int use_rf = ((pane->scroll_offset > 0 || pane->session_view || s->session_view) &&
                   (cols < s->cols || pane->session_view || s->session_view) &&
                   !s->in_alt_screen && s->line_wrap != NULL);
@@ -5904,7 +5907,7 @@ static void render_split_pane(char *out, int bs, int *posp, int leaf, PaneRect *
          * 光标所在区域始终可见；cols 每帧变化时只有上方内容被挤掉，下方稳定。
          * 用户往上翻历史时 vo = scroll_offset 本身就是他的显式意图，同样适用。 */
         if (rf_ready && grid &&
-            screen_reflow_view(s, pane->scroll_offset, rows, cols, grid, NULL)) {
+            screen_reflow_view(s, pane->scroll_offset, rows, cols, grid, &pane->session_cursor_row)) {
             /* 整窗 reflow 成功（返回 1 表示已填满整个视口）才发布这块网格。 */
             pane->rf_grid = grid;
             pane->rf_rows = rows;
@@ -6684,6 +6687,12 @@ void render_screen(void) {
         }
         if (rc->valid && s->cursor_visible && ap->scroll_offset == 0 && !g_copy_mode) {
             int cx = s->cursor_x, cy = s->cursor_y;
+            /* v2.4.2：「有分屏保存的历史时，恢复后光标错位」：正文用恢复视图的
+             * 重排行，而旧逻辑仍用 ConPTY 物理行；只有本帧网格真正成功才换坐标，
+             * alt 屏和回退物理渲染仍用原行号。 */
+            if (ap->rf_valid && !s->in_alt_screen && (ap->session_view || s->session_view) &&
+                ap->session_cursor_row >= 0 && ap->session_cursor_row < rc->rows)
+                cy = ap->session_cursor_row;
             if (cx >= rc->cols) cx = rc->cols - 1;
             if (cy >= rc->rows) cy = rc->rows - 1;
             if (cx < 0) cx = 0;

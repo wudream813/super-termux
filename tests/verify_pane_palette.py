@@ -587,6 +587,32 @@ int main(int argc, char **argv) {
 """
 
 
+def vt_cursor_check(rows, cols, data, needle, _cache={}):
+    """用 libvterm 回放整帧，检查光标是否紧跟 # 开头的输入；不可用时返回 None。"""
+    global _VTEXT_OK
+    if os.environ.get("TERMUX_NO_VTERM"):
+        _VTEXT_OK = False
+        return None
+    if "bin" not in _cache:
+        td = tempfile.mkdtemp(prefix="termux_cursor_")
+        src = os.path.join(td, "vt.c")
+        exe = os.path.join(td, "vt")
+        with open(src, "w") as f:
+            f.write(VTERM_CURSOR_C)
+        r = subprocess.run(["gcc", "-O1", src, "-o", exe, "-lvterm"], capture_output=True, text=True)
+        _cache["bin"] = exe if r.returncode == 0 else ""
+    if not _cache["bin"]:
+        _VTEXT_OK = False
+        return None
+    with tempfile.TemporaryDirectory(prefix="termux_cursor_d_") as td:
+        dump = os.path.join(td, "screen.bin")
+        with open(dump, "wb") as f:
+            f.write(data)
+        p = subprocess.run([_cache["bin"], str(rows), str(cols), dump, needle],
+                           capture_output=True, text=True)
+        return p.stdout.strip()
+
+
 def ini_pane_lines(ini):
     """ini 里真正生效的 pane_* 行（注释行里也有 pane_background 字样，不能直接 in）。"""
     return [l.strip() for l in ini.splitlines() if l.strip().startswith("pane_")]
@@ -2759,6 +2785,51 @@ int main(int argc, char **argv) {
                "P 行=%r" % ([x for x in sh2.splitlines() if x.startswith("P ")],))
         finally:
             shutil.rmtree(td_sh, ignore_errors=True)
+
+        # v2.4.2（用户报「有分屏保存的历史时，恢复后光标错位」）：不能只看文字。
+        # 整帧回放到 libvterm，量输入末尾的宿主光标；覆盖左右/上下两种布局、两边焦点、
+        # 切换焦点及超过视口的历史。每次用相同快照，避免上一次正常退出重写测试数据。
+        td_cur = sess_mkdir(SESS_INI_ON)
+        try:
+            scenarios = [("v50pp", 1, False, []), ("v50pp", 0, False, []),
+                         ("h50pp", 1, False, []), ("h50pp", 0, False, []),
+                         ("v50pp", 1, False, [b"\x02\t"]),
+                         ("v50pp", 0, True, []), ("h50pp", 0, True, [])]
+            for idx, (tree, focus, long_hist, keys) in enumerate(scenarios):
+                hist = "".join("D CURSOROLD%02d\n" % n for n in range(40 if long_hist else 1))
+                with open(os.path.join(td_cur, "termux.session"), "w", encoding="utf-8") as f:
+                    f.write("s 2\nu 1795490000\nT 0 %s\nP %d /bin/sh\n%s"
+                            "P %d /bin/sh\n%s" % (tree, focus, hist, 1 - focus, hist))
+                dc, exc = sess_run(td_cur, ROWS_C, COLS_C, keys + [b"#CURSORTEST"])
+                result = vt_cursor_check(ROWS_C, COLS_C, dc, "#CURSORTEST")
+                rA_ck("T2g%d v2.4.2：分屏历史恢复后光标紧跟输入（%s 焦点=%d 长历史=%s 切换=%s）"
+                      % (idx, tree, focus, long_hist, bool(keys)),
+                      exc and result == "ok", "退出=%r 位置=%r" % (exc, result))
+            # 真正的「分屏 → 写盘 → 重开」也走一遍，防止手工快照漏掉存盘阶段的状态。
+            os.remove(os.path.join(td_cur, "termux.session"))
+            _, saved = sess_run(td_cur, ROWS_C, COLS_C,
+                                [b"echo CURSORLEFT\r", b"\x02-", b"echo CURSORRIGHT\r"])
+            snap_cur = sess_read(td_cur) or ""
+            dc, exc = sess_run(td_cur, ROWS_C, COLS_C, [b"#CURSORTEST"])
+            result = vt_cursor_check(ROWS_C, COLS_C, dc, "#CURSORTEST")
+            rA_ck("T2g7 v2.4.2：真实分屏写盘再重开，右窗格输入的光标跟随文字",
+                  saved and exc and "v50pp" in snap_cur and result == "ok",
+                  "写盘=%r 退出=%r 位置=%r" % (saved, exc, result))
+            # bash 的可编辑长命令跨软换行后左移：光标必须回到第一段，而不是始终钉在末段。
+            for focus in (1, 0):
+                with open(os.path.join(td_cur, "termux.session"), "w", encoding="utf-8") as f:
+                    f.write("s 2\nu 1795490000\nT 0 v50pp\n"
+                            "P %d /bin/bash --noprofile --norc\nD CURSORLEFT\n"
+                            "P %d /bin/bash --noprofile --norc\nD CURSORRIGHT\n"
+                            % (focus, 1 - focus))
+                dc, exc = sess_run(td_cur, ROWS_C, COLS_C,
+                                   [b"#XYZ" + b"a" * 55, b"\x1b[D" * 55])
+                result = vt_cursor_check(ROWS_C, COLS_C, dc, "#XYZ")
+                rA_ck("T2g%d v2.4.2：长输入软换行后左移，光标回到对应的前一段"
+                      % (8 if focus else 9), exc and result == "ok",
+                      "退出=%r 位置=%r" % (exc, result))
+        finally:
+            shutil.rmtree(td_cur, ignore_errors=True)
 
         d2, ex2 = sess_run(td, ROWS_C, COLS_C, [b"echo AFTERFOCUS\r"])
         scr2 = vt_text(ROWS_C, COLS_C, d2) or []

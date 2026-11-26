@@ -1260,6 +1260,7 @@ int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out
     int cursor_pending = 0;
     int cursor_unkept = 0;      /* 光标所在逻辑行是空行、按口径不落位 */
     int cursor_below = 0;       /* 看到光标行那一刻已经写下的「更新」显示行数 */
+    int cursor_newer = 0, cursor_len = 0;  /* 光标物理行之后的格数、该行参与重排的格数 */
     int filled = 0;             /* 已写下的显示行总数（含夹在内容之间的空行） */
     int saw_text = 0;           /* 扫描（从新到老）已经遇到过正文行 */
 
@@ -1286,8 +1287,21 @@ int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out
             }                                                                  \
             if (_text) saw_text = 1;                                           \
             if (cursor_pending) {                                              \
-                if (filled > cursor_below) cursor_idx = _first;                \
-                else cursor_unkept = 1;                                        \
+                if (filled > cursor_below) {                                   \
+                    /* v2.4.2：「恢复后光标错位」：光标可在软换行逻辑行的中间，       \
+                     * 不能总放到最后一段；先数光标之前的格再映射到重排行。 */       \
+                    int _x = s->cursor_x < cursor_len ? s->cursor_x : cursor_len; \
+                    if (_x < 0) _x = 0;                                       \
+                    int _upto = logn - cursor_newer - cursor_len + _x;         \
+                    if (_upto < 0) _upto = 0;                                 \
+                    if (_upto > logn) _upto = logn;                           \
+                    int _row = reflow_rows_for(logrow, _upto, width) - 1;      \
+                    int _col = reflow_col_for(logrow, _upto, width);           \
+                    if (_upto < logn && s->cursor_x < s->cols && _col > 0 &&  \
+                        _col + reflow_glyph_w(logrow[_upto].ci.Char.UnicodeChar) > width) \
+                        _row++;                                                \
+                    cursor_idx = _first - (acc.count - 1 - _row);             \
+                } else cursor_unkept = 1;                                     \
                 cursor_pending = 0;                                            \
             }                                                                  \
         } else if (cursor_pending) {                                           \
@@ -1309,8 +1323,10 @@ int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out
          * 分组：wrap0 处结束上一条逻辑行；落位时由 keep_blank 决定是否显示。 */
         int len = screen_row_reflow_len(s, rel);
         int wrap = (s->line_wrap && s->line_wrap[pr]) ? 1 : 0;
-        if (rel == s->cursor_y) { cursor_pending = 1; cursor_below = filled; }
-                                                      /* 这条逻辑行就是光标所在行 */
+        if (rel == s->cursor_y) {
+            cursor_pending = 1; cursor_below = filled;
+            cursor_newer = logn; cursor_len = len;
+        }                                             /* 这条逻辑行就是光标所在行 */
 
         /* 段前插：本行段（扫描上更老）插到 logrow 开头，保持 logrow 老→新。 */
         if (logn + len > logcap) {
@@ -1358,8 +1374,7 @@ int screen_reflow_view(ScreenBuffer *s, int vo, int rows, int width, RGlyph *out
      *    的历史与提示符被压在屏底、上面一片空白；用户要的是「像正常终端一样在最上面」。
      *    尾巴空白（光标下方那串空行）不算内容，只影响视口里多显示几行空白。
      * 光标行同源算出：cursor_idx 是 grid 下标，减去视口首行下标即可；光标落在不落位的
-     * 空行上时，落在「已渲染的最后一行之下」。cursor_row 为 NULL 时跳过（分屏路径不在
-     * 这里定位宿主光标）。 */
+     * 空行上时，落在「已渲染的最后一行之下」。单窗格和分屏均用此行号定位宿主光标。 */
     int content_rows = filled;
     int pad = rows - content_rows;
     int gi0 = (pad > 0) ? (total - filled) : 0;
