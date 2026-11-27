@@ -2843,7 +2843,8 @@ int main(int argc, char **argv) {
                         "T 0 h50pp\nP 0 /bin/bash --noprofile --norc\nD TOP\n"
                         "P 0 /bin/bash --noprofile --norc\nD BOTTOM\n")
             geo_log = os.path.join(td_geo, "first-size.log")
-            hook = 'printf "%s %s %s\\n" "$BASHPID" "$COLUMNS" "$LINES" >> ' + geo_log
+            # macOS 自带 bash 3.2 没有 BASHPID；这里的 $$ 同样是每个 shell 的唯一 PID。
+            hook = 'printf "%s %s %s\\n" "$$" "$COLUMNS" "$LINES" >> ' + geo_log
             _, ex_geo = sess_run(td_geo, ROWS_C, COLS_C, [], env_extra={"PROMPT_COMMAND": hook})
             first_sizes = {}
             if os.path.isfile(geo_log):
