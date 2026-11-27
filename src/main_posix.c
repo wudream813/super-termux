@@ -262,10 +262,12 @@ int main(void) {
      * 叶子就是这里建的这一块，等 session_restore() 再想换 shell 已经来不及（进程早起了）。
      * 问不到、或那条命令起不来 ⇒ 照旧走 create_pane()。 */
     WCHAR first_shell[256] = { 0 };
-    int first = -1;
+    int first = -1, first_cols = 0, first_rows = 0;
+    /* v2.4.3：不能等首帧才把首叶子从整屏缩成分屏，否则 shell 已用错误宽度初始化。 */
+    session_probe_first_size(&first_cols, &first_rows);
     if (session_probe_first_shell(first_shell, (int)(sizeof(first_shell) / sizeof(first_shell[0]))))
-        first = create_pane_shell(first_shell);
-    if (first < 0) first = create_pane();
+        first = create_pane_shell_sized(first_shell, first_cols, first_rows);
+    if (first < 0) first = create_pane_sized(first_cols, first_rows);
     if (first < 0) {
         host_printf("\x1b[31m启动失败：无法创建窗格（检查 $SHELL 是否可执行）\x1b[0m\r\n");
         Sleep(3000);

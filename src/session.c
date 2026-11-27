@@ -791,6 +791,44 @@ static int sess_tree_count(const char **pp, int depth, int budget) {
     return a + b;
 }
 
+/* v2.4.3：先在临时节点里重建已验过的树，用真正的 split_layout 算每个叶子的最终
+ * 矩形。用户报「有分屏保存的历史时，恢复后光标错位」：新 shell 如果先按整屏启动，
+ * 首帧再改成分屏宽度，SIGWINCH 可落在 bash 初始化的空档；它仍按整屏宽度编辑，
+ * 跨行移动时会发错坐标。复用正式布局而非另写一套百分比/最小尺寸算法。 */
+static int sess_plan_node(const char **pp, SplitNode *nodes, int *nn, int *nl) {
+    if (*nn >= MAX_SPLIT_NODES) return -1;
+    int node = (*nn)++;
+    nodes[node].used = 1;
+    char c = *(*pp)++;
+    if (c == 'p') {
+        if (*nl >= MAX_PANES) return -1;
+        nodes[node].leaf = 1;
+        nodes[node].pane_idx = (*nl)++;
+        return node;
+    }
+    if (c != 'v' && c != 'h') return -1;
+    int pct = 0;
+    while (**pp >= '0' && **pp <= '9') { pct = pct * 10 + (*(*pp)++ - '0'); }
+    nodes[node].dir = c == 'v' ? SPLIT_V : SPLIT_H;
+    nodes[node].frac_pct = pct;
+    int a = sess_plan_node(pp, nodes, nn, nl);
+    int b = sess_plan_node(pp, nodes, nn, nl);
+    if (a < 0 || b < 0) return -1;
+    nodes[node].a = a; nodes[node].b = b;
+    return node;
+}
+
+static int sess_plan_layout(const char *tree, PaneRect *rects) {
+    SplitNode nodes[MAX_SPLIT_NODES];
+    int nn = 0, nl = 0;
+    memset(nodes, 0, sizeof(nodes));
+    memset(rects, 0, sizeof(PaneRect) * MAX_PANES);
+    int root = sess_plan_node(&tree, nodes, &nn, &nl);
+    if (root < 0 || *tree || nl < 1) return 0;
+    split_layout(root, 0, 0, g_mux.host_cols, g_mux.host_rows, nodes, rects);
+    return nl;
+}
+
 /* 按树把 node（当前持有 cur_pane 的叶子）展开；新建出来的窗格依次记进 leaves[]。
  * v2.4.1：shells[] 是这一 tab 各叶子在档里记下的命令行（按 P 记录顺序），第 li 片
  * 新建的窗格就用 shells[li] 起进程 —— 以前这里一律 sess_default_shell()，
@@ -807,7 +845,7 @@ static int sess_leaf_shell(WCHAR *out, int cells, WCHAR (*shells)[256], int nshe
 }
 
 static int sess_expand(int node, int cur_pane, const char **pp, int *leaves, int *nl,
-                       SplitNode *nd, WCHAR (*shells)[256], int nshells) {
+                       SplitNode *nd, WCHAR (*shells)[256], int nshells, const PaneRect *plan) {
     char c = **pp;
     if (c == 'p') {
         (*pp)++;
@@ -830,13 +868,15 @@ static int sess_expand(int node, int cur_pane, const char **pp, int *leaves, int
     memset(sh, 0, sizeof(sh));
     if (!sess_leaf_shell(sh, (int)(sizeof(sh) / sizeof(sh[0])), shells, nshells, *nl + na))
         return 0;
-    int np = create_pane_shell(sh);
+    int leaf_idx = *nl + na;
+    if (leaf_idx < 0 || leaf_idx >= MAX_PANES || !plan[leaf_idx].valid) return 0;
+    int np = create_pane_shell_sized(sh, plan[leaf_idx].cols, plan[leaf_idx].rows);
     if (np < 0) return 0;
     if (split_do(node, (c == 'v') ? SPLIT_V : SPLIT_H, np) < 0) { close_pane(np); return 0; }
     g_mux.panes[np].is_split_child = 1;
     nd[node].frac_pct = pct;
-    if (!sess_expand(nd[node].a, cur_pane, pp, leaves, nl, nd, shells, nshells)) return 0;
-    if (!sess_expand(nd[node].b, np, pp, leaves, nl, nd, shells, nshells)) return 0;
+    if (!sess_expand(nd[node].a, cur_pane, pp, leaves, nl, nd, shells, nshells, plan)) return 0;
+    if (!sess_expand(nd[node].b, np, pp, leaves, nl, nd, shells, nshells, plan)) return 0;
     return 1;
 }
 
@@ -1119,6 +1159,34 @@ int session_probe_first_shell(WCHAR *out, int cells) {
     return got;
 }
 
+/* v2.4.3：第一个窗格在 session_restore 之前启动，也必须使用快照树中首叶子的
+ * 最终尺寸。坏档 / session=off 返回 0，调用方继续按原来的整屏默认尺寸启动。 */
+int session_probe_first_size(int *cols, int *rows) {
+    if (!cols || !rows || !g_session_persist) return 0;
+    SRec *recs = NULL;
+    char *raw = NULL;
+    int nrec = 0, why = 0, got = 0;
+    if (!sess_open_latest(&recs, &nrec, &raw, &why)) return 0;
+    if (nrec > 0 && recs[0].type == 's' &&
+        (recs[0].body[0] == '1' || recs[0].body[0] == '2')) {
+        for (int i = 1; i < nrec; i++) {
+            if (recs[i].type != 'T') continue;
+            const char *tk = recs[i].body;
+            while (*tk >= '0' && *tk <= '9') tk++;
+            while (*tk == ' ') tk++;
+            const char *chk = tk;
+            if (sess_tree_count(&chk, 0, MAX_PANES) < 1 || *chk) continue;
+            PaneRect plan[MAX_PANES];
+            if (sess_plan_layout(tk, plan) && plan[0].valid && plan[0].cols > 0 && plan[0].rows > 0) {
+                *cols = plan[0].cols; *rows = plan[0].rows; got = 1;
+            }
+            break;
+        }
+    }
+    free(recs); free(raw);
+    return got;
+}
+
 int session_restore(void) {
     if (!g_session_persist) return 0;
 
@@ -1157,6 +1225,8 @@ int session_restore(void) {
         while (*tk == ' ') tk++;
         const char *chk = tk;
         if (sess_tree_count(&chk, 0, MAX_PANES) < 1 || *chk) { ri++; continue; }  /* 树坏了：这个 tab 不要 */
+        PaneRect plan[MAX_PANES];
+        if (!sess_plan_layout(tk, plan)) { ri++; continue; }
         ri++;
         /* v2.4.1：树验过了才看 P 记录 —— 按叶子顺序把每片「当时用哪条命令」收好，
          * 下面建窗格时逐片对上号。坏树直接 continue，P 记录跟着一起跳过。 */
@@ -1174,7 +1244,7 @@ int session_restore(void) {
             WCHAR sh[256];
             memset(sh, 0, sizeof(sh));
             if (!sess_leaf_shell(sh, (int)(sizeof(sh) / sizeof(sh[0])), shbuf, nsh, 0)) goto done;
-            anchor = create_pane_shell(sh);
+            anchor = create_pane_shell_sized(sh, plan[0].cols, plan[0].rows);
             if (anchor < 0) goto done;
             split_init_tab(anchor);
         }
@@ -1185,7 +1255,7 @@ int session_restore(void) {
         int leaves[MAX_PANES];
         int nl = 0;
         const char *tc = tk;
-        if (!sess_expand(root, anchor, &tc, leaves, &nl, split_nodes(), shbuf, nsh) || nl < 1) goto done;
+        if (!sess_expand(root, anchor, &tc, leaves, &nl, split_nodes(), shbuf, nsh, plan) || nl < 1) goto done;
 
         for (int k = 0; k < nl && ri < nrec; k++) {
             int flag = 0;
