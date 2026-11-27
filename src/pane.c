@@ -656,6 +656,9 @@ void pane_resize_to(int idx, int cols, int rows) {
      * pane_resize_to，若同尺寸也下发，ConPTY 会整屏重绘（记录里逐帧重复的
      * 全屏 repaint），还会让行内容被以不同 wrap 覆写而残留过期 line_wrap。 */
     if (p->process != NULL_HANDLE && (p->conpty_cols != cols || p->conpty_rows != rows)) {
+        if (getenv("TERMUX_CURSOR_DIAG"))
+            dump_mark("[cursor-diag] resize pane=%d before=%dx%d requested=%dx%d", idx,
+                      p->conpty_cols, p->conpty_rows, cols, rows);
         plat_proc_resize(p->process, p->pipe_in, p->pipe_out, cols, rows);
         p->conpty_cols = cols;
         p->conpty_rows = rows;
