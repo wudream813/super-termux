@@ -6697,6 +6697,11 @@ void render_screen(void) {
             if (cy >= rc->rows) cy = rc->rows - 1;
             if (cx < 0) cx = 0;
             if (cy < 0) cy = 0;
+            if (getenv("TERMUX_CURSOR_DIAG"))
+                dump_mark("[cursor-diag] pane=%d screen=(%d,%d) rfrow=%d rfvalid=%d session=%d/%d alt=%d rect=(%d,%d,%d,%d) chosen=(%d,%d)",
+                          g_mux.active_pane, s->cursor_x, s->cursor_y, ap->session_cursor_row,
+                          ap->rf_valid, ap->session_view, s->session_view, s->in_alt_screen,
+                          rc->r0, rc->c0, rc->rows, rc->cols, cy, cx);
             pos += snprintf(out + pos, bs - pos, "\x1b[%d;%dH\x1b[?25h",
                             rc->r0 + cy + 2, rc->c0 + cx + 1);
         } else {

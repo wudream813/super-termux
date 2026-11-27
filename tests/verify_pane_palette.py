@@ -2822,9 +2822,24 @@ int main(int argc, char **argv) {
                             "P %d /bin/bash --noprofile --norc\nD CURSORLEFT\n"
                             "P %d /bin/bash --noprofile --norc\nD CURSORRIGHT\n"
                             % (focus, 1 - focus))
+                diag = os.environ.get("TERMUX_CURSOR_CAPTURE")
+                if diag:
+                    for name in ("mouse_dump.log", "render_dump.log", "render_delta.log", "scroll_trace.log"):
+                        try: os.remove(os.path.join(td_cur, name))
+                        except OSError: pass
                 dc, exc = sess_run(td_cur, ROWS_C, COLS_C,
-                                   [b"#XYZ" + b"a" * 55, b"\x01", b"\x1b[C" * 4])
+                                   [b"#XYZ" + b"a" * 55, b"\x01", b"\x1b[C" * 4],
+                                   env_extra={"TERMUX_DUMP": "1", "TERMUX_CURSOR_DIAG": "1"} if diag else None)
                 result = vt_cursor_check(ROWS_C, COLS_C, dc, "#XYZ")
+                if diag:
+                    os.makedirs(diag, exist_ok=True)
+                    with open(os.path.join(diag, "focus%d.bin" % focus), "wb") as f: f.write(dc)
+                    with open(os.path.join(diag, "focus%d.txt" % focus), "w", encoding="utf-8") as f:
+                        f.write("result=%s exit=%s\n" % (result, exc))
+                        f.write("\n".join(vt_text(ROWS_C, COLS_C, dc) or []))
+                    for name in ("mouse_dump.log", "render_dump.log", "render_delta.log", "scroll_trace.log"):
+                        src = os.path.join(td_cur, name)
+                        if os.path.isfile(src): shutil.copy2(src, os.path.join(diag, "focus%d-%s" % (focus, name)))
                 rA_ck("T2g%d v2.4.2：长输入软换行后左移，光标回到对应的前一段"
                       % (8 if focus else 9), exc and result == "ok",
                       "退出=%r 位置=%r" % (exc, result))

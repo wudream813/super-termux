@@ -192,7 +192,17 @@ jobs:
           python3 verify_search_refresh.py
 
       - name: POSIX 套件（真 pty）
+        env:
+          TERMUX_CURSOR_CAPTURE: /tmp/termux-cursor-diag
         run: make check-posix
+
+      - name: 保存光标诊断
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cursor-diag
+          path: /tmp/termux-cursor-diag
+          if-no-files-found: warn
 
       - uses: actions/upload-artifact@v4
         with:
