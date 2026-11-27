@@ -2824,7 +2824,7 @@ int main(int argc, char **argv) {
                             % (focus, 1 - focus))
                 diag = os.environ.get("TERMUX_CURSOR_CAPTURE")
                 if diag:
-                    for name in ("mouse_dump.log", "render_dump.log", "render_delta.log", "scroll_trace.log"):
+                    for name in ("mouse_dump.log", "termux_dump.log", "render_dump.log", "render_delta.log", "scroll_trace.log"):
                         try: os.remove(os.path.join(td_cur, name))
                         except OSError: pass
                 dc, exc = sess_run(td_cur, ROWS_C, COLS_C,
@@ -2837,7 +2837,7 @@ int main(int argc, char **argv) {
                     with open(os.path.join(diag, "focus%d.txt" % focus), "w", encoding="utf-8") as f:
                         f.write("result=%s exit=%s\n" % (result, exc))
                         f.write("\n".join(vt_text(ROWS_C, COLS_C, dc) or []))
-                    for name in ("mouse_dump.log", "render_dump.log", "render_delta.log", "scroll_trace.log"):
+                    for name in ("mouse_dump.log", "termux_dump.log", "render_dump.log", "render_delta.log", "scroll_trace.log"):
                         src = os.path.join(td_cur, name)
                         if os.path.isfile(src): shutil.copy2(src, os.path.join(diag, "focus%d-%s" % (focus, name)))
                 rA_ck("T2g%d v2.4.2：长输入软换行后左移，光标回到对应的前一段"

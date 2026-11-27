@@ -24,6 +24,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  cursor-diagnostic:
+    name: 快速光标诊断
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y libvterm-dev
+      - run: make -B linux
+      - run: python3 tools/debug_cursor_ci.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cursor-fast
+          path: /tmp/cursor-fast
+
   # ==========================================================================
   windows:
     name: Windows (本机 MinGW-w64)
