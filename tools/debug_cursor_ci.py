@@ -41,3 +41,19 @@ for iteration in range(8):
             src=os.path.join(td,name)
             if os.path.isfile(src):shutil.copy2(src,os.path.join(out,'prompt%d-%s'%(iteration,name)))
     finally:shutil.rmtree(td,ignore_errors=True)
+for iteration in range(16):
+    td=m.sess_mkdir('[general]\nsession = true\nmouse = true\nanim = off\n')
+    try:
+        with open(os.path.join(td,'termux.session'),'w') as f:
+            f.write('s 2\nu 1795490000\nT 0 v50pp\nP 0 /bin/bash --noprofile --norc\nD CURSORLEFT\nP 1 /bin/bash --noprofile --norc\nD CURSORRIGHT\n')
+        log=os.path.join(td,'columns.log')
+        hook='printf "%s %s\\n" "$BASHPID" "$COLUMNS" >> '+log
+        data, ex=m.sess_run(td,24,100,[b'#XYZ'+b'a'*55,b'\x01',b'\x1b[C'*4],env_extra={'TERMUX_DUMP':'1','TERMUX_CURSOR_DIAG':'1','PROMPT_COMMAND':hook})
+        result=m.vt_cursor_check(24,100,data,'#XYZ')
+        cols=open(log).read() if os.path.isfile(log) else '(no log)'
+        print('HOOK_RUN',iteration,'RESULT',result,'COLS',repr(cols),flush=True)
+        if result != 'ok':
+            for name in ('mouse_dump.log','termux_dump.log','columns.log'):
+                src=os.path.join(td,name)
+                if os.path.isfile(src):shutil.copy2(src,os.path.join(out,'hook%d-%s'%(iteration,name)))
+    finally:shutil.rmtree(td,ignore_errors=True)
