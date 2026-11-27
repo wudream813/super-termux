@@ -2847,8 +2847,8 @@ int main(int argc, char **argv) {
             shutil.rmtree(td_cur, ignore_errors=True)
 
         # v2.4.3：不能只在第一帧之后验证 TIOCGWINSZ；bash 可能在收到 resize 前按
-        # 整屏尺寸初始化并错过信号。让每个进程在【首次提示符】把自身 COLUMNS/LINES
-        # 写出来，连尚未切到的后台 tab 一起验，不依赖 libvterm 或调度时序。
+        # 整屏尺寸初始化并错过信号。让每个进程在【首次提示符前】用 stty 查询自身 PTY
+        # 尺寸，连尚未切到的后台 tab 一起验，不依赖 libvterm 或调度时序。
         td_geo = sess_mkdir(SESS_INI_ON)
         try:
             with open(os.path.join(td_geo, "termux.session"), "w", encoding="utf-8") as f:
@@ -2858,8 +2858,9 @@ int main(int argc, char **argv) {
                         "T 0 h50pp\nP 0 /bin/bash --noprofile --norc\nD TOP\n"
                         "P 0 /bin/bash --noprofile --norc\nD BOTTOM\n")
             geo_log = os.path.join(td_geo, "first-size.log")
-            # macOS 自带 bash 3.2 没有 BASHPID；这里的 $$ 同样是每个 shell 的唯一 PID。
-            hook = 'printf "%s %s %s\\n" "$$" "$COLUMNS" "$LINES" >> ' + geo_log
+            # macOS bash 3.2 的首次 PROMPT_COMMAND 在 COLUMNS/LINES 初始化之前执行；
+            # 用 stty 直接取 PTY 的行列（行在前），$$ 同时兼容 bash 3.2 / 5。
+            hook = 'sz=$(stty size); printf "%s %s\\n" "$$" "$sz" >> ' + geo_log
             _, ex_geo = sess_run(td_geo, ROWS_C, COLS_C, [], env_extra={"PROMPT_COMMAND": hook})
             first_sizes = {}
             if os.path.isfile(geo_log):
@@ -2867,7 +2868,7 @@ int main(int argc, char **argv) {
                     for line in f:
                         fields = line.split()
                         if len(fields) == 3:
-                            first_sizes.setdefault(fields[0], tuple(fields[1:]))
+                            first_sizes.setdefault(fields[0], (fields[2], fields[1]))
             ck("T2h v2.4.3：恢复时四个 shell 的首次提示符就拿到最终窗格尺寸"
                "（左右 49/50×23、后台上下 100×11）；不靠事后 resize 修正",
                ex_geo and sorted(first_sizes.values()) == sorted([
