@@ -24,6 +24,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  cursor-mac-diagnostic:
+    name: macOS 快速尺寸诊断
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make -B darwin
+      - run: TERMUX_PALETTE_EXE=./termux-macos python3 tools/debug_geometry_mac.py
+
   cursor-diagnostic:
     name: 快速光标诊断
     runs-on: ubuntu-latest
