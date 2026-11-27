@@ -270,7 +270,9 @@ int create_about_pane(void) {
     return idx;
 }
 
-int create_pane_shell_with_dir(const WCHAR *shell, const WCHAR *workdir) {
+/* v2.4.3：恢复分屏时，进程必须从一开始就拿到最终矩形，不能等第一帧再 resize：
+ * bash 等交互程序可能已按整屏宽度初始化，却错过启动期间的 SIGWINCH。0 表示普通整屏。 */
+static int create_pane_shell_sized_dir(const WCHAR *shell, const WCHAR *workdir, int cols, int rows) {
     int idx = -1;
     for (int i = 0; i < MAX_PANES; i++)
         if (!g_mux.panes[i].active && g_mux.panes[i].read_thread == NULL_HANDLE) { idx = i; break; }
@@ -284,14 +286,15 @@ int create_pane_shell_with_dir(const WCHAR *shell, const WCHAR *workdir) {
         while (shell[si] && si < scap - 1) { pane->shell_cmd[si] = shell[si]; si++; }
         pane->shell_cmd[si] = 0;
     }
-    int pane_cols = g_mux.host_cols;
-    if (!screen_init(&pane->screen, pane_cols, g_mux.host_rows)) return -1;
+    int pane_cols = cols > 0 ? cols : g_mux.host_cols;
+    int pane_rows = rows > 0 ? rows : g_mux.host_rows;
+    if (!screen_init(&pane->screen, pane_cols, pane_rows)) return -1;
     pane->screen.pane_index = idx;
 
 #ifdef _WIN32
     /* ---- Windows：ConPTY + CreateProcessW ---- */
     HANDLE pi_r = NULL, pi_w = NULL, po_r = NULL, po_w = NULL;
-    COORD sz = {(SHORT)pane_cols, (SHORT)g_mux.host_rows};
+    COORD sz = {(SHORT)pane_cols, (SHORT)pane_rows};
     STARTUPINFOEXW si;
     SIZE_T as = 0;
     PROCESS_INFORMATION pi;
@@ -429,7 +432,7 @@ create_fail:
     }
 
     if (plat_proc_spawn(cmd_utf8, dir_utf8[0] ? dir_utf8 : NULL,
-                        pane_cols, g_mux.host_rows,
+                        pane_cols, pane_rows,
                         &pane->pipe_in, &pane->pipe_out, &pane->process) != 0) {
         screen_free(&pane->screen);
         memset(pane, 0, sizeof(*pane));
@@ -458,12 +461,20 @@ create_fail:
 #endif
 }
 
-int create_pane_shell(const WCHAR *shell) {
-    return create_pane_shell_with_dir(shell, NULL);
+int create_pane_shell_with_dir(const WCHAR *shell, const WCHAR *workdir) {
+    return create_pane_shell_sized_dir(shell, workdir, 0, 0);
 }
 
-int create_pane_from_item(int idx) {
-    if (idx < 0 || idx >= g_chooser_item_count) return create_pane();
+int create_pane_shell_sized(const WCHAR *shell, int cols, int rows) {
+    return create_pane_shell_sized_dir(shell, NULL, cols, rows);
+}
+
+int create_pane_shell(const WCHAR *shell) {
+    return create_pane_shell_sized(shell, 0, 0);
+}
+
+static int create_pane_from_item_sized(int idx, int cols, int rows) {
+    if (idx < 0 || idx >= g_chooser_item_count) return create_pane_sized(cols, rows);
     if (strcmp(g_chooser_items[idx].cmd, ":custom") == 0) {
         g_mux.custom_cmd_mode = 1;
         g_mux.custom_cmd_len = 0;
@@ -479,7 +490,7 @@ int create_pane_from_item(int idx) {
     if (g_chooser_items[idx].workdir[0]) {
         MultiByteToWideChar(CP_UTF8, 0, g_chooser_items[idx].workdir, -1, wdir, 255);
     }
-    int p = create_pane_shell_with_dir(wcmd, wdir[0] ? wdir : NULL);
+    int p = create_pane_shell_sized_dir(wcmd, wdir[0] ? wdir : NULL, cols, rows);
     if (p >= 0) {
         strncpy(g_mux.panes[p].title, g_chooser_items[idx].name, sizeof(g_mux.panes[p].title) - 1);
         strncpy(g_mux.panes[p].full_title, g_chooser_items[idx].name, sizeof(g_mux.panes[p].full_title) - 1);
@@ -490,15 +501,23 @@ int create_pane_from_item(int idx) {
     return p;
 }
 
-int create_pane(void) {
+int create_pane_from_item(int idx) {
+    return create_pane_from_item_sized(idx, 0, 0);
+}
+
+int create_pane_sized(int cols, int rows) {
     if (g_chooser_item_count > 0 && strcmp(g_chooser_items[0].cmd, ":custom") != 0) {
-        return create_pane_from_item(0);
+        return create_pane_from_item_sized(0, cols, rows);
     }
 #ifdef _WIN32
-    return create_pane_shell(L"cmd.exe");
+    return create_pane_shell_sized(L"cmd.exe", cols, rows);
 #else
-    return create_pane_shell(plat_default_shell());
+    return create_pane_shell_sized(plat_default_shell(), cols, rows);
 #endif
+}
+
+int create_pane(void) {
+    return create_pane_sized(0, 0);
 }
 
 int open_settings_pane(void) {

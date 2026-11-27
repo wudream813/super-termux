@@ -53,6 +53,8 @@ void session_note_now(void);
  * 档里没记 ⇒ 调用方用默认 shell）。不然第一块永远是默认 shell，用户在 PowerShell 里
  * 退出再进来就变回 cmd.exe。 */
 int session_probe_first_shell(WCHAR *out, int cells);
+/* 恢复分屏前预取首叶子的尺寸，使首个 shell 从正确尺寸启动；无有效快照返回 0。 */
+int session_probe_first_size(int *cols, int *rows);
 
 /* 退出前调用（main 里 handle_input() 之后、关窗格的循环之前）：把内存里那份快照落盘。
  * 返回 1 = 写了文件；0 = 没写（开关关着 / 没有可存的终端窗格 / 文件打不开）。 */

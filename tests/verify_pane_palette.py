@@ -2846,6 +2846,35 @@ int main(int argc, char **argv) {
         finally:
             shutil.rmtree(td_cur, ignore_errors=True)
 
+        # v2.4.3：不能只在第一帧之后验证 TIOCGWINSZ；bash 可能在收到 resize 前按
+        # 整屏尺寸初始化并错过信号。让每个进程在【首次提示符】把自身 COLUMNS/LINES
+        # 写出来，连尚未切到的后台 tab 一起验，不依赖 libvterm 或调度时序。
+        td_geo = sess_mkdir(SESS_INI_ON)
+        try:
+            with open(os.path.join(td_geo, "termux.session"), "w", encoding="utf-8") as f:
+                f.write("s 2\nu 1795490000\nT 0 v50pp\n"
+                        "P 1 /bin/bash --noprofile --norc\nD LEFT\n"
+                        "P 0 /bin/bash --noprofile --norc\nD RIGHT\n"
+                        "T 0 h50pp\nP 0 /bin/bash --noprofile --norc\nD TOP\n"
+                        "P 0 /bin/bash --noprofile --norc\nD BOTTOM\n")
+            geo_log = os.path.join(td_geo, "first-size.log")
+            hook = 'printf "%s %s %s\\n" "$BASHPID" "$COLUMNS" "$LINES" >> ' + geo_log
+            _, ex_geo = sess_run(td_geo, ROWS_C, COLS_C, [], env_extra={"PROMPT_COMMAND": hook})
+            first_sizes = {}
+            if os.path.isfile(geo_log):
+                with open(geo_log, encoding="utf-8") as f:
+                    for line in f:
+                        fields = line.split()
+                        if len(fields) == 3:
+                            first_sizes.setdefault(fields[0], tuple(fields[1:]))
+            ck("T2h v2.4.3：恢复时四个 shell 的首次提示符就拿到最终窗格尺寸"
+               "（左右 49/50×23、后台上下 100×11）；不靠事后 resize 修正",
+               ex_geo and sorted(first_sizes.values()) == sorted([
+                   ("49", "23"), ("50", "23"), ("100", "11"), ("100", "11")]),
+               "退出=%r 首次尺寸=%r" % (ex_geo, first_sizes))
+        finally:
+            shutil.rmtree(td_geo, ignore_errors=True)
+
         d2, ex2 = sess_run(td, ROWS_C, COLS_C, [b"echo AFTERFOCUS\r"])
         scr2 = vt_text(ROWS_C, COLS_C, d2) or []
 

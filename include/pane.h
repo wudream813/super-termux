@@ -10,6 +10,8 @@
 #include "theme.h"
 
 int create_pane(void);
+int create_pane_sized(int cols, int rows);
+int create_pane_shell_sized(const WCHAR *shell, int cols, int rows);
 int create_pane_shell(const WCHAR *shell);
 int create_pane_shell_with_dir(const WCHAR *shell, const WCHAR *workdir);
 int create_pane_from_item(int idx);
