@@ -6,7 +6,7 @@ td=m.sess_mkdir('[general]\nsession = true\nmouse = true\nanim = off\n')
 try:
  with open(td+'/termux.session','w') as f:
   f.write('s 2\nu 1795490000\nT 0 v50pp\nP 1 /bin/bash --noprofile --norc\nD LEFT\nP 0 /bin/bash --noprofile --norc\nD RIGHT\nT 0 h50pp\nP 0 /bin/bash --noprofile --norc\nD TOP\nP 0 /bin/bash --noprofile --norc\nD BOTTOM\n')
- log=td+'/first-size.log'; hook='printf "%s %s %s\\n" "$$" "$COLUMNS" "$LINES" >> '+log
+ log=td+'/first-size.log'; hook='sz=$(stty size); printf "%s %s\\n" "$$" "$sz" >> '+log
  print('TEMP',td,'HOOK',repr(hook),flush=True)
  data,ex=m.sess_run(td,24,100,[b'echo MACDEBUG:$$:$COLUMNS:$LINES:$PROMPT_COMMAND\r'],env_extra={'PROMPT_COMMAND':hook,'TERMUX_DUMP':'1'})
  print('EX',ex,'FILE',repr(open(log).read()) if os.path.isfile(log) else 'MISSING',flush=True)
